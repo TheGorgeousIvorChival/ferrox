@@ -1,23 +1,7 @@
-//! Share-link to per-engine client configs for the live speedtest.
-//!
-//! A speedtest hands every core the same job — dial this link, expose SOCKS,
-//! move bytes — so the translation from `vless://` to each engine's dialect
-//! lives in exactly one place, tested here. The configs necessarily contain
-//! the link's secrets (a config without the UUID authenticates nothing), so
-//! they are local files only: the renderer and the report never see them, and
-//! [`secret_tokens`] names every substring the redaction validator must not
-//! find anywhere else.
-//!
-//! Learned, not copied: neither pinned harness is transcribed. The field names
-//! are each engine's own config schema at its pin (`sing-box/option/*.go`,
-//! `xray-core/transport/internet/reality/config.proto`, the xray-rust config
-//! compatibility doc), read the same way `parity::Dialect` was.
-
 use ferrox_core::vless::VlessLink;
 
 use crate::json::Json;
 
-/// An engine the speedtest can drive, by config dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineFamily {
     Ferrox,
@@ -28,7 +12,6 @@ pub enum EngineFamily {
 }
 
 impl EngineFamily {
-    /// Parse the `--engine` name the driver passes.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
             "ferrox" => Ok(Self::Ferrox),
@@ -43,39 +26,25 @@ impl EngineFamily {
         }
     }
 
-    /// Whether this engine reads the sing-box (`type`-keyed) dialect.
     const fn is_singbox(self) -> bool {
         matches!(self, Self::SingBox)
     }
 }
 
-/// What the link must carry for a speedtest row to exist.
-///
-/// VLESS over TCP or WebSocket with `none`, `tls` or `reality` security and
-/// no (or Vision) flow — except on `ferrox`, which dials raw TCP without
-/// a security layer today (`vless_security_supported` in
-/// `ferrox-app/src/proxy.rs`; the REALITY/Vision row there is the
-/// server side). Anything else is a named refusal, not a silent omission: a
-/// row the driver cannot build reads as "not attempted", which is a fact
-/// about the matrix, not a gap in it. When the client rung lands, the
-/// `Ferrox` arm below is what goes.
 fn check_supported(link: &VlessLink, engine: EngineFamily) -> Result<(), String> {
     if engine == EngineFamily::Ferrox {
         if link.transport_kind() != ferrox_core::transport::TransportKind::Tcp {
             return Err("ferrox dials raw TCP only: the row sits out with this reason".into());
         }
         if !matches!(link.security(), ferrox_core::transport::Security::None) {
-            return Err(
-                "ferrox dials no security layer yet (REALITY/Vision is the \
+            return Err("ferrox dials no security layer yet (REALITY/Vision is the \
                  server side only): the row sits out with this reason"
-                    .into(),
-            );
+                .into());
         }
         return Ok(());
     }
     match link.transport_kind() {
-        ferrox_core::transport::TransportKind::Tcp
-        | ferrox_core::transport::TransportKind::Ws => {}
+        ferrox_core::transport::TransportKind::Tcp | ferrox_core::transport::TransportKind::Ws => {}
         _ => {
             return Err(format!(
                 "speedtest supports vless over tcp or ws, got type=`{}`",
@@ -117,9 +86,6 @@ fn check_supported(link: &VlessLink, engine: EngineFamily) -> Result<(), String>
     Ok(())
 }
 
-/// `#n remark | type= security= flow=`: the row label. The remark is the
-/// link's own fragment (user-chosen display text); the UUID, keys and host
-/// never appear — see [`secret_tokens`].
 pub fn redacted_label(link: &VlessLink, index: usize) -> String {
     let remark = if link.name.is_empty() {
         "-".to_owned()
@@ -134,9 +100,6 @@ pub fn redacted_label(link: &VlessLink, index: usize) -> String {
     )
 }
 
-/// Every credential substring that must not appear outside the engine config
-/// files: the account UUID and the REALITY key material. The redaction
-/// validator fails the run on any of them in any other artefact.
 pub fn secret_tokens(link: &VlessLink) -> Vec<String> {
     let mut out = vec![link.uuid.clone()];
     for key in ["pbk", "sid", "spx", "password"] {
@@ -148,7 +111,6 @@ pub fn secret_tokens(link: &VlessLink) -> Vec<String> {
     out
 }
 
-/// SOCKS inbound in the engine's dialect, on loopback.
 fn socks_inbound(engine: EngineFamily, port: u16) -> Json {
     let mut inbound = Json::object();
     if engine.is_singbox() {
@@ -170,7 +132,6 @@ fn socks_inbound(engine: EngineFamily, port: u16) -> Json {
     inbound
 }
 
-/// The VLESS remote in Xray-dialect JSON.
 fn xray_outbound(link: &VlessLink) -> Json {
     let mut outbound = Json::object();
     outbound.insert("protocol", Json::Str("vless".into()));
@@ -201,12 +162,6 @@ fn xray_outbound(link: &VlessLink) -> Json {
     outbound
 }
 
-/// `streamSettings` for the link's transport and security.
-///
-/// Field names are Xray-core's at its pin (`realitySettings.serverName`,
-/// `publicKey`, `shortId`, `spiderX`). Certificate verification stays on for
-/// `tls`: the handshake a user performs is the one measured, and a test
-/// server with a broken chain fails loudly rather than silently downgraded.
 fn xray_stream(link: &VlessLink) -> Json {
     let mut stream = Json::object();
     let network = if link.param("type") == "ws" {
@@ -262,10 +217,6 @@ fn xray_stream(link: &VlessLink) -> Json {
     stream
 }
 
-/// The VLESS remote in sing-box-dialect JSON.
-///
-/// `spiderX` has no sing-box field and is dropped: stated here so a row that
-/// differs between dialects differs for a named reason, not a silent one.
 fn singbox_outbound(link: &VlessLink) -> Json {
     let mut outbound = Json::object();
     outbound.insert("type", Json::Str("vless".into()));
@@ -323,8 +274,6 @@ fn singbox_outbound(link: &VlessLink) -> Json {
     outbound
 }
 
-/// The whole client document: SOCKS in, the remote out. One outbound and no
-/// routing section, so the default route (first outbound) is the tunnel.
 pub fn engine_config(
     link: &VlessLink,
     engine: EngineFamily,
@@ -348,12 +297,6 @@ pub fn engine_config(
     root.to_string()
 }
 
-/// `linkconfig` CLI: `--link URL --engine NAME --socks-port N` prints the
-/// engine document; `--describe --index N` prints the redacted row label;
-/// `--tokens` prints the credential substrings for the redaction validator.
-/// Secrets never reach stdout except inside the engine document itself (which
-/// is redirected to a file the renderer never reads) and the `--tokens` list
-/// (which the driver captures into a variable, never a log).
 pub fn run(args: &[String]) -> i32 {
     for arg in args {
         if arg.starts_with("--")
@@ -429,9 +372,6 @@ pub fn run(args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
-    /// Synthetic REALITY link: TEST-NET address, example SNI, made-up key
-    /// material. Never a real credential (`scripts/check-fixture-safety.sh`
-    /// enforces the address rule; the rule for keys is this comment).
     fn reality_link() -> VlessLink {
         VlessLink::parse(
             "vless://11111111-2222-4333-8444-555555555555@198.51.100.7:443\
@@ -448,8 +388,6 @@ mod tests {
     #[test]
     fn every_engine_builds_a_reality_config() {
         let link = reality_link();
-        // Ferrox is absent on purpose: it sits reality out with the rung
-        // reason (`ferrox_sits_out_what_it_cannot_dial` holds that side).
         for engine in [
             EngineFamily::XrayCore,
             EngineFamily::XrayRust,
@@ -522,7 +460,6 @@ mod tests {
 
     #[test]
     fn refusals_name_their_reason() {
-        // No public key on a reality link.
         let no_pbk = VlessLink::parse(
             "vless://11111111-2222-4333-8444-555555555555@198.51.100.7:443\
              ?security=reality&encryption=none&fp=chrome&type=tcp\
@@ -532,7 +469,6 @@ mod tests {
         assert!(engine_config(&no_pbk, EngineFamily::XrayCore, 10801)
             .expect_err("no pbk is refused")
             .contains("pbk"));
-        // Wrong transport.
         let quic = VlessLink::parse(
             "vless://11111111-2222-4333-8444-555555555555@198.51.100.7:443\
              ?security=none&encryption=none&type=quic#x",
@@ -541,24 +477,19 @@ mod tests {
         assert!(engine_config(&quic, EngineFamily::XrayCore, 10801)
             .expect_err("quic is refused")
             .contains("tcp or ws"));
-        // Unsafe fingerprint.
         let mut unsafe_fp = reality_link();
         unsafe_fp.params.insert("fp".into(), "unsafe-chrome".into());
         assert!(engine_config(&unsafe_fp, EngineFamily::XrayCore, 10801)
             .expect_err("unsafe fp is refused")
             .contains("unsafe"));
-        // Unknown engine.
         assert!(EngineFamily::parse("quiche").is_err());
     }
 
     #[test]
     fn ferrox_sits_out_what_it_cannot_dial() {
-        // REALITY is the server side only: a skip with the rung reason,
-        // not a red row for a handshake that was never attempted.
         let err = engine_config(&reality_link(), EngineFamily::Ferrox, 10801)
             .expect_err("ferrox does not dial reality");
         assert!(err.contains("server side only"), "{err}");
-        // Plain TCP to loopback dials.
         let plain = VlessLink::parse(
             "vless://11111111-2222-4333-8444-555555555555@127.0.0.1:443\
              ?security=none&encryption=none&type=tcp#x",

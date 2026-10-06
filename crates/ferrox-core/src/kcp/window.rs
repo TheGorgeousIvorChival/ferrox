@@ -1,11 +1,7 @@
-//! The send/receive windows and the ack scheduler, ported one for one with
-//! the same explicit-`current` clock so the same inputs give the same bytes.
-
 use std::collections::{HashMap, VecDeque};
 
 use super::segment::{AckSegment, DataSegment};
 
-/// The sending window: segments awaiting acknowledgement, in order.
 #[derive(Debug, Default)]
 pub struct SendingWindow {
     cache: VecDeque<DataSegment>,
@@ -13,25 +9,21 @@ pub struct SendingWindow {
 }
 
 impl SendingWindow {
-    /// Empty window.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Number of cached segments.
     #[must_use]
     pub fn len(&self) -> u32 {
         self.cache.len() as u32
     }
 
-    /// Whether it is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
 
-    /// Queue one: a fresh segment numbered `number` carrying `payload`.
     pub fn push(&mut self, number: u32, payload: Vec<u8>) {
         self.cache.push_back(DataSegment {
             number,
@@ -40,13 +32,11 @@ impl SendingWindow {
         });
     }
 
-    /// Number of the oldest segment.
     #[must_use]
     pub fn first_number(&self) -> u32 {
         self.cache.front().map_or(0, |s| s.number)
     }
 
-    /// Drop every segment numbered below `una`, from the front.
     pub fn clear(&mut self, una: u32) {
         while let Some(seg) = self.cache.front() {
             if seg.number >= una {
@@ -56,8 +46,6 @@ impl SendingWindow {
         }
     }
 
-    /// A fast ack on `number` cuts the retransmit timeout of every segment
-    /// still in front of the acked one by one third of the RTO.
     pub fn handle_fast_ack(&mut self, number: u32, rto: u32) {
         for seg in &mut self.cache {
             if seg.number == number || number.wrapping_sub(seg.number) > 0x7FFF_FFFF {
@@ -69,7 +57,6 @@ impl SendingWindow {
         }
     }
 
-    /// Remove the segment numbered `number`.
     pub fn remove(&mut self, number: u32) -> bool {
         for i in 0..self.cache.len() {
             if self.cache[i].number > number {
@@ -86,9 +73,6 @@ impl SendingWindow {
         false
     }
 
-    /// Retransmit due segments and (re)stamp their clocks. Every emission
-    /// increments `transmit`; the first one bumps `total_in_flight`, and
-    /// retransmissions are counted as `lost` for the loss rate.
     pub fn flush(
         &mut self,
         current: u32,
@@ -99,7 +83,6 @@ impl SendingWindow {
         let mut lost = 0u32;
         let mut in_flight = 0u32;
         for seg in &mut self.cache {
-            // Not due: the serial-arithmetic wrap says `current < timeout`.
             if current.wrapping_sub(seg.timeout) >= 0x7FFF_FFFF {
                 continue;
             }
@@ -125,20 +108,17 @@ impl SendingWindow {
     }
 }
 
-/// The receive side's reassembly buffer, keyed by sequence number.
 #[derive(Debug, Default)]
 pub struct ReceivingWindow {
     cache: HashMap<u32, DataSegment>,
 }
 
 impl ReceivingWindow {
-    /// Empty window.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Insert unless already present.
     pub fn set(&mut self, id: u32, value: DataSegment) -> bool {
         if self.cache.contains_key(&id) {
             return false;
@@ -147,20 +127,16 @@ impl ReceivingWindow {
         true
     }
 
-    /// Present?
     #[must_use]
     pub fn has(&self, id: u32) -> bool {
         self.cache.contains_key(&id)
     }
 
-    /// Take it out, if present.
     pub fn remove(&mut self, id: u32) -> Option<DataSegment> {
         self.cache.remove(&id)
     }
 }
 
-/// The ack scheduler: which numbers to list in the next ack segment, and
-/// when.
 #[derive(Debug, Default)]
 pub struct AckList {
     numbers: Vec<u32>,
@@ -170,13 +146,11 @@ pub struct AckList {
 }
 
 impl AckList {
-    /// Empty.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record a received segment.
     pub fn add(&mut self, number: u32, timestamp: u32) {
         self.numbers.push(number);
         self.timestamps.push(timestamp);
@@ -184,7 +158,6 @@ impl AckList {
         self.dirty = true;
     }
 
-    /// Drop entries below `una` (plain `u32` compare, as upstream).
     pub fn clear(&mut self, una: u32) {
         let mut count = 0usize;
         for i in 0..self.numbers.len() {
@@ -206,15 +179,11 @@ impl AckList {
         }
     }
 
-    /// Whether anything is pending.
     #[must_use]
     pub fn is_pending(&self) -> bool {
         !self.numbers.is_empty()
     }
 
-    /// Emit ack segments covering the known numbers. The exact upstream
-    /// policy — including its candidate piggybacking — is ported verbatim
-    /// so the emitted bytes match.
     pub fn flush(
         &mut self,
         current: u32,

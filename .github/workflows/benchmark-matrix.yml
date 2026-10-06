@@ -1,51 +1,8 @@
 name: benchmark-matrix
 
-# The five-engine comparison as a standing measurement, not a one-off report.
-#
-# ZeroNet measures itself against Xray-core, sing-box and xray-rust in CI;
-# xray-rust publishes dated SVG groups against the same three. This workflow
-# measures all five (ferrox plus those four) on one matrix, on one native
-# runner per OS/ISA, renders the charts, and pushes the dated bundle and the
-# README update to main on the daily schedule — automatically, because a
-# benchmark whose front page rots between manual merges is a claim without a
-# date. Dispatch runs only prove (artefacts, no publish): publishing a
-# hand-picked tier as the standing benchmark would mislabel it.
-#
-# Every pull request runs the smoke tier on ubuntu only: one scenario, two
-# engines, three repeats. It proves the plumbing (builders, configs, cells,
-# renderer, validator) without moving any number the README shows. The daily
-# schedule and manual dispatches run the standard and full tiers on all four
-# runners; only the schedule refreshes the README, by pushing to main.
-#
-# The comparator trees are fetched **once** per run, by the `fetch` job, and the
-# four legs restore them. Each leg used to run `fetch-upstream.sh` itself, so the
-# same four clones happened four times over — twelve repos each, where four were
-# needed. That was the largest single cost in this workflow and none of it varied
-# by runner. See the `fetch` job for what the restore replaces.
-#
-# Windows is in the runner set, and was left out for a reason that has since
-# stopped being true. The comment that used to stand here said the harness had no
-# sampler for it, citing `SampleError::NoSource` -- but that variant is gone: the
-# Win32 sampler shipped (`ps::win32`, on `GetProcessTimes`, at a 1 ms floor, with
-# `windows-sys` declarations and `check-windows.sh` compiling it). Leaving the leg
-# out meant the runner with the *finest* CPU resolution in the matrix published no
-# throughput row at all, and the coverage table's claim that every host has a
-# mechanism was the only evidence.
-#
-# Three runner-specific details the Windows leg needs, all of them the same three
-# that `docs/methodology.md` records for the earlier silent-green failure:
-# `shell: bash`, because a `run:` step on `windows-latest` defaults to PowerShell
-# and PowerShell cannot execute a `bash` script -- that step exits 0 having done
-# nothing, which is how this runner once reported a pass while contributing no rows;
-# `if-no-files-found: error`, so an empty run is red rather than a warning; and the
-# summary step failing when the report is missing. The Go and Python setup steps
-# are shared with the other legs, so they are not repeated here.
 
 on:
   pull_request:
-    # The PR leg is the smoke tier on one runner, so it needs a path filter more
-    # than anything else here: ungated, it put three runners behind every push to
-    # every pull request to prove the same plumbing twice.
     paths:
       - "crates/**/*.rs"
       - "crates/**/*.toml"
@@ -53,11 +10,6 @@ on:
       - "scripts/render-benchmark-charts.py"
       - ".github/workflows/benchmark-matrix.yml"
   schedule:
-    # Daily at 03:41 UTC, ahead of `bench.yml` (04:17) and `parity.yml` (05:23)
-    # so the three never run at once and read each other's load as a throughput
-    # regression. The hour spacing is the point: these three publish a ratio
-    # against each other, so overlapping them would put a co-tenant's CPU into
-    # the numbers.
     - cron: "41 3 * * *"
   workflow_dispatch:
     inputs:
@@ -71,9 +23,6 @@ on:
           - standard
           - full
 
-# Cancelled for pull requests, queued for the daily leg: the daily run hands
-# `refresh` the bundles to push to `main`, and a truncated run is a missing
-# *published* measurement rather than a missing one.
 concurrency:
   group: matrix-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -87,19 +36,6 @@ env:
   RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
 
 jobs:
-  # The four comparator trees, fetched once per run and shared by every leg.
-  #
-  # This was the largest cost in this workflow and it was being paid four times
-  # over: each leg ran `fetch-upstream.sh` itself, cloning **twelve**
-  # repositories when the matrix builds four engines. Fetching is network-bound
-  # and the legs are on different runners, so there is no contention to reason
-  # about — there were just four identical five-minute downloads, every day.
-  #
-  # One job fetches at the pins and uploads the trees; each leg restores them.
-  # The pin check is not lost by the move: `fetch-upstream.sh` verifies every
-  # checkout is at its exact rev, so a leg holding these trees holds the same
-  # commits a leg that cloned them would have, and `pins.yml` still checks all
-  # twelve pins against their remotes on its own schedule.
   fetch:
     name: fetch the four comparator trees
     runs-on: ubuntu-latest
@@ -114,17 +50,7 @@ jobs:
           name: upstream-trees
           path: upstream/
           retention-days: 1
-          # `.git` is the load-bearing part of this artifact, and `upload-artifact`
-          # leaves hidden files out **by default**. Both harnesses verify the pin
-          # through git — `lib-engines.sh:37` is `[[ -d upstream/$name/.git ]]`
-          # and then `git rev-parse HEAD` — so an artifact without `.git` makes
-          # every leg fail `verify_checkout` with "upstream/xray-core is
-          # missing; run scripts/fetch-upstream.sh", which is both wrong (the tree
-          # is right there) and unfixable from the leg.
           include-hidden-files: true
-          # `error`: an artifact of nothing means all four legs below restore no
-          # comparator and each reports "upstream/xray-core is missing", which
-          # reads as four failures and is one.
           if-no-files-found: error
 
   matrix:
@@ -135,15 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # PRs prove the plumbing on the smoke tier on one runner; schedules
-        # run standard and dispatches run the tier they asked for, on one
-        # native runner per OS/ISA. One tier per event keeps a doc-only PR
-        # from queuing full matrices behind it.
         tier: ${{ github.event_name == 'pull_request' && fromJSON('["smoke"]') || (github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.tier)) || fromJSON('["standard"]')) }}
-        # All four native runners: one per OS/ISA, `ubuntu-24.04-arm` because
-        # aarch64 is half the coverage table and `macos-15` is the only arm64
-        # Darwin runner, `windows-latest` because it is the only host with a 1 ms
-        # CPU floor and therefore the one that can resolve the shortest window.
         os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]') }}
     steps:
       - uses: actions/checkout@v4
@@ -151,41 +69,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-          # `setup-go` caches the module and build caches, keyed on this file. The
-          # comparators are pinned, so their module files do not change between
-          # runs — which is what keeps `go build` of Xray-core and sing-box off
-          # the network on every run after the first.
           cache-dependency-path: upstream/pins.toml
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          # The chart dependency is a wheel and its transitive set, identical on
-          # every run, so `pip install` was a download and an unpack on four legs
-          # to produce four identical environments. Keyed on the requirements
-          # file, so changing it is what invalidates the cache.
           cache: pip
           cache-dependency-path: scripts/requirements-benchmark.txt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # One key across the four legs so the first to finish warms the registry
-          # and crate sources for the rest. Compiled artefacts stay per-leg —
-          # four different targets — so this buys the download half of a cold
-          # build and nothing else.
           shared-key: benchmark-matrix
-      # Same reason and same fix as `parity.yml`: `quiche` builds `BoringSSL`, and
-      # `cmake`, `perl` and a C compiler ship with all three Unix runners while
-      # `nasm` does not ship with `windows-latest`. Without it the Windows leg's
-      # `cargo build` fails on a dependency of a crate the matrix never exercises.
       - name: install the QUIC build tool
         if: runner.os == 'Windows'
         run: choco install nasm -y --no-progress || echo "nasm already installed"
-      # `shell: bash` on every step that runs one of this repository's scripts.
-      # A `run:` step with no `shell:` on `windows-latest` is PowerShell, which
-      # cannot execute a `bash` script; it exits 0 having done nothing, the
-      # artifact upload then finds no files, and `if-no-files-found: warn` turns
-      # that into a green job that measured nothing. Named on each step rather than
-      # once at the workflow level, because a workflow-level default is one
-      # `defaults.run.shell` away from not applying to the step that needs it.
       - uses: actions/download-artifact@v4
         with:
           name: upstream-trees
@@ -210,9 +105,6 @@ jobs:
           --cells target/benchmark-matrix/cells
           --results target/benchmark-matrix/matrix-results.json
           --charts target/benchmark-matrix/charts
-      # A tier that measured nothing must be red, not a warning: this is the check
-      # that would have caught the PowerShell step above, because an empty bundle
-      # renders no charts and validates against an empty cell list.
       - name: refuse a bundle that measured nothing
         shell: bash
         run: |
@@ -223,26 +115,16 @@ jobs:
               the run above exited 0 without measuring anything"
             exit 1
           fi
-      # Always uploaded, green or red: a failed cell's stdout.log names the
-      # assertion or timeout that killed it, and without it the next run
-      # starts from zero evidence.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: benchmark-matrix-${{ matrix.tier }}-${{ matrix.os }}
           path: target/benchmark-matrix/
           retention-days: 30
-          # An empty bundle is a fault, not a warning: the whole point of this
-          # workflow is the measurements, and an artifact of nothing is the exact
-          # shape of the failure this leg once had.
           if-no-files-found: error
 
   refresh:
-    # Scheduled runs publish; PR and dispatch runs only prove. Publishing needs
-    # every leg green: a refresh from a subset would present one runner's numbers
-    # as the matrix. `needs` fails when any leg fails, so a partial run publishes
-    # nothing rather than something.
-    name: publish the dated bundles and README
+    name: publish the dated bundles
     needs: matrix
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -250,13 +132,12 @@ jobs:
     concurrency:
       group: benchmark-refresh
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          # The same wheel as the legs above, cached the same way.
           cache: pip
           cache-dependency-path: scripts/requirements-benchmark.txt
       - name: install the chart dependency
@@ -267,7 +148,7 @@ jobs:
           path: matrix-bundles/
       - name: stamp the bundle date once
         run: echo "STAMP=$(date -u +%F)" >> "$GITHUB_ENV"
-      - name: lay out per-runner bundles and rewrite the README
+      - name: lay out per-runner bundles
         run: |
           for bundle in matrix-bundles/benchmark-matrix-standard-*/; do
             slug="$(grep -m1 '^runner: ' "$bundle/manifest.txt" | cut -d' ' -f2)"
@@ -275,32 +156,25 @@ jobs:
               echo "::error::$bundle has no runner: line in manifest.txt"
               exit 1
             fi
-            dest="docs/benchmarks/results/$STAMP/$slug"
-            charts="docs/benchmarks/charts/latest/$slug"
+            dest="matrix-published/$STAMP/$slug"
+            charts="$dest/charts"
             mkdir -p "$dest" "$charts"
             cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$dest/"
             cp -r "$bundle/cells" "$dest/cells"
             cp "$bundle"/charts/*.png "$charts/"
-            cp "$bundle"/charts/*.png "$dest/"
             python3 scripts/render-benchmark-charts.py \
               --input "$bundle" \
               --charts "$charts" \
               --results "$dest/matrix-results.json" \
-              --readme README.md \
               --runner "$slug"
             python3 scripts/validate-benchmark-matrix.py \
               --cells "$dest/cells" \
               --results "$dest/matrix-results.json" \
-              --charts "$charts" \
-              --readme README.md
+              --charts "$charts"
           done
-      - name: push the refresh to main
-        run: |
-          git add docs/benchmarks README.md
-          if git diff --cached --quiet; then
-            echo "nothing changed; no refresh needed"
-            exit 0
-          fi
-          git -c user.name="ferrox-bench" -c user.email="ferrox-bench@users.noreply.github.com" \
-            commit -m "benchmarks: refresh charts and table for $STAMP"
-          git push origin HEAD:main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-matrix-published-${{ env.STAMP }}
+          path: matrix-published/
+          retention-days: 90
+          if-no-files-found: error

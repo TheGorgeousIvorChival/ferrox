@@ -1,71 +1,30 @@
-//! The `x86_64` backend: `AES-NI` for the `CTR` half, `PCLMULQDQ` for the
-//! `GHASH` half, four blocks in flight.
-//!
-//! # Where the arithmetic comes from
-//!
-//! The `GHASH` kernel — the Karatsuba carryless multiply and the shift-based
-//! reduction — is transcribed from the `polyval` crate's `clmul.rs`, which is
-//! what `aes-gcm`'s `GHASH` runs on this architecture. The one change is
-//! structural: the crate reduces after every block, and [`super::Lanes`]
-//! accumulates the four-register unreduced products and reduces once per group.
-//! `mul_add` below is exactly the crate's product up to the point its reduction
-//! starts; `reduce` is the crate's reduction unchanged. Linearity of the
-//! reduction is what makes the regrouping exact.
-//!
-//! # What keeps this honest
-//!
-//! Nothing here is Miri-checkable — Miri cannot interpret these intrinsics.
-//! What is checked is the contract this module owes [`super::Lanes`], by the
-//! differential sweep against the `aes-gcm` crate at every length: a lane
-//! mix-up, a wrong shuffle immediate or a reduction step dropped fails there,
-//! at the first length whose shape exercises it.
-
 use super::Lanes;
-// Glob-imported on purpose: the module is a flat list of intrinsics, and
-// naming twenty of them by hand to satisfy a lint would be noise that hides
-// the ones that matter — the same call `chacha::avx2` makes.
 #[allow(clippy::wildcard_imports)]
 use core::arch::x86_64::*;
 
-/// The per-key state: the eleven round keys and the four `H` powers, each
-/// paired with its Karatsuba middle-term constant `h ^ swap_halves(h)`.
 pub(crate) struct Engine {
-    /// `AES-128`'s eleven round keys, in `AESENC` order.
     rk: [__m128i; 11],
-    /// `H^1 .. H^4` in the reflected representation, each as `(h, h ^ swap(h))`.
     h: [(__m128i, __m128i); 4],
 }
 
-/// `_mm_shuffle_epi32` immediate `0x0E`: lanes `[2, 3, 0, 0]`, whose low half
-/// is the source's high 64 bits — the 64-bit half-swap the Karatsuba middle
-/// term and the four-register product layout are built from.
 const HALVES: i32 = 0x0E;
 
-/// The byte-reversal mask: `GHASH`'s operands enter the multiply reversed, in
-/// the `ghash` crate's adapter to the `POLYVAL` field.
 const BSWAP: [u8; 16] = [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
 
-/// The counter mask: the nonce's twelve bytes untouched, the counter's four
-/// reversed — `inc32`'s big-endian half of a native-domain add.
 const CTRMASK: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 14, 13, 12];
 
 #[inline(always)]
 fn loadu(b: &[u8; 16]) -> __m128i {
-    // SAFETY: `_mm_loadu_si128` reads 16 bytes, unaligned; `b` is a 16-byte
-    // array, live for the call.
     unsafe { _mm_loadu_si128(b.as_ptr().cast()) }
 }
 
 #[inline(always)]
 fn xor4(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m128i {
-    // SAFETY: pure register op; the feature cover is the caller's
-    // `target_feature` function, reached only through the probed entry.
     unsafe { _mm_xor_si128(_mm_xor_si128(a, b), _mm_xor_si128(c, d)) }
 }
 
 #[inline(always)]
 fn xor5(v0: __m128i, v1: __m128i, v2: __m128i, v3: __m128i, v4: __m128i) -> __m128i {
-    // SAFETY: as above.
     unsafe {
         _mm_xor_si128(
             v0,
@@ -82,43 +41,26 @@ impl Lanes for __m128i {
 
     #[inline(always)]
     fn store(self, b: &mut [u8; 16]) {
-        // SAFETY: `_mm_storeu_si128` writes 16 bytes, unaligned; `b` is a
-        // 16-byte array, live for the call.
         unsafe { _mm_storeu_si128(b.as_mut_ptr().cast(), self) }
     }
 
     #[inline(always)]
     fn xor(self, o: Self) -> Self {
-        // SAFETY: pure register op; the feature cover is the caller's
-        // `target_feature` function, reached only through the probed entry.
         unsafe { _mm_xor_si128(self, o) }
     }
 
     #[inline(always)]
     fn bswap(self) -> Self {
-        // SAFETY: as above. The mask is a full permutation, so every output
-        // byte is a real source byte.
         unsafe { _mm_shuffle_epi8(self, loadu(&BSWAP)) }
     }
 
     #[inline(always)]
     fn swap_halves(self) -> Self {
-        // SAFETY: as above.
         unsafe { _mm_shuffle_epi32::<HALVES>(self) }
     }
 
     #[inline(always)]
     fn mul_add(acc: &mut [Self; 4], a: Self, h: Self, hxs: Self) {
-        // The crate's Karatsuba product, with the `h`-side shuffles precomputed
-        // per power at setup: `t2`'s multiplier is `h ^ swap(h)`, which is
-        // `hxs`. The four registers of the unreduced product are accumulated
-        // into `acc` rather than reduced: the high lanes of `acc[1..4]` carry
-        // the same don't-care values the crate's own reduction discards, and
-        // the `XOR` of two such accumulators keeps them consistent — every
-        // operation downstream is lane-wise.
-        //
-        // SAFETY: pure register ops; the feature cover is the caller's
-        // `target_feature` function, reached only through the probed entry.
         unsafe {
             let a1 = _mm_shuffle_epi32::<HALVES>(a);
             let a2 = _mm_xor_si128(a, a1);
@@ -135,14 +77,6 @@ impl Lanes for __m128i {
 
     #[inline(always)]
     fn reduce(acc: [Self; 4]) -> Self {
-        // The crate's shift-based reduction, verbatim: the 256-bit accumulated
-        // product folded modulo `x^128 + x^127 + x^126 + x^121 + 1`. Only the
-        // low 64-bit lanes of `v1..v3` reach the result; the shifts never move
-        // a bit across the 64-bit lane boundary, so the accumulated high lanes
-        // cannot contaminate them.
-        //
-        // SAFETY: pure register ops; the feature cover is the caller's
-        // `target_feature` function, reached only through the probed entry.
         unsafe {
             let [v0, v1, v2, v3] = acc;
             let v2 = xor5(
@@ -177,28 +111,16 @@ impl Lanes for __m128i {
 
     #[inline(always)]
     fn ctr_add(self, n: u32) -> Self {
-        // The counter is the high lane: bytes 12..15 are `_mm_set_epi32`'s
-        // first argument.
-        //
-        // SAFETY: pure register op; the feature cover is the caller's
-        // `target_feature` function, reached only through the probed entry.
         unsafe { _mm_add_epi32(self, _mm_set_epi32(n.cast_signed(), 0, 0, 0)) }
     }
 
     #[inline(always)]
     fn ctr_swap(self) -> Self {
-        // SAFETY: as above. The mask reverses only the last four bytes.
         unsafe { _mm_shuffle_epi8(self, loadu(&CTRMASK)) }
     }
 
     #[inline(always)]
     fn encrypt4(rk: &[Self; 11], s: &mut [Self; 4]) {
-        // Four independent chains, one round key loaded per round across all
-        // four: the chains have no data dependence between them, which is what
-        // keeps the `AESENC` pipe full.
-        //
-        // SAFETY: pure register ops; the feature cover is the caller's
-        // `target_feature` function, reached only through the probed entry.
         unsafe {
             for lane in s.iter_mut() {
                 *lane = _mm_xor_si128(*lane, rk[0]);
@@ -216,7 +138,6 @@ impl Lanes for __m128i {
 
     #[inline(always)]
     fn encrypt1v(rk: &[Self; 11], mut s: Self) -> Self {
-        // SAFETY: pure register ops under the caller's `target_feature`.
         unsafe {
             s = _mm_xor_si128(s, rk[0]);
             for k in &rk[1..10] {
@@ -228,8 +149,6 @@ impl Lanes for __m128i {
 
     #[inline(always)]
     fn encrypt4_256(rk: &[Self; 15], s: &mut [Self; 4]) {
-        // SAFETY: pure register ops; the feature cover is the caller's
-        // `target_feature` function, reached only through the probed entry.
         unsafe {
             for lane in s.iter_mut() {
                 *lane = _mm_xor_si128(*lane, rk[0]);
@@ -247,7 +166,6 @@ impl Lanes for __m128i {
 
     #[inline(always)]
     fn encrypt1v_256(rk: &[Self; 15], mut s: Self) -> Self {
-        // SAFETY: pure register ops under the caller's `target_feature`.
         unsafe {
             s = _mm_xor_si128(s, rk[0]);
             for k in &rk[1..14] {
@@ -258,13 +176,8 @@ impl Lanes for __m128i {
     }
 }
 
-/// One `AES-128` expansion step: `SubWord(RotWord(k[3])) ^ rcon` broadcast over
-/// the four words, folded into the key by the shift-and-xor ladder — the
-/// sequence Intel's `AES-NI` white paper spells out.
 #[inline(always)]
 fn assist<const RCON: i32>(k: __m128i) -> __m128i {
-    // SAFETY: pure register ops; the feature cover is the caller's
-    // `target_feature` function, reached only through the probed entry.
     unsafe {
         let t = _mm_shuffle_epi32::<0xff>(_mm_aeskeygenassist_si128::<RCON>(k));
         let k = _mm_xor_si128(k, _mm_slli_si128::<4>(k));
@@ -274,12 +187,8 @@ fn assist<const RCON: i32>(k: __m128i) -> __m128i {
     }
 }
 
-/// The eleven round keys, in `AESENC` order. Shared by both `x86_64` engines:
-/// the 256-bit one broadcasts them per lane.
 #[inline(always)]
 pub(crate) fn expand(key: &[u8; 16]) -> [__m128i; 11] {
-    // Each round key is the previous one through the expansion step, in
-    // `AES-128`'s ten `rcon` order.
     let mut rk = [loadu(key); 11];
     rk[1] = assist::<0x01>(rk[0]);
     rk[2] = assist::<0x02>(rk[1]);
@@ -295,12 +204,6 @@ pub(crate) fn expand(key: &[u8; 16]) -> [__m128i; 11] {
 }
 
 impl Engine {
-    /// Expand the key and build the `H` powers.
-    ///
-    /// # Safety
-    ///
-    /// `AES-NI`, `PCLMULQDQ` and `SSSE3` must be present. The only caller is
-    /// [`super::Aes128Gcm::new`], which probes exactly those three first.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn new(key: &[u8; 16]) -> Self {
         let rk = expand(key);
@@ -308,21 +211,11 @@ impl Engine {
         Self { rk, h }
     }
 
-    /// Seal, on this engine's lanes.
-    ///
-    /// # Safety
-    ///
-    /// As [`Engine::new`]: the probe at construction covers the features.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         super::seal_impl(&self.rk, &self.h, nonce, aad, buf)
     }
 
-    /// Open, on this engine's lanes.
-    ///
-    /// # Safety
-    ///
-    /// As [`Engine::new`]: the probe at construction covers the features.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn open(
         &self,
@@ -335,22 +228,15 @@ impl Engine {
     }
 }
 
-/// `SubWord` for the `AES-256` expansion: `aeskeygenassist` computes
-/// `SubWord(RotWord(x))` and `RotWord` in this word order is a one-byte
-/// `rotate_right`, so feeding it the one-byte-rotated-the-other-way input
-/// yields `SubWord` itself.
 #[inline(always)]
 #[allow(clippy::cast_possible_wrap)]
 fn sub_word256(w: u32) -> u32 {
-    // SAFETY: pure register op; the feature cover is the caller's
-    // `target_feature` function.
     unsafe {
         let k = _mm_set_epi32(w.rotate_left(8) as i32, 0, 0, 0);
         _mm_extract_epi32::<3>(_mm_aeskeygenassist_si128::<0x00>(k)) as u32
     }
 }
 
-/// The fifteen round keys, in `AESENC` order.
 #[inline(always)]
 pub(crate) fn expand256(key: &[u8; 32]) -> [__m128i; 15] {
     const RCON: [u32; 7] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
@@ -377,19 +263,12 @@ pub(crate) fn expand256(key: &[u8; 32]) -> [__m128i; 15] {
     })
 }
 
-/// The `AES-256` session state: fifteen round keys and the `H` powers.
 pub(crate) struct Engine256 {
     rk: [__m128i; 15],
     h: [(__m128i, __m128i); 4],
 }
 
 impl Engine256 {
-    /// Expand the key and build the `H` powers.
-    ///
-    /// # Safety
-    ///
-    /// `AES-NI`, `PCLMULQDQ` and `SSSE3` must be present. The only caller is
-    /// [`super::Aes256Gcm::new`], which probes exactly those three first.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn new(key: &[u8; 32]) -> Self {
         let rk = expand256(key);
@@ -397,21 +276,11 @@ impl Engine256 {
         Self { rk, h }
     }
 
-    /// Seal, on this engine's lanes.
-    ///
-    /// # Safety
-    ///
-    /// As [`Engine256::new`]: the probe at construction covers the features.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         super::seal_impl_256(&self.rk, &self.h, nonce, aad, buf)
     }
 
-    /// Open, on this engine's lanes.
-    ///
-    /// # Safety
-    ///
-    /// As [`Engine256::new`]: the probe at construction covers the features.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn open(
         &self,

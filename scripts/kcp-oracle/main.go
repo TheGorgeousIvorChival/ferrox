@@ -1,7 +1,3 @@
-// The oracle driver: runs a script of operations against the pinned Go
-// types and prints every emitted segment, so a Rust port can be compared
-// byte for byte. Nothing here is compiled into the shipped tree; it only
-// exists to be built from the pinned upstream checkout at test time.
 package main
 
 import (

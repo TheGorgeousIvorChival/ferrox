@@ -12,21 +12,8 @@ workspace = true
 [dependencies]
 ferrox-core = { workspace = true, features = ["bench-reference"] }
 chacha20 = "0.9"
-# Gate 10's reference: the crate the two `AES-128-GCM` hot paths sealed with
-# before `ferrox_core::aesgcm`. This crate is never shipped; it is the
-# "before" the gate measures against, the way `chacha20` is gate 1's.
 aes-gcm = "0.10"
 
-# The Windows leg of gate 5 samples its engine through the Win32 API, because there
-# is no `ps` on `windows-latest` worth shelling out to.
-#
-# `windows-sys` rather than hand-declared `extern "system"` blocks, and that is the
-# whole point of the dependency: this repository already had a Win32 sampler written
-# that way and it crashed the runner with `STATUS_ACCESS_VIOLATION`, because a
-# hand-written `PROCESS_MEMORY_COUNTERS` or a hand-written argument list is a layout
-# claim nobody checked. These declarations are generated from the SDK headers, so the
-# struct layouts and the signatures are right by construction rather than by review.
-# Features are exactly the four modules the sampler calls into.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.52", features = [
   "Win32_Foundation",

@@ -1,33 +1,3 @@
-//! `QUIC` dial for `VLESS`: pooled connections, one stream per session,
-//! through `quiche`.
-//!
-//! Why `quiche`: it is the `QUIC` stack the conformance notes name as the one
-//! the rungs dial through, pinned at the same version this builds against, and
-//! `sing-box`'s `with_quic` transport shows the shape to copy — a `UDP` socket,
-//! a `TLS` handshake inside `QUIC`, application bytes on stream zero — without
-//! copying any of its lines. `Xray-core` dropped the transport and `xray-rust`
-//! never had it, so there is no second wire to match: the `ALPN` below is `h3`,
-//! the default `sing-box` offers when none is configured, which is what makes
-//! this end compatible with the one peer that still speaks it.
-//!
-//! Trust is explicit or nothing: the caller hands over `DER` trust anchors the
-//! way [`ferrox_core::tls::TlsConfig`] does, they are wrapped to `PEM` and
-//! loaded into `BoringSSL` from a staged file that is deleted before dialling,
-//! and an empty anchor set refuses rather than connecting unverified. There is
-//! no system store, no `allowInsecure`, no fallback.
-//!
-//! One thread pumps packets and the downlink, the calling thread carries the
-//! uplink; the pump wakes on packets and timers, and the uplink flushes its own
-//! egress straight after queueing so no wake-up channel stands between a chunk
-//! and the wire. Joining is bounded by a poll cap, never by a peer.
-//!
-//! Connections are pooled by server: concurrent dials share one handshake and
-//! one socket, each on its own stream, the way `sing-box` pools its `QUIC`
-//! transports — except here a stream is a whole `VLESS` session with no mux
-//! framing at all, because `QUIC` streams already are that. The last stream
-//! out closes the connection; there is no idle linger (an idle pool needs a
-//! reaper, which is its own slice).
-
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
@@ -35,141 +5,71 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// What a `QUIC` dial needs: the server as written, and explicit trust.
 #[derive(Debug, Clone)]
 pub(crate) struct QuicDial {
-    /// User id bytes for the `VLESS` header on stream zero.
     pub(crate) id: [u8; 16],
-    /// Server name for `SNI` and certificate verification.
     pub(crate) host: String,
-    /// Server host as written.
     pub(crate) address: String,
-    /// Server port.
     pub(crate) port: u16,
-    /// `DER` trust anchors; `None` (or empty) refuses the dial outright.
     pub(crate) roots: Option<Vec<Vec<u8>>>,
 }
 
-/// One pooled server: the dial parameters a connection is safe to share.
-///
-/// The anchors ride along because two dials to one address with different
-/// trust must never share verification: equality is byte equality, not
-/// name equality.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct QuicServer {
-    /// Server host as written.
     address: String,
-    /// Server port.
     port: u16,
-    /// Server name for `SNI` and certificate verification.
     host: String,
-    /// `DER` trust anchors the connection verified against.
     roots: Option<Vec<Vec<u8>>>,
 }
 
-/// Sessions on one pooled connection: stream id to its `TCP` write half,
-/// plus the next client-initiated bidirectional id (`0`, `4`, `8`, …).
 struct PooledState {
-    /// Stream id to the `TCP` half its downlink writes through.
     sessions: HashMap<u64, TcpStream>,
-    /// Ids whose header exchange still belongs to their dial thread: the
-    /// pump leaves their bytes buffered for that thread's read, because a
-    /// `[0, 0]` drained here would reach the client as echo bytes and
-    /// starve the handshake that is waiting for it.
     opening: HashSet<u64>,
-    /// Next id to hand out; client-initiated bidirectional ids step by four.
     next_id: u64,
 }
 
-/// One pooled connection: the shared stack, its session table, and the
-/// socket the pump thread reads. Dial threads flush through clones, which
-/// share the same local port.
 #[derive(Clone)]
 struct PooledConn {
-    /// The shared `quiche` state; locked before the table, never after.
     conn: Arc<Mutex<quiche::Connection>>,
-    /// Session table; locked only while holding the connection lock or alone.
     table: Arc<Mutex<PooledState>>,
-    /// The bound socket; clones share its port.
     sock: Arc<UdpSocket>,
 }
 
-/// All pooled `QUIC` connections, by server. One per process: a relay that
-/// never runs should not pay for any, and a second pool would only split
-/// sharing along an invisible line.
 struct QuicPool {
-    /// Server to its live connection; entries leave only through eviction
-    /// below, so a lookup that finds one shares it.
     inner: Mutex<HashMap<QuicServer, PooledConn>>,
 }
 
-/// One per process, built on first use rather than at start-up.
 static QUIC_POOL: OnceLock<QuicPool> = OnceLock::new();
 
-/// The process pool: acquire here, never beside it.
 fn pool() -> &'static QuicPool {
     QUIC_POOL.get_or_init(|| QuicPool {
         inner: Mutex::new(HashMap::new()),
     })
 }
 
-/// The `ALPN` offered: `h3`, the default the one remaining peer negotiates.
 const ALPN_H3: &[u8] = b"h3";
 
-/// Source connection id bytes: unpredictable per connection, per `RFC 9000`.
 const SCID_LEN: usize = 16;
 
-/// Largest `UDP` payload taken per read, above any path `MTU` this dials over.
 const MAX_DATAGRAM: usize = 1350;
 
-/// A handshake slower than this is a path that will not carry the stream
-/// either — but shared runners stall threads for seconds, and a slow peer is
-/// not a dead one, so this is thirty seconds, not eight: the `TCP` dial
-/// budget it once mirrored measures one round trip, while a `QUIC`
-/// handshake is four flights plus crypto on both ends.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Idle `QUIC` connections close themselves after this long.
-///
-/// Five minutes, not two: a relayed stream outlives silence the way its `TCP`
-/// half does (which has no killer at all), and shared runners demonstrably
-/// stall threads past two minutes while the pump keeps ticking wall-clock
-/// timeouts — an idle killer at or below the test bounds reaps a connection
-/// whose dial already succeeded, and the relay drops `TCP` the test still
-/// holds. Dead peers still reap — just within five minutes instead of two —
-/// and every test bound below stays well under this one, so nothing here can
-/// die before the protocol gives up.
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
-/// Flow-control windows, the orders of magnitude `quiche`'s own apps default
-/// to: one stream carries whole sessions here, so an exhausted window is a
-/// dead peer rather than a tuning knob. Without these the stack advertises
-/// zero streams and every send fails with `StreamLimit`.
 pub(crate) const MAX_DATA: u64 = 10_000_000;
-/// Per-stream flow-control window; see [`MAX_DATA`].
 pub(crate) const MAX_STREAM_DATA: u64 = 1_000_000;
-/// Concurrent stream budget; see [`MAX_DATA`].
 pub(crate) const MAX_STREAMS: u64 = 100;
 
-/// How long the pump sleeps past a missing timer: it bounds joining after a
-/// local close, never the wire, which wakes on packets and real timers.
 const PUMP_POLL: Duration = Duration::from_millis(500);
 
-/// How long queued stream bytes wait for flow-control window before the dial
-/// gives up: windows this small mean a peer that will not read.
 const SEND_WAIT: Duration = Duration::from_secs(10);
 
-/// Staged trust files are unique per process and per dial.
 static TRUST_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Temporary diagnosis log for the pooled-`QUIC` sharing test: every dial and
-/// uplink stage with test-relative milliseconds, tagged by server port,
-/// dumped into the panic message on failure so it survives `cargo test`
-/// output capture. Removed once the `Linux` slowness is attributed.
 #[cfg(test)]
 pub(crate) static QSTAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Record one diagnosis stage; test builds only, see [`QSTAGES`].
 #[cfg(test)]
 pub(crate) fn qstage(ev: String) {
     if let Ok(mut log) = QSTAGES.lock() {
@@ -177,8 +77,6 @@ pub(crate) fn qstage(ev: String) {
     }
 }
 
-/// Milliseconds since the first diagnosis stage: per-phase durations without
-/// trusting interleaved log timestamps. Test builds only.
 #[cfg(test)]
 pub(crate) fn qms() -> u128 {
     static QT0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -187,20 +85,8 @@ pub(crate) fn qms() -> u128 {
         .as_millis()
 }
 
-/// Standard-base64 alphabet, the one `PEM` wraps `DER` in.
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// One base64 line: up to 48 input bytes into the 64 output bytes a `PEM`
-/// line holds, padding included; returns the bytes written.
-///
-/// A full line is exactly 64 characters with no padding, so encoding line by
-/// line is the same bytes as encoding whole and wrapping after — which is
-/// what lets [`der_to_pem`] skip the intermediate buffer entirely.
-///
-/// # Panics
-///
-/// If `bytes` is longer than 48: longer input would overrun `out`, and every
-/// caller here works in 48-byte lines or shorter.
 fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
     assert!(bytes.len() <= 48, "base64 lines are 48 input bytes");
     let mut written = 0;
@@ -223,18 +109,12 @@ fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
     written
 }
 
-/// One base64 digit value, `None` for padding and garbage alike.
 fn base64_value(byte: u8) -> Option<u8> {
     B64.iter()
         .position(|digit| *digit == byte)
         .map(|slot| slot as u8)
 }
 
-/// Standard-base64 decode, whitespace skipped; `false` on any garbage.
-///
-/// Padding is terminal: data after `=` or more than two pads is garbage, and
-/// a short final quantum emits only the bytes it names — `"Zg=="` is one
-/// byte, not three.
 fn base64_decode(text: &[u8], out: &mut Vec<u8>) -> bool {
     let mut word = 0u32;
     let mut slots = 0;
@@ -275,10 +155,6 @@ fn base64_decode(text: &[u8], out: &mut Vec<u8>) -> bool {
     slots == 0
 }
 
-/// Wrap `DER` in `PEM` under `label`, body at 64 columns.
-///
-/// One pass with no intermediate buffer: 48 input bytes encode to exactly one
-/// 64-character line, so each line is encoded straight into the output.
 pub(crate) fn der_to_pem(der: &[u8], label: &str) -> Vec<u8> {
     let mut pem = Vec::new();
     pem.extend_from_slice(b"-----BEGIN ");
@@ -296,10 +172,6 @@ pub(crate) fn der_to_pem(der: &[u8], label: &str) -> Vec<u8> {
     pem
 }
 
-/// Every `CERTIFICATE` block in `pem` as `DER`.
-///
-/// Strict: one undecodable block voids the whole bundle, because trust anchors
-/// are not the place where "most of it parsed" is a passing grade.
 pub(crate) fn parse_ca_pem(pem: &[u8]) -> Vec<Vec<u8>> {
     const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
     const END: &[u8] = b"-----END CERTIFICATE-----";
@@ -320,8 +192,6 @@ pub(crate) fn parse_ca_pem(pem: &[u8]) -> Vec<Vec<u8>> {
     certs
 }
 
-/// Stage a trust bundle where `BoringSSL` can load it: a unique file in the
-/// temporary directory, deleted by the caller right after loading.
 fn stage_trust_file(bundle: &[u8]) -> Option<std::path::PathBuf> {
     let name = format!(
         "ferrox-quic-roots-{}-{}.pem",
@@ -333,10 +203,6 @@ fn stage_trust_file(bundle: &[u8]) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// A client `quiche` config over explicit anchors, `None` without any.
-///
-/// Verification stays on: an empty anchor set is a refusal, not an unverified
-/// connection. The staged file is deleted before returning either way.
 pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
     if roots.is_empty() {
         return None;
@@ -366,12 +232,6 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
     config
 }
 
-/// Send every queued datagram at the address `quiche` names, ignoring
-/// per-packet loss.
-///
-/// Loss is `QUIC`'s own job to notice and repair; a datagram the kernel
-/// refuses surfaces as a handshake or stream timeout at the operation that is
-/// actually waiting, which is where the error belongs.
 fn flush_egress(conn: &mut quiche::Connection, sock: &UdpSocket) {
     let mut out = [0u8; MAX_DATAGRAM];
     while let Ok((written, info)) = conn.send(&mut out) {
@@ -379,11 +239,6 @@ fn flush_egress(conn: &mut quiche::Connection, sock: &UdpSocket) {
     }
 }
 
-/// One inbound datagram through the connection plus one flush out.
-///
-/// `false` only when the socket itself is gone; undecodable packets are
-/// dropped on the floor, because anything brighter (closing on garbage) hands
-/// every off-path spoofer a kill switch for the connection.
 fn pump_once(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
@@ -413,7 +268,6 @@ fn pump_once(
     true
 }
 
-/// Drive a fresh connection to established, or `None` on timeout or refusal.
 fn drive_handshake(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
@@ -433,7 +287,6 @@ fn drive_handshake(
     Some(())
 }
 
-/// Queue the whole buffer on a stream, waiting out flow control within reason.
 fn stream_send_all(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
@@ -450,9 +303,6 @@ fn stream_send_all(
                     flush_egress(conn, sock);
                     return true;
                 }
-                // No progress without an error is a wait like `Done`, not a
-                // state to spin in: bound it by the same deadline, or a peer
-                // that never opens window hangs the dial aimlessly.
                 if written == 0 {
                     if Instant::now() >= deadline {
                         return false;
@@ -475,7 +325,6 @@ fn stream_send_all(
     true
 }
 
-/// Read exactly `want` stream bytes, pumping packets meanwhile.
 fn stream_recv_exact(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
@@ -509,7 +358,6 @@ fn stream_recv_exact(
     (out.len() == want).then_some(out)
 }
 
-/// A `UDP` socket bound for `address:port`, family-matched like the `TCP` dial.
 fn udp_to_server(address: &str, port: u16) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
     let peer = format!("{address}:{port}").to_socket_addrs().ok()?.next()?;
     let sock = if peer.is_ipv6() {
@@ -521,7 +369,6 @@ fn udp_to_server(address: &str, port: u16) -> Option<(UdpSocket, SocketAddr, Soc
     Some((sock, peer, local))
 }
 
-/// Handshake one `QUIC` connection at `peer`, over explicit anchors.
 fn handshake(
     sock: &UdpSocket,
     peer: SocketAddr,
@@ -538,21 +385,12 @@ fn handshake(
     Some(conn)
 }
 
-/// Packets in and every open stream out to its `TCP` half, until the
-/// connection ends.
-///
-/// Unknown ids drain into the void rather than stalling the connection:
-/// a removed session's bytes are nobody's, but its window still belongs to
-/// the flow control both ends agreed on. The staging list is reused across
-/// wakeups; only the session table behind it is shared.
 fn pump(
     shared: &Arc<Mutex<quiche::Connection>>,
     table: &Arc<Mutex<PooledState>>,
     sock: &UdpSocket,
     local: SocketAddr,
 ) {
-    // One scratch list, reused: it names the streams with data this wakeup,
-    // never the data itself, which is written straight through below.
     let mut ready: Vec<(u64, TcpStream)> = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -581,7 +419,6 @@ fn pump(
                         .and_then(|half| half.try_clone().ok())
                 };
                 if half.is_none() {
-                    // Gone mid-flight: still drain, or its window never opens.
                     while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
                         if n == 0 {
                             break;
@@ -618,12 +455,6 @@ fn pump(
     }
 }
 
-/// Drop one session and, when it was the last, the connection with it.
-///
-/// Every exit path lands here or nowhere: an entry left behind is a stream
-/// id never handed out again on a connection nobody closes. Each step
-/// tolerates already being done, because two sessions can end together and
-/// only one of them finds anything left to close.
 fn leave_session(
     shared: &Arc<Mutex<quiche::Connection>>,
     table: &Arc<Mutex<PooledState>>,
@@ -652,11 +483,6 @@ fn leave_session(
     }
 }
 
-/// Open one session on a pooled connection: refuse a dead stack (evicting
-/// it so the next dial rebuilds), refuse past the advertised stream budget,
-/// and register the downlink half marked still-opening — or `None` on any
-/// of those, having added nothing. The dial graduates it past the header
-/// exchange; until then the pump will not touch its bytes.
 fn open_session(pooled: &PooledConn, key: &QuicServer, client: &TcpStream) -> Option<u64> {
     let Ok(conn) = pooled.conn.lock() else {
         return None;
@@ -684,8 +510,6 @@ fn open_session(pooled: &PooledConn, key: &QuicServer, client: &TcpStream) -> Op
     Some(id)
 }
 
-/// Carry one stream's uplink on the calling thread, then leave: `fin` the
-/// stream and drop the session, closing (and evicting) when it was the last.
 fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStream) {
     let Ok(flush_sock) = pooled.sock.try_clone() else {
         leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), key, id);
@@ -700,9 +524,6 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStr
         match plain.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                // Locked per attempt, never across the sleep: holding the
-                // lock while waiting for window starves the pump behind us,
-                // and no window ever opens.
                 let mut rest = &chunk[..n];
                 let deadline = Instant::now() + SEND_WAIT;
                 let sent = loop {
@@ -767,9 +588,6 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStr
     leave_session(&pooled.conn, &pooled.table, &flush_sock, pool(), key, id);
 }
 
-/// Dial one `VLESS` stream over a pooled `QUIC` connection: share the
-/// server's connection when one lives, build (and publish for the next dial)
-/// when none does, then header, `[0, 0]` and relay on a fresh stream.
 pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAddr) {
     let key = QuicServer {
         address: dial.address.clone(),
@@ -777,8 +595,6 @@ pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAd
         host: dial.host.clone(),
         roots: dial.roots.clone(),
     };
-    // Look first, build outside the lock: holding the pool across a handshake
-    // would serialize every dial behind one slow server.
     let pooled = if let Ok(pool) = pool().inner.lock() {
         pool.get(&key).cloned()
     } else {
@@ -796,8 +612,6 @@ pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAd
         #[cfg(test)]
         qstage(format!("{} t={} built", dial.port, qms()));
         let Ok(mut pool) = pool().inner.lock() else {
-            // Nowhere to publish it, but nothing stops this dial from using
-            // it privately: eviction below is a no-op on an absent key.
             return Some(fresh);
         };
         if let Some(live) = pool.get(&key) {
@@ -846,7 +660,6 @@ pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAd
         leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), &key, id);
         return;
     }
-    // Graduated: the acceptance is read, so the downlink is the pump's now.
     if let Ok(mut table) = pooled.table.lock() {
         table.opening.remove(&id);
     }
@@ -855,13 +668,10 @@ pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAd
     uplink_stream(&pooled, &key, id, client);
 }
 
-/// Build one pooled connection outside the pool lock: socket, handshake,
-/// pump thread, table — or `None` when any of it refuses.
 fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = udp_to_server(&dial.address, dial.port)?;
     let mut conn = handshake(&sock, peer, local, &dial.host, roots)?;
-    // Drain anything the handshake left queued before sharing the stack.
     flush_egress(&mut conn, &sock);
     let shared = Arc::new(Mutex::new(conn));
     let table = Arc::new(Mutex::new(PooledState {
@@ -886,7 +696,6 @@ fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
 mod tests {
     use super::*;
 
-    /// `RFC 4648` vectors, the whole contract in four lines.
     #[test]
     fn base64_matches_the_rfc_vectors() {
         let mut block = [0u8; 64];
@@ -906,7 +715,6 @@ mod tests {
         let mut garbage = Vec::new();
         assert!(!base64_decode(b"!!!", &mut garbage));
         assert!(!base64_decode(b"Zg=", &mut garbage));
-        // A wrapped body with padding decodes back exactly.
         let long = vec![0xabu8; 50];
         let mut wrapped = Vec::new();
         for chunk in long.chunks(48) {
@@ -919,7 +727,6 @@ mod tests {
         assert_eq!(unwrapped, long);
     }
 
-    /// `PEM` wraps at 64 columns under the label given.
     #[test]
     fn pem_wraps_at_sixty_four_columns() {
         let pem = der_to_pem(&[0xabu8; 48], "CERTIFICATE");
@@ -935,7 +742,6 @@ mod tests {
         assert_eq!(parse_ca_pem(&pem), vec![vec![0xabu8; 48]]);
     }
 
-    /// One corrupt block voids the bundle: trust is all-or-nothing.
     #[test]
     fn corrupt_bundle_parses_to_nothing() {
         assert_eq!(parse_ca_pem(b"no blocks here"), Vec::<Vec<u8>>::new());
@@ -944,14 +750,12 @@ mod tests {
         assert_eq!(parse_ca_pem(&pem), Vec::<Vec<u8>>::new());
     }
 
-    /// No anchors, no config; garbage anchors, no config either.
     #[test]
     fn config_refuses_without_trust() {
         assert!(quiche_config(&[]).is_none());
         assert!(quiche_config(&[vec![0u8; 16]]).is_none());
     }
 
-    /// A real anchor builds a real config: `rcgen` mints, `quiche` loads.
     #[test]
     fn config_loads_a_minted_anchor() {
         let minted =

@@ -1,21 +1,6 @@
-//! Config-driven comparison: hand CI a working `vless://` link, get a table.
-//!
-//! Proof order is the same as the main gates: identity first, deterministic
-//! counts second, timings last (reported, never gated here — the live network
-//! is not a deterministic machine). Credentials never reach the report: the
-//! link's UUID, public key and host are redacted before anything prints.
-//!
-//! Against whom: the pinned upstreams in `upstream/pins.toml` — Xray-core,
-//! sing-box, xray-rust — each built from its pin. A core that cannot be
-//! configured for the link's transport gets an empty cell *with the reason*
-//! (from `VlessLink::support`), never an omission. A live end-to-end column
-//! runs only when `FERROX_LIVE=1` *and* the link's transport is
-//! `Implemented`; otherwise it is empty with the reason too.
-
 use ferrox_core::vless::VlessLink;
 use std::fmt::Write as _;
 
-/// Redacted one-line description: method + support, no secrets.
 pub fn describe_redacted(link: &VlessLink) -> String {
     format!(
         "type={} security={} flow={} fp={} sni-present={} support={}",
@@ -34,8 +19,6 @@ pub fn describe_redacted(link: &VlessLink) -> String {
     )
 }
 
-/// Run the offline comparator: header-encode microbench + record-layer
-/// throughput at the link's framing size. Returns markdown for the report.
 pub fn compare_offline(link: &VlessLink) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "\n## Config comparison (offline, no network)\n");
@@ -46,7 +29,6 @@ pub fn compare_offline(link: &VlessLink) -> String {
         link.support()
     );
 
-    // Header encode: zero-alloc form, counted to prove it.
     let target = "example.com";
     let need = link.request_header_len(target);
     let mut hdr_buf = vec![0u8; need];
@@ -65,10 +47,6 @@ pub fn compare_offline(link: &VlessLink) -> String {
         "| encode_into | {ns:.1} ns/op, 0 allocs (caller buffer) |"
     );
 
-    // Record layer at framing sizes (1440 B MSS-ish, 16384 B record): ours vs
-    // reference, median of 5 interleaved runs — the same discipline as gate 3
-    // but reported, not gated. Medians, not bests: a best rewards the luckiest
-    // scheduling accident, a median reports the typical one.
     let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
     let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(53).wrapping_add(7));
     for len in [1440usize, 16384] {
@@ -110,9 +88,6 @@ pub fn compare_offline(link: &VlessLink) -> String {
         );
     }
 
-    // Who the comparison is against: every pinned source and its exact commit.
-    // A comparison against "latest" is not a comparison — this table names what
-    // was measured against, read straight from the pins file at compile time.
     s.push_str("\n| upstream | pinned rev | suite |\n");
     s.push_str("|---|---|---|\n");
     for (name, rev, suite) in pinned_sources() {
@@ -147,10 +122,6 @@ pub fn compare_offline(link: &VlessLink) -> String {
     s
 }
 
-/// Every pinned upstream source, read from `upstream/pins.toml` at compile
-/// time: `(name, rev, suite)`. `suite` is the conformance command that checks
-/// our implementation for that source, or empty when its rung is not
-/// implemented yet (the cell then shows the reason, never an omission).
 fn pinned_sources() -> Vec<(String, String, String)> {
     const PINS: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -187,7 +158,6 @@ fn pinned_sources() -> Vec<(String, String, String)> {
     out
 }
 
-/// `key = "value"` accessor for the pins subset above.
 fn value_of(line: &str, key: &str) -> Option<String> {
     let (k, v) = line.split_once('=')?;
     if k.trim() != key {

@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# Refreshes the pinned upstream commits in upstream/pins.toml.
-#
-# Writes the change and shows the diff; it does not commit. A pin bump is a
-# change to what every comparison in this project is measured against, so it
-# should be reviewable on its own rather than riding along with a code change.
-# Pass --pr to have `gh` open the pull request, which is what CI uses.
-#
-# This rewrites `rev` to the tip of each source's `default_branch`. That is a
-# deliberate choice, not a neutral one: bumping a pin changes the reference, so
-# the benchmark table has to be regenerated before the new numbers mean
-# anything. CI does that on the same commit.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -23,9 +12,6 @@ if [[ ! -f "$pins_file" ]]; then
   exit 1
 fi
 
-# name<TAB>repo<TAB>branch, read the same way the checker reads it.
-# Read into an array with a while loop rather than `mapfile`, which is bash 4+;
-# macOS still ships bash 3.2 and this script is expected to run there.
 entries=()
 while IFS= read -r line; do
   [[ -n "$line" ]] && entries+=("$line")
@@ -69,8 +55,6 @@ for entry in "${entries[@]}"; do
 
   echo "bump: $name ${old:-<none>} -> $tip"
 
-  # Replace the rev only within this source's block. A global substitution would
-  # rewrite every pin to the same commit the first time two sources agreed.
   awk -v want="$name" -v tip="$tip" '
     /^\[sources\./ { cur = $0; sub(/^\[sources\./, "", cur); sub(/\]$/, "", cur) }
     cur == want && /^rev[[:space:]]*=/ && !done { print "rev           = \"" tip "\""; done = 1; next }

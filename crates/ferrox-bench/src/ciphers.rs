@@ -1,52 +1,3 @@
-//! Gate 9: the three `shadowsocks` ciphers, side by side.
-//!
-//! # What this gate is
-//!
-//! The `shadowsocks` rung added two connection ways to a matrix that had one, so
-//! the cost question is not "faster than upstream" — it is **"do the ways we
-//! added cost what the way we had cost?"** `aes-256-gcm` is therefore this
-//! gate's reference: not a flattering choice but the one method that has been
-//! here all along, and the method the `aes-256-gcm` conformance row proves.
-//!
-//! Every row asserts the two sides produce the same bytes before either is
-//! timed, which is the same discipline gates 1, 4, 6 and 7 use.
-//!
-//! # Why the timing rows are printed and not judged
-//!
-//! **This is a decision recorded before any run of this gate, and the reason is
-//! structural rather than a shrug.** The two sides straddle a hardware boundary
-//! that differs per runner: the `aes-256-gcm` reference runs `aes-gcm`, which
-//! dispatches to AES-NI on `x86_64` and to the ARMv8-Crypto backend only behind
-//! the two `--cfg`s `ci.yml` sets, and falls back to its soft table
-//! implementation without them, while `chacha20-ietf-poly1305` runs this
-//! crate's own NEON and AVX2 ladder. (`aes-128-gcm` ran `aes-gcm` too when this
-//! was written; it now runs `ferrox_core::aesgcm`, which gate 10 measures
-//! against the crate directly.)
-//! So the ratio between them is a property of the runner's AES as much as of the
-//! code — the same shape of problem `muxframe.rs` documents for its encode rows,
-//! and the same reason the report names both backends on every other page.
-//!
-//! What this gate *does* judge is the part that can be a fact rather than a
-//! reading, and it judges it for all three methods:
-//!
-//! - **no allocation per chunk**, sealing into a buffer the caller has already
-//!   staged and opening in place. This is the claim the relay makes, so it is
-//!   the one worth asserting rather than reporting -- as **under one allocation
-//!   per chunk**, which is gate 7's bar and for gate 7's reason: `count::measure`
-//!   sets one process-wide flag, so under a test runner a count also holds
-//!   whatever the *other* tests are allocating at that moment. Measured here in
-//!   run `37263530382`: **666 allocations over 64 chunks**, every one of them
-//!   another test's, none of them this code's. The assertion therefore lives in
-//!   this gate rather than in a `#[test]`, which is why `muxframe.rs` and
-//!   `earlydata.rs` put theirs there too. The bar keeps its slack anyway, and in the
-//!   gate it does not need it: run `37264964528` reads **0 allocations and 0 bytes
-//!   in all sixty windows** -- three methods, five lengths, four native runners.
-//! - **the derivation is the method's length**: `aes-128-gcm` derives sixteen
-//!   bytes of master key and `aes-256-gcm` thirty-two, so one `MD5` round
-//!   against two. `MasterKey::rounds` is where that number comes from and
-//!   `crates/ferrox-core/src/shadowsocks.rs` asserts it; here it is timed, so
-//!   the saving is visible rather than argued.
-
 use std::fmt::Write as _;
 
 use ferrox_core::shadowsocks::{Cipher, MasterKey, Method, MAX_CHUNK};
@@ -54,44 +5,23 @@ use ferrox_core::shadowsocks::{Cipher, MasterKey, Method, MAX_CHUNK};
 use crate::count;
 use crate::framing::{best_of, Row};
 
-/// Chunks per timed shape. A chunk is at most `0x3FFF` bytes, so a 2 KiB budget
-/// is a fraction of a second a side.
 const ITERS: u64 = 100_000;
 
-/// Iterations the allocation window runs, matching gate 7's discipline.
 const ALLOC_ITERS: u64 = 64;
 
-/// The payload lengths the gate times.
-///
-/// The small end is a whole chunk — an address header and its length prefix, the
-/// shortest a live connection ever seals — and the top is `MAX_CHUNK` itself,
-/// which is the one length where the framing's cost is amortised over as much
-/// payload as the format allows.
 fn payloads() -> Vec<usize> {
     vec![64, 512, 1400, 8171, MAX_CHUNK]
 }
 
-/// The reference method: the one that shipped, and the one the conformance row
-/// names.
 const REFERENCE: Method = Method::Aes256Gcm;
 
-/// What one method's allocation window counted, for the report to print.
-///
-/// The counts are printed rather than only judged because a bar of "under one
-/// per chunk" that reads 0 on three lengths and something else on the fourth
-/// asks a question the reader should be able to see the answer to.
 pub(crate) struct Window {
-    /// The method that was measured.
     pub(crate) method: &'static str,
-    /// The chunk length the window ran at.
     pub(crate) len: usize,
-    /// What it allocated while the counting flag was up.
     pub(crate) counts: count::Counts,
-    /// Chunks the window sealed and opened.
     pub(crate) iters: u64,
 }
 
-/// Gate 9: every row's assertions, then every row timed.
 pub(crate) fn gate_ciphers() -> (Vec<Row>, Vec<Window>) {
     let mut rows = Vec::new();
     let mut windows = Vec::new();
@@ -110,12 +40,6 @@ pub(crate) fn gate_ciphers() -> (Vec<Row>, Vec<Window>) {
                 bytes: len,
                 base: control,
                 ours,
-                // Gate 9 prints these rows and judges none of them, because the
-                // two sides straddle a hardware boundary that differs per runner
-                // (see this file's header). Nothing here feeds the bar, so there
-                // is nothing to confirm: a second reading would change no verdict
-                // and only make the published ratio disagree with the decision to
-                // report rather than gate.
                 remeasured: false,
             });
         }
@@ -123,7 +47,6 @@ pub(crate) fn gate_ciphers() -> (Vec<Row>, Vec<Window>) {
     (rows, windows)
 }
 
-/// One method at one length: identity, allocations, then the seconds per chunk.
 fn check_and_time(method: Method, len: usize, plain: &[u8], windows: &mut Vec<Window>) -> f64 {
     let (sealed, opened) = round_trip(method, plain);
     assert_eq!(opened, plain, "{} {len}: the same bytes", method.name());
@@ -137,8 +60,6 @@ fn check_and_time(method: Method, len: usize, plain: &[u8], windows: &mut Vec<Wi
     time_chunks(method, plain)
 }
 
-/// A chunk sealed and opened, as the relay does it: one buffer staged once and
-/// reused, the payload copied in and sealed in place, the tag behind it.
 fn round_trip(method: Method, plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let salt = [0x24u8; 32];
     let mut send = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
@@ -151,31 +72,11 @@ fn round_trip(method: Method, plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (sealed, wire[..opened].to_vec())
 }
 
-/// No allocation per chunk, sealing into a staged buffer and opening in place.
-///
-/// The relay's own shape, so this is the claim it depends on: `staging` is
-/// allocated once per direction and every chunk after the first rides in it.
-///
-/// **The bar is under one allocation per chunk, not zero**, and this is gate 7's
-/// bar for gate 7's reason, applied here rather than inherited by reflex.
-/// `count::measure` sets one process-wide flag, so under a test runner the window
-/// also counts whatever the other tests allocate while it is open -- 666
-/// allocations over 64 chunks in run `37263530382`, none of them this code's.
-/// That is also why this assertion is here and not in the `#[test]`.
-///
-/// Zero is not demanded because an 8 KiB allocation from outside the encode has
-/// been seen inside a release window in gate 7 -- `docs/claims.md`'s open item
-/// P32 -- and a gate that demanded zero here would be gating on that unknown
-/// rather than on this code. What is decidable is the shape of the claim, and it
-/// is the claim the relay makes: **a chunk does not allocate per call.** The exact
-/// counts go to the report, so a reader sees the number behind the bar and not
-/// only the verdict.
 fn check_allocs(method: Method, len: usize, plain: &[u8], windows: &mut Vec<Window>) {
     let salt = [0x24u8; 32];
     let mut staging = Vec::with_capacity(plain.len() + ferrox_core::shadowsocks::TAG_LEN);
     let mut send = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
     let mut recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
-    // Two warm-up chunks so neither side is charged for growing its buffer.
     send.seal_into(plain, &mut staging).expect("seals");
     recv.open_in_place(&mut staging).expect("opens");
 
@@ -203,7 +104,6 @@ fn check_allocs(method: Method, len: usize, plain: &[u8], windows: &mut Vec<Wind
     });
 }
 
-/// Seconds per chunk, sealing and opening one each time.
 fn time_chunks(method: Method, plain: &[u8]) -> f64 {
     let salt = [0x24u8; 32];
     let mut staging = Vec::with_capacity(plain.len() + ferrox_core::shadowsocks::TAG_LEN);
@@ -220,8 +120,6 @@ fn time_chunks(method: Method, plain: &[u8]) -> f64 {
     })
 }
 
-/// The per-session derivation, which is where `aes-128-gcm` is cheaper than the
-/// method it joins, and what the `MD5` round count is.
 pub(crate) fn derivations() -> Vec<(&'static str, usize, usize)> {
     [Method::Aes128Gcm, REFERENCE, Method::Chacha20Poly1305]
         .into_iter()
@@ -232,7 +130,6 @@ pub(crate) fn derivations() -> Vec<(&'static str, usize, usize)> {
         .collect()
 }
 
-/// The `shadowsocks` section of the report, appended after the early-data one.
 pub(crate) fn report(rows: &[Row], windows: &[Window]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "\n## Gate 9 — the shadowsocks ciphers\n");
@@ -335,17 +232,6 @@ pub(crate) fn report(rows: &[Row], windows: &[Window]) -> String {
 mod tests {
     use super::*;
 
-    /// Every row agrees with its reference byte for byte.
-    ///
-    /// A row whose two sides disagreed fails here rather than after a hundred
-    /// thousand chunks of a measurement that would have meant nothing.
-    ///
-    /// **The allocation half of the gate is not here.** `count::measure` sets one
-    /// process-wide flag, so a `#[test]` that counted would also count the other
-    /// tests running beside it -- 666 allocations over 64 chunks in run
-    /// `37263530382`, which is what this test's first draft asserted against
-    /// zero. `check_allocs` runs in the gate instead, where nothing else is
-    /// running, exactly as `muxframe.rs` and `earlydata.rs` do theirs.
     #[test]
     fn every_cipher_row_agrees_and_allocates_nothing() {
         assert_eq!(payloads(), vec![64, 512, 1400, 8171, MAX_CHUNK]);
@@ -368,8 +254,6 @@ mod tests {
         }
     }
 
-    /// The three methods do not produce the same chunk, so a row that agrees with
-    /// `aes-256-gcm` cannot pass on a method that merely round-trips its own.
     #[test]
     fn no_two_methods_produce_the_same_chunk() {
         let plain = b"the same bytes under three ciphers".to_vec();
@@ -389,8 +273,6 @@ mod tests {
         }
     }
 
-    /// The derivation table, with the two `AES` methods differing in the one
-    /// number this rung makes them differ in.
     #[test]
     fn aes_128_derives_half_the_master_key() {
         let table = derivations();

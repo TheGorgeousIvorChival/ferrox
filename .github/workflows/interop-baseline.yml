@@ -1,6 +1,5 @@
 name: interop-baseline
 
-# Informational, not a gate: runs every test the zeronet + xray-rust suites have against ferrox-app and documents each verdict. Failures never fail this job; only infra failures go red. sing-box has no seam, so it is checked for one and documented, not executed.
 
 on:
   pull_request:

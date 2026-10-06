@@ -1,44 +1,20 @@
-//! A minimal `JSON` reader and writer, so the harness has no dependency whose
-//! version could move a number.
-//!
-//! The benchmark's inputs and outputs are `JSON` documents, and the project
-//! policy is that a measurement should not be attributable to a transitive
-//! dependency that a lockfile bump could change
-//! (`upstream/zeronet/docs/benchmarks/README.md:21`, "No dependencies. std only,
-//! so CI builds it in seconds and nobody has to reason about whether a patched
-//! transitive crate moved the number"). The same argument applies here: the
-//! harness reads a request and writes a result, and nothing else it does needs a
-//! serialisation library.
-//!
-//! It is deliberately small: objects, arrays, strings with the standard escapes,
-//! numbers, `true`/`false`/`null`, nested 32 deep. Anything else is an error
-//! rather than a guess, because a guess in a request parser is a request that
-//! measures something other than what it says.
-
 use std::fmt::Write as _;
 
-/// One `JSON` value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
     Null,
     Bool(bool),
-    /// Numbers are `f64`: every number in a request is a count or a port, and a
-    /// count this harness accepts is below 2^32.
     Num(f64),
     Str(String),
     Arr(Vec<Json>),
-    /// Insertion order is kept, so a written document is byte-stable and a diff
-    /// between two runs shows the changed value rather than a reordered object.
     Obj(Vec<(String, Json)>),
 }
 
 impl Json {
-    /// An empty object.
     pub fn object() -> Self {
         Self::Obj(Vec::new())
     }
 
-    /// Insert or replace a member. Insertion order is preserved on first insert.
     pub fn insert(&mut self, key: &str, value: Json) {
         if let Self::Obj(pairs) = self {
             match pairs.iter_mut().find(|(k, _)| k == key) {
@@ -48,7 +24,6 @@ impl Json {
         }
     }
 
-    /// Member lookup, `None` on a non-object or an absent key.
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Self::Obj(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
@@ -56,7 +31,6 @@ impl Json {
         }
     }
 
-    /// String contents, `None` for every other shape.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s),
@@ -64,7 +38,6 @@ impl Json {
         }
     }
 
-    /// Array items, `None` for every other shape.
     pub fn as_arr(&self) -> Option<&[Json]> {
         match self {
             Self::Arr(items) => Some(items),
@@ -72,7 +45,6 @@ impl Json {
         }
     }
 
-    /// Object members, `None` for every other shape.
     pub fn as_obj(&self) -> Option<&[(String, Json)]> {
         match self {
             Self::Obj(pairs) => Some(pairs),
@@ -80,11 +52,6 @@ impl Json {
         }
     }
 
-    /// A finite number, `None` for a non-number or a non-finite one.
-    ///
-    /// The finiteness check is load-bearing rather than defensive: `NaN` and the
-    /// infinities have no `JSON` spelling, so a document containing one is a
-    /// document this parser has misread.
     pub fn as_num(&self) -> Option<f64> {
         match self {
             Self::Num(n) if n.is_finite() => Some(*n),
@@ -92,7 +59,6 @@ impl Json {
         }
     }
 
-    /// A boolean, `None` for every other shape.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(b) => Some(*b),
@@ -100,12 +66,6 @@ impl Json {
         }
     }
 
-    /// Serialise to compact `JSON`.
-    ///
-    /// Named `to_string` rather than implementing `Display` because it can fail:
-    /// a `f64` that is not finite has no `JSON` spelling, so a document holding
-    /// one has to be an error at the point it is written rather than a `NaN`
-    /// appearing in a published result.
     #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> Result<String, String> {
         let mut out = String::new();
@@ -113,11 +73,6 @@ impl Json {
         Ok(out)
     }
 
-    /// Serialise into `out`, which is what [`Self::to_string`] wraps.
-    ///
-    /// A non-finite number is an error rather than a `NaN` in the output: a
-    /// `result.json` is read by other tools, and a document they cannot parse is
-    /// better than one they parse into a number that means nothing.
     fn write(&self, out: &mut String) -> Result<(), String> {
         match self {
             Self::Null => out.push_str("null"),
@@ -161,12 +116,6 @@ impl Json {
     }
 }
 
-/// Write a `JSON` string literal, escaping what the grammar requires.
-///
-/// The two mandatory escapes, the five short forms, and every control character
-/// below `0x20` as `\u00XX`. A lone surrogate cannot be produced by `escape_default`
-/// for a `char`, and Rust strings cannot hold one, so the pair of cases above
-/// `0x7f` needs nothing.
 fn write_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
@@ -187,7 +136,6 @@ fn write_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
-/// Parse a whole document, rejecting trailing bytes after the first value.
 pub fn parse(text: &str) -> Result<Json, String> {
     let mut cursor = Cursor {
         bytes: text.as_bytes(),
@@ -201,29 +149,24 @@ pub fn parse(text: &str) -> Result<Json, String> {
     Ok(value)
 }
 
-/// Deepest nesting accepted, matching the config reader in `ferrox-app`.
 const MAX_DEPTH: usize = 32;
 
-/// Byte cursor over the document.
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 
 impl Cursor<'_> {
-    /// Skip whitespace between tokens.
     fn gap(&mut self) {
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
 
-    /// The byte at the cursor, or `None` at the end.
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
     }
 
-    /// Expect one literal byte.
     fn expect(&mut self, byte: u8) -> Result<(), String> {
         if self.peek() == Some(byte) {
             self.pos += 1;
@@ -236,7 +179,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// One complete value.
     fn value(&mut self, depth: usize) -> Result<Json, String> {
         if depth > MAX_DEPTH {
             return Err(format!("nested deeper than {MAX_DEPTH}"));
@@ -254,7 +196,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// A fixed literal.
     fn literal(&mut self, text: &str, value: Json) -> Result<Json, String> {
         if self.bytes[self.pos..].starts_with(text.as_bytes()) {
             self.pos += text.len();
@@ -343,8 +284,6 @@ impl Cursor<'_> {
                         }
                     }
                 }
-                // Anything at or above 0x80 is copied through: the bytes are
-                // passed on unchanged and validated as UTF-8 at the end.
                 _ => {
                     let start = self.pos - 1;
                     while self.pos < self.bytes.len()
@@ -359,7 +298,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// `\uXXXX`, with a surrogate pair joined when the next escape is the low half.
     fn unicode_escape(&mut self) -> Result<char, String> {
         let high = self.hex4()?;
         if (0xd800..0xdc00).contains(&high) {
@@ -466,8 +404,6 @@ mod tests {
         assert_eq!(render(1.5), "1.5");
     }
 
-    /// A non-finite number has no `JSON` spelling, so writing one is an error at
-    /// the point of writing rather than a `NaN` in a published result.
     #[test]
     fn a_non_finite_number_is_refused_rather_than_written() {
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -486,10 +422,8 @@ mod tests {
             r#""unterminated"#,
             r#""\q""#,
             r#""\ud83c""#,
-            // A lone low surrogate, and an escape that is not four hex digits.
             r#""\udf00""#,
             r#""\u00g0""#,
-            // Trailing bytes after a complete value, including a second value.
             "{} {}",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} must not parse");

@@ -1,7 +1,4 @@
 #![allow(clippy::missing_panics_doc)]
-//! The two ways a mkcp connection starts: client `dial` and server
-//! `Listener`. Both sit on plain `UDP` sockets, demux datagrams into
-//! segments, and hand each conversation to its own [`Connection`].
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -16,7 +13,6 @@ use super::config::Config;
 use super::connection::{ConnMetadata, Connection, State};
 use super::segment::{read_segment, Command, Segment};
 
-/// The one-datagram writer injected per session.
 type Writer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send>;
 
 static NEXT_CONVERSATION: AtomicU16 = AtomicU16::new(1);
@@ -25,7 +21,6 @@ fn next_conversation() -> u16 {
     NEXT_CONVERSATION.fetch_add(1, Ordering::Relaxed).max(1)
 }
 
-/// Every datagram in one input buffer, parsed front to back.
 fn parse_segments(buf: &[u8]) -> Vec<Segment> {
     let mut out = Vec::new();
     let mut rest = buf;
@@ -36,7 +31,6 @@ fn parse_segments(buf: &[u8]) -> Vec<Segment> {
     out
 }
 
-/// Read loop for one connected UDP socket backing one conversation.
 fn feed(sock: &UdpSocket, conn: &Connection) {
     let mut buf = vec![0u8; 65536];
     loop {
@@ -57,9 +51,6 @@ fn feed(sock: &UdpSocket, conn: &Connection) {
     }
 }
 
-/// Dial one peer: a connected `UDP` socket, one conversation, one reader
-/// thread. `conv` is the caller's conversation id — upstream picks one
-/// from a global counter; the caller now picks its own scheme.
 #[allow(clippy::missing_panics_doc)]
 pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Connection>> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
@@ -86,15 +77,11 @@ pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Conne
     Ok(connection)
 }
 
-/// A process-wide conversation counter for callers that do not care
-/// which, mirroring the upstream's atomic global.
 #[must_use]
 pub fn fresh_conversation() -> u16 {
     next_conversation()
 }
 
-/// The server side: one `UDP` socket, one `Connection` per (peer,
-/// conversation) pair.
 pub struct Listener {
     inner: Arc<ListenerInner>,
 }
@@ -115,7 +102,6 @@ impl std::fmt::Debug for Listener {
 }
 
 impl Listener {
-    /// Bind a `UDP` socket and start routing.
     pub fn bind(addr: SocketAddr, config: Config) -> io::Result<Self> {
         let sock = UdpSocket::bind(addr)?;
         let local = sock.local_addr()?;
@@ -199,13 +185,11 @@ impl Listener {
         Ok(Self { inner })
     }
 
-    /// Local socket address.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.addr
     }
 
-    /// Block until a new connection arrives; `Err` once closed.
     pub fn accept(&self) -> io::Result<Arc<Connection>> {
         let mut ready = self.inner.ready.lock().unwrap();
         loop {
@@ -219,7 +203,6 @@ impl Listener {
         }
     }
 
-    /// Stop: close every session and refuse new ones.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         let mut sessions = self.inner.sessions.lock().unwrap();

@@ -1,27 +1,14 @@
-//! Minimal `JSON` reader for Xray-shaped config files.
-//!
-//! Only what `run -c` looks up exists here: objects, arrays, strings, numbers,
-//! `true`/`false`/`null`, nested 32 deep. Anything else is an error, never a guess.
-
-/// One `JSON` value, borrowed from nothing and owned by the caller.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Json {
-    /// `null`.
     Null,
-    /// `true` or `false`.
     Bool(bool),
-    /// Any number, kept as `f64` since only ports are read out of it.
     Num(f64),
-    /// A string, escapes resolved.
     Str(String),
-    /// An array.
     Arr(Vec<Json>),
-    /// An object, insertion order kept.
     Obj(Vec<(String, Json)>),
 }
 
 impl Json {
-    /// Member lookup on objects, `None` on anything else or when absent.
     pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Self::Obj(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
@@ -29,7 +16,6 @@ impl Json {
         }
     }
 
-    /// String contents, `None` for every other shape.
     pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s),
@@ -37,7 +23,6 @@ impl Json {
         }
     }
 
-    /// Port numbers: integers in `0..=65535`, `None` otherwise.
     pub(crate) fn as_port(&self) -> Option<u16> {
         match self {
             Self::Num(n) if n.fract() == 0.0 && (0.0..=65535.0).contains(n) => Some(*n as u16),
@@ -45,7 +30,6 @@ impl Json {
         }
     }
 
-    /// Array items, `None` for every other shape.
     pub(crate) fn as_arr(&self) -> Option<&[Json]> {
         match self {
             Self::Arr(items) => Some(items),
@@ -54,7 +38,6 @@ impl Json {
     }
 }
 
-/// Parse a whole document, rejecting trailing bytes after the first value.
 pub(crate) fn parse(text: &str) -> Result<Json, String> {
     let mut cursor = Cursor {
         bytes: text.as_bytes(),
@@ -68,24 +51,19 @@ pub(crate) fn parse(text: &str) -> Result<Json, String> {
     Ok(value)
 }
 
-/// Byte cursor over the document, tracking one position.
 #[derive(Debug)]
 struct Cursor<'a> {
-    /// Raw document bytes.
     bytes: &'a [u8],
-    /// Next unread offset.
     pos: usize,
 }
 
 impl Cursor<'_> {
-    /// Skip ASCII whitespace.
     fn gap(&mut self) {
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
 
-    /// Consume one expected byte, naming it on failure.
     fn byte(&mut self, want: u8, what: &str) -> Result<(), String> {
         self.gap();
         if self.bytes.get(self.pos) == Some(&want) {
@@ -96,7 +74,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// Parse any value at the depth limit.
     fn value(&mut self, depth: usize) -> Result<Json, String> {
         if depth > 32 {
             return Err(format!("nesting past 32 at offset {}", self.pos));
@@ -112,7 +89,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// Parse `{...}` after the brace is seen.
     fn object(&mut self, depth: usize) -> Result<Json, String> {
         self.pos += 1;
         let mut pairs = Vec::new();
@@ -141,7 +117,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// Parse `[...]` after the bracket is seen.
     fn array(&mut self, depth: usize) -> Result<Json, String> {
         self.pos += 1;
         let mut items = Vec::new();
@@ -164,7 +139,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// Parse a quoted string with its escapes resolved.
     fn string(&mut self) -> Result<String, String> {
         self.pos += 1;
         let mut out = String::new();
@@ -182,7 +156,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// Parse one escape after the backslash is consumed.
     fn escape(&mut self) -> Result<char, String> {
         let Some(&b) = self.bytes.get(self.pos) else {
             return Err(format!("dangling backslash at offset {}", self.pos));
@@ -212,7 +185,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// Parse a number, keeping one `f64`.
     fn number(&mut self) -> Result<Json, String> {
         let from = self.pos;
         if self.bytes.get(self.pos) == Some(&b'-') {
@@ -243,7 +215,6 @@ impl Cursor<'_> {
             .map_err(|_| format!("bad number at offset {from}"))
     }
 
-    /// Parse `true`, `false` or `null` by exact word.
     fn word(&mut self) -> Result<Json, String> {
         for (word, value) in [
             ("true", Json::Bool(true)),
@@ -259,7 +230,6 @@ impl Cursor<'_> {
     }
 }
 
-/// One hex digit's value.
 fn hex(byte: u8, at: usize) -> Result<u32, String> {
     match byte {
         b'0'..=b'9' => Ok(u32::from(byte - b'0')),
@@ -273,21 +243,14 @@ fn hex(byte: u8, at: usize) -> Result<u32, String> {
 mod tests {
     use super::*;
 
-    /// A `SplitMix64` state, so a printed seed replays the exact corpus.
-    ///
-    /// Deterministic rather than random, and that is the whole design: a failure
-    /// in CI on a runner nobody can log into cannot be reproduced at all, and a
-    /// generator whose seed is printed replays anywhere.
     #[derive(Debug, Clone)]
     struct Rng(u64);
 
     impl Rng {
-        /// A generator from a seed.
         fn new(seed: u64) -> Self {
             Self(seed)
         }
 
-        /// The next 64 bits, by `SplitMix64` (Steele, Lea and Flood).
         fn next_u64(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
             let mut z = self.0;
@@ -296,7 +259,6 @@ mod tests {
             z ^ (z >> 31)
         }
 
-        /// One byte.
         fn byte(&mut self) -> u8 {
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -304,8 +266,6 @@ mod tests {
             }
         }
 
-        /// A byte in `0..bound`, by rejection so it is uniform, and `0` on a zero
-        /// bound rather than a division by it.
         fn below(&mut self, bound: usize) -> usize {
             if bound == 0 {
                 return 0;
@@ -321,26 +281,12 @@ mod tests {
         }
     }
 
-    /// The corpus seed: a golden-ratio odd number, so adjacent seeds produce
-    /// visibly different corpora.
     const SEED: u64 = 0x4528_21e6_38d0_1377;
 
-    /// Cases. 4096, and not a power of two: a count of `2^n` lets a
-    /// modulo-bound generator cover half its range by accident.
     const CASES: usize = 4_096;
 
-    /// A configuration the reader is meant to accept, so the corrupt cases are a
-    /// delta from something valid rather than noise from nothing.
     const GOOD: &str = r#"{"inbounds":[{"protocol":"vless","port":443,"streamSettings":{"network":"ws","wsSettings":{"path":"/x"}}}],"outbounds":[{"protocol":"freedom"}]}"#;
 
-    /// This reader is hand-written, so every escape, every number and every
-    /// nesting level is code somebody wrote, and it is the one parser here with
-    /// no `unsafe` and therefore no differential proof behind it. The claim is
-    /// only that it never panics and never half-parses.
-    ///
-    /// A `libFuzzer` target would explore until it found a case; this explores
-    /// 4096 seeded ones on every runner `ci.yml` has, which is a weaker guarantee
-    /// and the one that is actually reached on every commit.
     #[test]
     fn the_reader_survives_corrupted_configuration() {
         for case in 0..CASES {
@@ -348,8 +294,6 @@ mod tests {
             let mut rng = Rng::new(seed);
 
             let mut text = String::from(GOOD);
-            // One case in five is the control, so the loop asserts the reader
-            // accepts what it should as well as refusing what it should not.
             match case % 5 {
                 0 => {}
                 1 => {
@@ -370,15 +314,10 @@ mod tests {
                 }
             }
 
-            // An `Err` is the usual answer and the correct one; the property is
-            // that neither answer panics, hangs, or trusts a length the text
-            // itself supplied.
             let _ = parse(&text);
         }
     }
 
-    /// Every prefix of a valid document must be refused, never parsed into a
-    /// config with fewer inbounds than it names.
     #[test]
     fn a_truncated_configuration_is_refused_rather_than_partially_parsed() {
         for cut in 1..GOOD.len() {

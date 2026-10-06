@@ -1,7 +1,3 @@
-//! RTT estimation, RFC 6298 as the upstream applies it.
-
-/// Smoothed round-trip state. Seeded with `rto: 100, min_rtt: config.tti`
-/// through [`RoundTripInfo::new`], as the upstream `Connection` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RoundTripInfo {
     variation: u32,
@@ -12,8 +8,6 @@ pub struct RoundTripInfo {
 }
 
 impl RoundTripInfo {
-    /// Values the upstream `Connection` starts a connection with: RTO 100 ms,
-    /// minimum RTT one tti.
     #[must_use]
     pub fn new(min_rtt: u32) -> Self {
         Self {
@@ -25,8 +19,6 @@ impl RoundTripInfo {
         }
     }
 
-    /// Upstream `UpdatePeerRTO`: adopt the peer's RTO only if the last
-    /// adoption was at least 3 seconds ago.
     pub fn update_peer_rto(&mut self, rto: u32, current: u32) {
         if current.wrapping_sub(self.updated_timestamp) < 3000 {
             return;
@@ -35,8 +27,6 @@ impl RoundTripInfo {
         self.rto = rto;
     }
 
-    /// Upstream `Update`: RFC 6298 SRTT/RTTVAR against the configured minimum,
-    /// capped at 10 s and then widened by 5/4.
     pub fn update(&mut self, rtt: u32, current: u32) {
         if rtt > 0x7FFF_FFFF {
             return;
@@ -62,13 +52,11 @@ impl RoundTripInfo {
         self.updated_timestamp = current;
     }
 
-    /// Current RTO estimate.
     #[must_use]
     pub fn timeout(&self) -> u32 {
         self.rto
     }
 
-    /// Current smoothed RTT.
     #[must_use]
     pub fn smoothed_time(&self) -> u32 {
         self.srtt

@@ -1,37 +1,3 @@
-//! The `REALITY` server handshake: authenticate a fingerprinted `TLS`
-//! `ClientHello` by its `shortId`, then let `rustls` finish the session.
-//!
-//! # The exchange, and why it is one
-//!
-//! A `REALITY` client hides inside a `uTLS` `ClientHello` and authenticates in
-//! the legacy `session_id`, the one field both `TLS` stacks already carry and
-//! neither bothers to look at. Sixteen bytes of it are the client's version, the
-//! Unix time and its `shortId`; the other sixteen are an `AES-256-GCM` tag over
-//! the whole `ClientHello`. The key for that tag is the `X25519` shared secret
-//! between the client's ephemeral key share and the server's `privateKey`, run
-//! through `HKDF-SHA256` with the first twenty bytes of the `ClientHello`
-//! `random` as salt. A wrong `shortId`, a wrong key or a rewritten hello all
-//! fail the tag, so there is nothing to check afterwards.
-//!
-//! That is why the whole handshake is one ECDH and one AEAD open rather than a
-//! session table, a replay cache and a nonce counter: the `ClientHello` is its
-//! own authenticator, and the tag covers it.
-//!
-//! # What the peer is told next
-//!
-//! The client's second gate is the certificate, and it has the same shape: a
-//! leaf whose public key is `Ed25519` and whose signature field is
-//! `HMAC-SHA512(auth_key, public_key)`. `bound_certificate` builds exactly
-//! that from one fixed keypair, so the per-connection work is one `HMAC` and a
-//! 64-byte splice. `rustls` signs the transcript with the same key, which is
-//! why a real certificate would add nothing here.
-//!
-//! # What is not implemented
-//!
-//! No `dest` fallback. A peer that fails authentication is closed, which is the
-//! stricter of the two answers: forwarding to a cover origin is a network dial
-//! on the unauthenticated path, and this server has no cover origin to dial.
-
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -40,83 +6,38 @@ use crate::tls::rustls_backend::RustlsServerProvider;
 use aes_gcm::aead::{Aead as _, KeyInit as _, Payload};
 use ring::signature::KeyPair as _;
 
-/// `X25519` as a `TLS` named group.
 const GROUP_X25519: u16 = 0x001d;
-/// The standardised post-quantum hybrid, whose `X25519` share is the last 32 bytes.
 const GROUP_X25519_MLKEM768: u16 = 0x11ec;
-/// The draft hybrid, which carries its `X25519` share first.
 const GROUP_X25519_MLKEM768_DRAFT: u16 = 0x6399;
-/// The `ML-KEM` encapsulation key length the hybrid share is prefixed with.
 const MLKEM768_KEY_LEN: usize = 1184;
-/// `TLS` 1.3, which `REALITY` is defined over and this server refuses to be.
 const TLS13: u16 = 0x0304;
-/// The `Ed25519` object identifier, as a full DER tag-length-value.
 const OID_ED25519: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
-/// The seed-only `PKCS#8` header `ring` and `rustls` both accept for `Ed25519`.
 const PKCS8_ED25519_SEED_HEADER: [u8; 16] = [
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
-/// The `Ed25519` signature length, which is also the `REALITY` proof length.
 const SIGNATURE_LEN: usize = 64;
-/// The largest `TLSPlaintext` this handshake will read, per RFC 8446 §5.1.
 const MAX_RECORD: usize = 16_384 + 2_048;
-/// Largest handshake message accepted, generous enough for a padded hello.
 const MAX_HELLO: usize = 1 << 16;
 
-/// A fixed `Ed25519` seed.
-///
-/// The certificate this key signs is not a credential: its signature field is a
-/// keyed `HMAC` over the peer's own key share, so nothing about it can be
-/// replayed and there is no authority behind it to steal. Fixed rather than
-/// drawn so the certificate, its length and the splice offset are all constants
-/// a test can pin.
 const ED25519_SEED: [u8; 32] = [
     0x64, 0x6f, 0x76, 0x65, 0x74, 0x61, 0x69, 0x6c, 0x2d, 0x72, 0x65, 0x61, 0x6c, 0x69, 0x74, 0x79,
     0x2d, 0x65, 0x64, 0x32, 0x35, 0x31, 0x39, 0x2d, 0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x63,
 ];
 
-/// One inbound's `REALITY` settings, read from `realitySettings` once.
-///
-/// The peer is authenticated against this set and against nothing else: a
-/// `serverName` outside it and a `shortId` outside it are both refusals.
 #[derive(Debug, Clone)]
 pub struct RealityServerConfig {
-    /// The `X25519` private key, decoded from `privateKey`.
     pub private_key: [u8; 32],
-    /// Every `shortId` this inbound answers, each zero-padded to eight bytes.
     pub short_ids: Vec<[u8; 8]>,
-    /// The `SNI` names this inbound answers, from `serverNames`.
     pub server_names: Vec<String>,
-    /// Largest accepted `ClientHello` clock skew, or `None` for no clock at all.
-    ///
-    /// A `None` is what `maxTimeDiff` absent means upstream, and it is the
-    /// default here: a clock is a second source of truth a server has to be
-    /// right about, and the tag already refuses a replayed hello.
     pub max_time_skew: Option<Duration>,
 }
 
-/// A `REALITY` session over `io`, once its `ClientHello` authenticated.
 #[derive(Debug)]
 pub struct RealityServer<S: Stream> {
     inner: RustlsServerProvider<Replay<S>>,
 }
 
 impl<S: Stream> RealityServer<S> {
-    /// Read and authenticate the `ClientHello`, then build the session that
-    /// replays those bytes into `rustls`.
-    ///
-    /// # Errors
-    ///
-    /// [`TlsError::Closed`] when the peer sends no well-formed `ClientHello`,
-    /// and [`TlsError::Other`] when it sends a well-formed one that does not
-    /// authenticate: an unknown `SNI`, no `X25519` share, a tag that does not
-    /// open, a `shortId` this inbound does not answer, or a clock outside
-    /// `max_time_skew`. The two are not separated because the peer learns
-    /// nothing from either.
-    ///
-    /// `now` is the current Unix time in seconds, passed in because this crate
-    /// reads no clock: a library that reads one is a library whose output
-    /// depends on when it ran.
     pub fn accept(cfg: &RealityServerConfig, now: u64, io: S) -> Result<Self, TlsError> {
         let mut replay = Replay::new(io);
         let (raw, hello) = read_client_hello(&mut replay)?;
@@ -126,14 +47,12 @@ impl<S: Stream> RealityServer<S> {
             key_der: ed25519_pkcs8(),
             key_kind: super::ServerKeyKind::Pkcs8,
         };
-        // `rustls` starts at the first record, so it gets the whole prefix back.
         replay.set_prefix(&raw);
         Ok(Self {
             inner: RustlsServerProvider::accept(&identity, replay)?,
         })
     }
 
-    /// The transport underneath, for a caller that needs the socket itself.
     pub fn get_ref(&self) -> &S {
         self.inner.get_ref().transport()
     }
@@ -173,11 +92,6 @@ impl<S: Stream> Write for RealityServer<S> {
     }
 }
 
-/// A transport that replays the handshake bytes already read, then the socket.
-///
-/// `rustls` starts at the first record, so the bytes this server consumed to
-/// authenticate have to reach it again; buffering them is cheaper than teaching
-/// `rustls` to start mid-stream.
 struct Replay<S> {
     prefix: Vec<u8>,
     at: usize,
@@ -199,7 +113,6 @@ impl<S> Replay<S> {
         self.at = 0;
     }
 
-    /// The socket under the replayed bytes.
     fn transport(&self) -> &S {
         &self.io
     }
@@ -229,27 +142,15 @@ impl<S: Write> Write for Replay<S> {
     }
 }
 
-/// The `ClientHello` fields this handshake reads, and the bytes it came from.
 #[derive(Debug)]
 struct ClientHello {
-    /// The whole handshake message, which is the AEAD's associated data.
     bytes: Vec<u8>,
-    /// Offset and length of the `session_id` field inside `bytes`.
     session_id: (usize, usize),
-    /// The 32-byte `random`.
     random: [u8; 32],
-    /// The `server_name` extension's host, if the peer sent one.
     server_name: Option<String>,
-    /// The peer's ephemeral `X25519` public key.
     peer_key: [u8; 32],
 }
 
-/// Read records until one whole `ClientHello` handshake message is buffered.
-///
-/// Returns the records as they arrived, so they can be replayed into `rustls`,
-/// and the parsed message. The message may be split across records and the
-/// split is invisible to every field below, which is why the bytes are
-/// accumulated rather than parsed per record.
 fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, ClientHello), TlsError> {
     let mut raw: Vec<u8> = Vec::new();
     let mut bytes: Vec<u8> = Vec::new();
@@ -285,7 +186,6 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, ClientHello), TlsE
     }
 }
 
-/// The end of a complete `ClientHello` inside `bytes`, if it is there yet.
 fn hello_is_whole(bytes: &[u8]) -> Option<usize> {
     if bytes.first()? != &0x01 || bytes.len() < 4 {
         return None;
@@ -294,7 +194,6 @@ fn hello_is_whole(bytes: &[u8]) -> Option<usize> {
     (bytes.len() >= want).then_some(want)
 }
 
-/// The `REALITY` auth key for this hello, if the peer is one of ours.
 fn authenticate(
     cfg: &RealityServerConfig,
     hello: &ClientHello,
@@ -318,8 +217,6 @@ fn authenticate(
         .expand(b"REALITY", &mut auth_key)
         .map_err(|_| refused("hkdf"))?;
 
-    // The associated data is the hello with its `session_id` zeroed, which is
-    // what the client sealed: it patched the tag into the raw bytes afterwards.
     let mut sealed = hello.bytes.clone();
     let (at, len) = hello.session_id;
     sealed[at..at + len].fill(0);
@@ -349,12 +246,10 @@ fn authenticate(
     Ok(auth_key)
 }
 
-/// The `SNI` to put in the certificate, or an empty name when none is allowed.
 fn first_name(cfg: &RealityServerConfig) -> &str {
     cfg.server_names.first().map_or("", String::as_str)
 }
 
-/// Parse the handshake message into the five fields the auth reads.
 fn parse_client_hello(bytes: Vec<u8>) -> Result<ClientHello, TlsError> {
     let bad = || TlsError::Other("reality: malformed ClientHello".to_owned());
     let mut at = 4 + 2;
@@ -418,7 +313,6 @@ fn parse_client_hello(bytes: Vec<u8>) -> Result<ClientHello, TlsError> {
     Ok(hello)
 }
 
-/// Every extension as `(type, body)`; a truncated one ends the walk.
 fn extensions(bytes: &[u8], at: usize, len: usize) -> impl Iterator<Item = (u16, &[u8])> {
     let end = at + len;
     (at..end).scan(at, move |cursor, _| {
@@ -431,11 +325,6 @@ fn extensions(bytes: &[u8], at: usize, len: usize) -> impl Iterator<Item = (u16,
     })
 }
 
-/// The `server_name` extension's host name, ignoring the other name types.
-/// The name list is prefixed with a *two*-byte length, not the one byte RFC
-/// 6066 specifies: that is what every peer in this exchange reads and writes,
-/// and a one-byte length here reads the first two characters of the name as a
-/// length and then finds no name at all.
 fn server_name(body: &[u8]) -> Option<String> {
     let mut list = Cursor::new(body, 2);
     while !list.empty() {
@@ -448,7 +337,6 @@ fn server_name(body: &[u8]) -> Option<String> {
     None
 }
 
-/// The `supported_versions` extension's list.
 fn supported_versions(body: &[u8]) -> Vec<u16> {
     let Some(&len) = body.first() else {
         return Vec::new();
@@ -463,16 +351,6 @@ fn supported_versions(body: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-/// The `X25519` key inside a `key_share` extension, hybrid or plain.
-///
-/// A hybrid share carries ML-KEM and `X25519` in one field, and the two drafts
-/// put them in opposite orders: the standardised group ends with the `X25519`
-/// key, the draft group starts with it.
-///
-/// A plain share wins over a hybrid one, because that is the share the peer
-/// derives its auth key from: it holds one classical key per curve it offers and
-/// falls back to the hybrid's only when it offered no classical share at all.
-/// Reading the hybrid instead picks a different key and the tag does not open.
 fn x25519_share(body: &[u8]) -> Option<[u8; 32]> {
     let hybrid_len = MLKEM768_KEY_LEN + 32;
     let mut plain = None;
@@ -497,7 +375,6 @@ fn x25519_share(body: &[u8]) -> Option<[u8; 32]> {
     plain.or(hybrid)
 }
 
-/// A borrowed cursor over a length-prefixed list body.
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -532,7 +409,6 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// One tag-length-value, with the shortest length encoding that fits.
 fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     if body.len() < 0x80 {
@@ -548,7 +424,6 @@ fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The body of a `SEQUENCE` over already-encoded parts.
 fn sequence(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(parts.iter().map(|part| part.len()).sum());
     for part in parts {
@@ -557,11 +432,6 @@ fn sequence(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// The leaf certificate a `REALITY` peer accepts: `Ed25519`, self-signed, and
-/// carrying `HMAC-SHA512(auth_key, public_key)` as its signature.
-///
-/// Built rather than embedded so the shape is readable, and so the proof is the
-/// last 64 bytes of the DER by construction rather than by a remembered offset.
 fn bound_certificate(auth_key: &[u8; 32], name: &str) -> Vec<u8> {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, auth_key);
     let proof = ring::hmac::sign(&key, public_key());
@@ -600,7 +470,6 @@ fn bound_certificate(auth_key: &[u8; 32], name: &str) -> Vec<u8> {
     der
 }
 
-/// One `CN=<name>` `Name`, as the issuer and the subject of a self-signed leaf.
 fn distinguished_name(name: &str) -> Vec<u8> {
     let attribute = tlv(
         0x30,
@@ -609,7 +478,6 @@ fn distinguished_name(name: &str) -> Vec<u8> {
     tlv(0x30, &sequence(&[&tlv(0x31, &attribute)]))
 }
 
-/// The `Ed25519` public key half of [`ED25519_SEED`], as `ring` derives it.
 fn public_key() -> &'static [u8; 32] {
     static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     KEY.get_or_init(|| {
@@ -619,7 +487,6 @@ fn public_key() -> &'static [u8; 32] {
     })
 }
 
-/// The `Ed25519` private key in `PKCS#8` v2, which is what `rustls` loads.
 fn ed25519_pkcs8() -> Vec<u8> {
     pkcs8()
 }
@@ -630,7 +497,6 @@ fn pkcs8() -> Vec<u8> {
     out
 }
 
-/// The proof a peer checks, over one auth key, as the last 64 bytes of a DER.
 #[cfg(test)]
 fn proof_at(der: &[u8]) -> &[u8] {
     &der[der.len() - SIGNATURE_LEN..]
@@ -642,8 +508,6 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
-    /// The `X25519` private key the pinned interop configs agree on, so a test
-    /// speaks the same key a suite configures rather than one it invented.
     const SERVER_PRIVATE: [u8; 32] = [
         0x69, 0x20, 0xca, 0xab, 0x2b, 0x4d, 0xe3, 0x7d, 0xfc, 0xfe, 0xbf, 0x60, 0x8b, 0x2a, 0x43,
         0x1c, 0x0e, 0xbb, 0xae, 0x26, 0x93, 0x9a, 0x9c, 0x01, 0x9e, 0x06, 0x1e, 0x8a, 0x0b, 0x4e,
@@ -661,8 +525,6 @@ mod tests {
         }
     }
 
-    /// A `ClientHello` built field by field, with the `session_id` left as the
-    /// 32 zero bytes the associated data is computed over.
     fn hello_body(random: &[u8; 32], share: &[u8; 32], sni: &str) -> Vec<u8> {
         let mut ext = Vec::new();
         ext.extend_from_slice(&tlv_header(0x0000, &name_list(sni)));
@@ -710,8 +572,6 @@ mod tests {
         list
     }
 
-    /// The auth key a client derives, and the sealed 16 bytes that go in the
-    /// `session_id`: version, reserved, clock, `shortId`.
     fn seal(
         body: &mut Vec<u8>,
         random: &[u8; 32],
@@ -747,7 +607,6 @@ mod tests {
         auth_key
     }
 
-    /// Wrap a handshake message in the `TLS` handshake record it arrived in.
     fn record(body: &[u8]) -> Vec<u8> {
         let mut out = vec![0x16, 0x03, 0x01];
         out.extend_from_slice(&u16::try_from(body.len()).unwrap().to_be_bytes());
@@ -755,8 +614,6 @@ mod tests {
         out
     }
 
-    /// Feed one `ClientHello` to the server over a loopback socket and report
-    /// whether it authenticated.
     fn offer(cfg: &RealityServerConfig, now: u64, bytes: &[u8]) -> bool {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -766,24 +623,12 @@ mod tests {
             RealityServer::accept(&settings, now, stream)
         });
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        // Half-close, so a server still waiting for the rest of a short hello
-        // sees the end of the stream rather than blocking the test forever.
         client.write_all(bytes).expect("writes");
         client.flush().expect("flushes");
-        // Best effort, and the reason is that this is a refusal test. A server that
-        // rejects the hello and closes before this line has made the half-close
-        // true by another route, and `shutdown(2)` on a socket the peer has closed
-        // answers `ENOTCONN` -- so `expect` here failed on exactly the outcome the
-        // test exists to observe. `conformance.yml` run 37248505844, 1 of 88 in
-        // `ferrox-core`, on a tree whose diff has no line in this file. Every
-        // production half-close in this workspace already ignores it
-        // (`proxy.rs`, `vmess.rs`, `xhttp.rs`); this was the last `expect` of the
-        // four, and P31 asked for it by name.
         let _ = client.shutdown(std::net::Shutdown::Write);
         server.join().expect("joins").is_ok()
     }
 
-    /// A well-formed, authenticated hello from a fixed client key.
     fn good_hello() -> Vec<u8> {
         let client_private = [0x11u8; 32];
         let random: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
@@ -804,8 +649,6 @@ mod tests {
         assert!(offer(&settings(), 0, &good_hello()));
     }
 
-    /// Every way a peer can be wrong has to be a refusal, because the only
-    /// answer this server has to a stranger is to hang up.
     #[cfg_attr(
         miri,
         ignore = "needs a loopback socket, and ring's assembly behind it"
@@ -828,8 +671,6 @@ mod tests {
         assert!(!offer(&settings(), 0, &build("evil.example", &SHORT_ID)));
         assert!(!offer(&settings(), 0, &build(SNI, &wrong_short)));
 
-        // One flipped byte anywhere in the sealed region, the key share or the
-        // `SNI` must all fail the tag.
         for at in [39usize, 50, 71, 100, 160] {
             let mut bytes = build(SNI, &SHORT_ID);
             let target = at.min(bytes.len() - 1);
@@ -846,8 +687,6 @@ mod tests {
         assert!(!offer(&settings(), 0, &[]));
     }
 
-    /// A `shortId` shorter than eight bytes is zero-padded on both sides, which
-    /// is how every peer writes one.
     #[cfg_attr(
         miri,
         ignore = "needs a loopback socket, and ring's assembly behind it"
@@ -875,8 +714,6 @@ mod tests {
         assert!(!offer(&settings(), 0, &record(&body)));
     }
 
-    /// The clock gate is off unless `maxTimeDiff` asks for it, and then it is
-    /// a gate: a hello stamped outside the window is refused.
     #[cfg_attr(
         miri,
         ignore = "needs a loopback socket, and ring's assembly behind it"
@@ -908,8 +745,6 @@ mod tests {
         assert!(offer(&cfg, now, &record(&body)));
     }
 
-    /// The `X25519` share is read out of whichever group carries it: the plain
-    /// one, the post-quantum hybrid, or the draft hybrid that reverses them.
     #[test]
     fn the_x25519_share_is_found_in_every_group_that_carries_one() {
         let key = [0x5au8; 32];
@@ -942,8 +777,6 @@ mod tests {
         assert_eq!(x25519_share(&[0, 0]), None);
     }
 
-    /// A plain share wins over a hybrid one, because the peer derives its auth
-    /// key from its classical share even when it also offers the hybrid.
     #[test]
     fn a_plain_share_is_preferred_over_a_hybrid_one() {
         let plain = [0x11u8; 32];
@@ -963,8 +796,6 @@ mod tests {
         let _ = hybrid_key;
     }
 
-    /// The `Ed25519` public key the fixed seed derives, so a seed change cannot
-    /// pass unnoticed and the proof has something to be computed over.
     #[cfg_attr(
         miri,
         ignore = "reaches ring's C and assembly, which Miri cannot interpret"
@@ -993,8 +824,6 @@ mod tests {
         assert!(der.windows(OID_ED25519.len()).any(|w| w == OID_ED25519));
     }
 
-    /// Two auth keys must not produce the same certificate, or one peer's proof
-    /// would authenticate another.
     #[cfg_attr(
         miri,
         ignore = "reaches ring's C and assembly, which Miri cannot interpret"
@@ -1007,8 +836,6 @@ mod tests {
         assert_eq!(a.len(), b.len());
     }
 
-    /// The `PKCS#8` bytes are what `rustls` hands to `ring`, so the fixed seed
-    /// has to be a v2 document `ring` accepts rather than one it merely parses.
     #[cfg_attr(
         miri,
         ignore = "reaches ring's C and assembly, which Miri cannot interpret"
@@ -1020,10 +847,6 @@ mod tests {
         assert!(ring::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der).is_ok());
     }
 
-    /// Every length in the certificate has to be exact, or the peer's parser
-    /// rejects a certificate this server believes it built. Only constructed
-    /// tags are descended into: the primitive ones hold keys and timestamps,
-    /// whose bytes are not themselves `DER`.
     fn walk_der(bytes: &[u8]) -> bool {
         let mut at = 0;
         while at < bytes.len() {
@@ -1038,7 +861,6 @@ mod tests {
         at > 0 && at == bytes.len()
     }
 
-    /// One `DER` element as `(tag, header length, total length)`.
     fn element(bytes: &[u8]) -> Option<(u8, usize, usize)> {
         let (&tag, &first) = (bytes.first()?, bytes.get(1)?);
         assert_ne!(tag, 0, "a `DER` element has a tag");
@@ -1067,11 +889,6 @@ mod tests {
         assert!(!walk_der(&[]));
     }
 
-    /// `rustls` has to be able to *sign* with the key that certificate names,
-    /// which is the one thing accepting the identity does not prove. The full
-    /// handshake needs a `uTLS` client, because a `rustls` client hashes its own
-    /// `ClientHello` before the `session_id` is patched into it; the pinned
-    /// suites are what prove the handshake itself.
     #[cfg_attr(
         miri,
         ignore = "reaches ring's C and assembly, which Miri cannot interpret"
@@ -1092,8 +909,6 @@ mod tests {
         assert_eq!(&spki.as_ref()[12..], public_key().as_slice());
     }
 
-    /// The handshake bytes are replayed into `rustls`, so what `accept` consumed
-    /// and what `rustls` then reads have to be the same bytes.
     #[cfg_attr(
         miri,
         ignore = "needs a loopback socket, and ring's assembly behind it"
@@ -1111,8 +926,6 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         client.write_all(&bytes).expect("writes");
         server.join().expect("joins").expect("authenticates");
-        // `rustls` reads the prefix before the socket, so a second hello the
-        // client sends next has to arrive whole rather than one byte late.
         assert_eq!(bytes[0], 0x16);
     }
 }

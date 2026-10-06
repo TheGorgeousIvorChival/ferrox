@@ -1,8 +1,3 @@
-//! The scripted-clock oracle: the same script the Go harness runs, the same
-//! recorder output format. The expected text is produced by the pinned Go
-//! code in `scripts/kcp-oracle` and checked in, so this test runs without
-//! Go; regenerating it is one command.
-
 #![allow(clippy::missing_panics_doc)]
 
 use std::fmt::Write as _;

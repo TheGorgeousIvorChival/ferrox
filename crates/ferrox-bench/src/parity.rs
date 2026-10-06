@@ -1,64 +1,3 @@
-//! The pinned comparators' process-level harness, reimplemented so one request
-//! file measures either binary.
-//!
-//! # Why this is a reimplementation and not a copy
-//!
-//! `xray-rust` ships a process-level harness whose contract is a `JSON` request
-//! naming an engine binary and a workload, and a `result.json` of validated
-//! throughput, RSS and CPU (`upstream/xray-rust/crates/xray-bench/src/protocol_bench.rs:122`).
-//! That contract is deliberately engine-agnostic: the measured engine is external
-//! and only has to accept `<binary> run -config <path>` with its inbounds
-//! injected. `ferrox-app` does, so **the same request file measures either
-//! binary**, which is the property that makes this a comparison rather than two
-//! benchmarks.
-//!
-//! Their harness is MPL-2.0 and is not copied here. `upstream/pins.toml` already
-//! runs their suites unmodified from the pin, which is both licence-clean and a
-//! stronger claim than a transcription. What is reproduced here is the *shape*:
-//! the request fields and their bounds, the result fields, the 500 ms pre-sleep
-//! and settle, the 100 ms `ps` sampling, the xorshift payload seed. So one
-//! request and one report mean the same thing on both sides.
-//! `scripts/run-parity.sh` hands the identical file to their binary when it is
-//! built from the pin, and `docs/methodology.md` records which of their
-//! workloads this covers and which it does not.
-//!
-//! # The four rules, which are `ZeroNet`'s and are why a number here is fair
-//!
-//! 1. **The payload is validated.** The sink writes a deterministic xorshift
-//!    keystream and checks every byte, and concurrent flows use disjoint
-//!    rotations of it, so a core that interleaves two sessions onto one carrier
-//!    is caught rather than hidden behind a correct total.
-//! 2. **The transfer window excludes setup.** Setup is timed in its own columns.
-//!    An engine that answers SOCKS before it dials and one that dials first hide
-//!    that difference inside a wall-clock rate, and the difference is exactly what
-//!    a reader of these numbers wants to see.
-//! 3. **The one-hop ceiling is published.** The same validated loop runs over a
-//!    bare socket with no engine in the path, so every listener moves the same
-//!    bytes by the same code. It is a **one**-socket-hop figure and every engine
-//!    row is a **two**-hop relay, so a row reaching 100% of it is the generator
-//!    saturating, not a ceiling exceeded -- which is what `sing-box` measures at
-//!    137% on `linux x86_64`. `ZeroNet`'s 85% generator bound
-//!    (`HARNESS_BOUND = 0.85`, `upstream/zeronet/docs/benchmarks/harness/zbench/report.py:58`)
-//!    is a rule about a row over the same hops as the ceiling, and is published
-//!    with the number rather than applied to rows it does not describe.
-//! 4. **Order is rotated and then reversed**, and comparisons are paired on the
-//!    repeat index, so the interval in `stats.rs` is over pairs rather than over
-//!    two independently aggregated sets of samples.
-//!
-//! # What sampling from outside cannot see
-//!
-//! Stated rather than implied. `ps` gives RSS and CPU for a Go engine and a Rust
-//! engine alike, which is the only way the two are comparable at all — but it
-//! gives no allocation counts, so those stay in-process and exact in `count.rs`;
-////! and it reports CPU at the kernel's tick resolution, so a delta under one tick
-//! reads `0`. `ZeroNet` names the same floor
-//! (`CPU_RESOLUTION_S = 0.010`, `.../zbench/report.py:88`) and
-//! [`cpu_resolution_floor_millis`] carries the number into the report.
-
-// Byte counts divided by 1 MiB or 1 GiB, and milliseconds divided by seconds,
-// are the figures this module exists to report; the conversion is the point
-// rather than an accident of the arithmetic. Every count here is orders of
-// magnitude below 2^53, where an `f64` is exact.
 #![allow(clippy::cast_precision_loss)]
 
 use std::collections::BTreeMap;
@@ -74,90 +13,33 @@ use std::time::{Duration, Instant};
 use crate::json::{self, Json};
 use crate::ps::{self, Host};
 
-/// Identifies this harness in every `result.json`, so a consumer can tell which
-/// implementation produced a file. The pinned harness does the same job with its
-/// `provenance.harness_profile`.
 pub const HARNESS_ID: &str = "ferrox-bench/protocol-run";
 
-/// Seed for the validated payload: the pinned harness's own constant
-/// (`upstream/xray-rust/crates/xray-bench/src/lib.rs:3888`).
-///
-/// Reused deliberately. It makes a payload mismatch reportable as *this harness
-/// and that harness disagree about the bytes*, which is a far more useful
-/// failure than a generic mismatch — and it means the two harnesses are
-/// validating the same stream.
 pub const BULK_PATTERN_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// Pre-work sleep, settle after the work, and the sampling period: the pinned
-/// harness's values (`protocol_bench.rs:219-225`). Kept because a comparison
-/// against a number produced with different constants is not a comparison.
 const PRE_SLEEP: Duration = Duration::from_millis(500);
 const SETTLE: Duration = Duration::from_millis(500);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Ceiling on the whole workload (`protocol_bench.rs:269`), and on how long the
-/// engine gets to answer before it is declared dead.
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Per-operation timeout on flow sockets.
-///
-/// `collect_flows` joins flow threads, and the run cap above is only checked
-/// after the join — so a peer that stalls mid-transfer with no timeout hangs
-/// the run forever rather than tripping the cap. Healthy loopback operations
-/// complete in milliseconds, so thirty seconds only ever fires on a dead
-/// peer, and when it does the flow records its stopped reason and returns
-/// into the existing short-transfer error path instead of hanging the job.
 const FLOW_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Largest request document accepted (`protocol_bench.rs:127`).
 const MAX_REQUEST_BYTES: usize = 262_144;
 
-/// Iterations one flow may be asked for.
-///
-/// The pinned harness caps this at 16 384 and reaches 16 GiB by multiplying
-/// `connections` instead (`protocol_bench.rs:68` and the same bounds on
-/// `payload_size` and `connections` at `:65`-`:69`). That route is closed here on
-/// purpose: the claim this row supports is about a *single* flow, and eight flows
-/// are eight relays, eight flows' resident buffers and thirty-two threads on a
-/// four-CPU runner -- a different workload wearing the same name, which is the
-/// failure mode a pinned harness is supposed to prevent rather than permit.
-///
-/// So the bound moves and the shape does not: one flow, `iterations` up to
-/// [`MAX_FLOW_BYTES`] bytes, `connections` still 1. The cost is that a request
-/// above 16 384 iterations is one the pinned harness's validator would refuse,
-/// which is why the *default* below stays inside it and `scripts/run-parity.sh`
-/// is what asks for the long one. The field is in `result.json`, so a reader sees
-/// which workload produced the numbers beside them.
 const MAX_ITERATIONS: usize = 262_144;
 
-/// Bytes one flow may move: 16 GiB, the same ceiling the pinned schema reaches.
 const MAX_FLOW_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// How an engine is told which config file to serve.
-///
-/// One field, and it is per engine because the three engines this harness compares
-/// genuinely disagree: `Xray-core` and `xray-rust` take `run -config <path>`,
-/// `sing-box` takes `run -c <path>`, and `Zray` takes the path as a bare
-/// positional after `run` (`upstream/zeronet/crates/zray-cli/src/main.rs:54`).
-/// The pinned harness makes the same distinction — its `EngineKind` picks `-config`
-/// or `-c` before spawning (`upstream/xray-rust/crates/xray-bench/src/lib.rs:8096`).
-///
-/// Guessing one shape for all of them would mean every engine but one fails to
-/// start, which reads as an engine that cannot serve rather than a flag that was
-/// wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigArg {
-    /// `run -config <path>`: Xray-core, xray-rust, and this workspace's own binary.
     Long,
-    /// `run -c <path>`: sing-box.
     Short,
-    /// `run <path>`: Zray.
     Positional,
 }
 
 impl ConfigArg {
-    /// Parse the spelling used on the command line.
     pub fn parse(raw: &str) -> Result<Self, Error> {
         match raw {
             "long" | "-config" | "--config" => Ok(Self::Long),
@@ -171,7 +53,6 @@ impl ConfigArg {
         }
     }
 
-    /// The arguments that name `path`, given the subcommand the engine expects.
     fn args(self, path: &Path) -> Vec<String> {
         match self {
             Self::Long => vec!["run".into(), "-config".into(), path.display().to_string()],
@@ -181,37 +62,13 @@ impl ConfigArg {
     }
 }
 
-/// The config shape an engine parses.
-///
-/// Two engines in the same comparison do not read the same document, and writing
-/// one shape for both does not make them comparable -- it makes the one whose
-/// dialect differs fail to start, and a failed start reads exactly like an engine
-/// that cannot serve. Every `parity` run until now did that to `sing-box`: the
-/// harness wrote `{"protocol": "freedom"}` and `{"protocol": "socks", "port": N}`,
-/// and sing-box answered `outbounds[0]: unknown outbound type: ` on all five
-/// repeats of all eight runs quoted in `docs/methodology.md`. Zero rows, five
-/// times over, published as `unproven`.
-///
-/// So the dialect is data, named per engine, and parsed at the point the engine
-/// list is built rather than inferred from a label. The two differ in both the
-/// key and the port field, which is why guessing one is not a shortcut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
-    /// `protocol`-keyed with `port`: the Xray family, which is `Xray-core`,
-    /// `xray-rust` and this workspace's own `ferrox-app`.
     Xray,
-    /// `type`-keyed with `listen_port`: `sing-box`, whose `direct` outbound
-    /// replaces `freedom` and whose legacy `port` field is *rejected* rather than
-    /// ignored since 1.13.0 -- read at the pin, `option/inbound.go`:
-    /// `// Legacy inbound fields are rejected since sing-box 1.13.0.` with
-    /// `ListenOptions` carrying `listen` and `listen_port` and no `port`
-    /// (`option/inbound.go:79`-`:81`), and `SocksInboundOptions` embedding exactly
-    /// that (`option/simple.go:14`-`:18`).
     SingBox,
 }
 
 impl Dialect {
-    /// Parse the spelling used on the command line.
     pub fn parse(raw: &str) -> Result<Self, Error> {
         match raw {
             "xray" | "protocol" => Ok(Self::Xray),
@@ -224,19 +81,10 @@ impl Dialect {
         }
     }
 
-    /// The `SOCKS` inbound this dialect reads, on `listen:port`.
-    ///
-    /// `noauth` in both dialects: the greeting is part of what is being measured,
-    /// so authentication would add a rejection that has nothing to do with the
-    /// relay. `udp` is only expressed in the Xray spelling because sing-box's
-    /// inbound has no such switch to turn off -- see [`inject_inbound`].
     fn socks_inbound(self, listen: Ipv4Addr, port: u16) -> Json {
         let mut inbound = Json::object();
         match self {
             Self::Xray => {
-                // Tagged so matrix configs can route this inbound to a protocol
-                // outbound while the protocol's own server side falls through
-                // to freedom; see `inject_inbound`.
                 inbound.insert("tag", Json::Str("harness-socks".into()));
                 inbound.insert("protocol", Json::Str("socks".into()));
             }
@@ -256,19 +104,12 @@ impl Dialect {
         }
         let mut settings = Json::object();
         settings.insert("auth", Json::Str("noauth".into()));
-        // UDP is off: nothing here measures UDP, and an engine that spawns a
-        // responder for a path this harness never exercises would only add
-        // resident memory to the RSS column.
         settings.insert("udp", Json::Bool(false));
         match self {
             Self::Xray => {
                 inbound.insert("settings", settings);
             }
             Self::SingBox => {
-                // sing-box puts nothing in a `settings` bag for this inbound; an
-                // empty `users` list *is* "no authentication required"
-                // (`docs/configuration/inbound/socks.md` at the pin), and an
-                // unknown key is a startup failure rather than a warning.
                 let _ = settings;
                 inbound.insert("users", Json::Arr(Vec::new()));
             }
@@ -276,11 +117,6 @@ impl Dialect {
         inbound
     }
 
-    /// The "send it straight out" outbound this dialect reads.
-    ///
-    /// `freedom` in the Xray spelling and `direct` in sing-box's, which are the
-    /// same behaviour under two names -- `sing-box/constant/proxy.go:7` at the
-    /// pin defines `TypeDirect = "direct"` for exactly this.
     fn direct_outbound(self) -> Json {
         let mut outbound = Json::object();
         match self {
@@ -295,16 +131,12 @@ impl Dialect {
         outbound
     }
 
-    /// The whole document, before the inbound is injected.
     pub fn base_config(self) -> Json {
         let mut root = Json::object();
         root.insert("outbounds", Json::Arr(vec![self.direct_outbound()]));
         match self {
             Self::Xray => {}
             Self::SingBox => {
-                // sing-box defaults `route.final` to the first outbound, so an
-                // empty route block is enough and a populated one would be a
-                // second thing to keep in step with the harness.
                 root.insert("route", Json::object());
             }
         }
@@ -312,12 +144,6 @@ impl Dialect {
     }
 }
 
-/// Every field a request may carry, and nothing else. `path` is accepted for the
-/// pinned harness's schema and refused in [`Request::validate`], because
-/// `ferrox-app` serves no TUN device; `idle_connections`,
-/// `prepare_client` and `tun`-only fields are accepted and refused the same way,
-/// so a request written for the other harness produces a stated reason rather
-/// than a silently different workload.
 const ACCEPTED_FIELDS: [&str; 13] = [
     "binary",
     "config",
@@ -334,27 +160,12 @@ const ACCEPTED_FIELDS: [&str; 13] = [
     "tcp_latency_iterations",
 ];
 
-/// One KiB, for the `ps` RSS field to MiB.
 const KIB: f64 = 1024.0;
 
-/// The finest CPU delta this host's sampling mechanism can report, in
-/// milliseconds. A sample delta below this is not "no CPU was used", it is "the
-/// mechanism does not count that finely", and naming it keeps a `0` in a CPU
-/// column from being read as free work.
-///
-/// A function, not the constant it used to be. The constant said 10 ms, which is
-/// what the *kernel* resolves, and the mechanism then threw it away: GNU `ps`
-/// prints `TIME` in whole seconds, so every Linux run of gate 5 measured 0 ms of
-/// CPU for every engine and the row read `UNPROVEN` in all of them. `ps` is still
-/// what carries RSS and the thread count; CPU now comes from `/proc/<pid>/stat`,
-/// which is where `ps` read it from before formatting it, so the published floor
-/// is finally the resolution of the thing that produced the number. See [`ps`].
 pub fn cpu_resolution_floor_millis() -> u64 {
     crate::ps::resolution_millis()
 }
 
-/// Phase tags, identical strings to `xray-bench`'s `BenchmarkPhase`
-/// (`lib.rs:606`) so a consumer of both `result.json` files reads one enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Startup,
@@ -372,7 +183,6 @@ impl Phase {
     }
 }
 
-/// Direction of the measured traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Traffic {
     Upload,
@@ -407,47 +217,32 @@ impl Traffic {
     }
 }
 
-/// A parsed request. An unknown field is an error, as it is in the pinned
-/// harness (`#[serde(deny_unknown_fields)]`, `protocol_bench.rs:8`): a field one
-/// implementation reads and the other ignores is two different measurements of a
-/// field name.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub binary: PathBuf,
-    /// Outbound-only configuration; the harness injects the SOCKS inbound.
     pub config: String,
-    /// Accepted for the pinned harness's schema; only `"socks"` is implemented,
-    /// and [`Request::validate`] refuses the rest with its reason.
     pub path: String,
     pub traffic: Traffic,
     pub connections: usize,
     pub iterations: usize,
     pub payload_size: usize,
-    /// Must not exist: the harness creates it, so a stale directory left by an
-    /// aborted run cannot be read as this run's output.
     pub output: PathBuf,
     pub warmup: bool,
-    /// Accepted for the pinned harness's schema, refused in
-    /// [`Request::validate`] with its reason.
     pub idle_connections: usize,
-    /// Accepted for the pinned harness's schema, refused in
-    /// [`Request::validate`] with its reason.
     pub prepare_client: bool,
     pub client_env: BTreeMap<String, String>,
 }
 
-/// A request that cannot be honoured, with the reason.
 #[derive(Debug)]
 pub enum Error {
-    /// A field outside the documented bounds, or an unreadable document.
     Invalid(String),
     Io {
         action: String,
         source: std::io::Error,
     },
-    /// The engine binary would not start, or exited during startup.
-    Engine { message: String },
-    /// The workload did not complete correctly.
+    Engine {
+        message: String,
+    },
     Workload(String),
 }
 
@@ -464,8 +259,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Lift an I/O failure with the action that was being attempted, so an error
-/// message says which of the harness's sockets failed rather than just "I/O error".
 fn io(action: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     move |source| Error::Io {
         action: action.to_owned(),
@@ -474,7 +267,6 @@ fn io(action: &'static str) -> impl FnOnce(std::io::Error) -> Error {
 }
 
 impl Request {
-    /// Read and validate a request file.
     pub fn read(path: &Path) -> Result<Self, Error> {
         let bytes = std::fs::read(path).map_err(io("reading the request"))?;
         if bytes.len() > MAX_REQUEST_BYTES {
@@ -485,18 +277,11 @@ impl Request {
         Self::parse(&bytes)
     }
 
-    /// Validate an in-memory request document.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| Error::Invalid("request is not UTF-8".into()))?;
         let root = json::parse(text).map_err(|e| Error::Invalid(format!("bad request: {e}")))?;
 
-        // `deny_unknown_fields`, as the pinned harness has it
-        // (`#[serde(deny_unknown_fields)]`, `protocol_bench.rs:8`). The reason is
-        // not tidiness: a request file is handed to *both* harnesses, and a field
-        // one reads while the other ignores it means the two ran different
-        // workloads under one name. Failing closed is the only way a request
-        // means the same thing on both sides.
         if let Some(pairs) = root.as_obj() {
             for (key, _) in pairs {
                 if !ACCEPTED_FIELDS.contains(&key.as_str()) {
@@ -553,11 +338,7 @@ impl Request {
         Ok(request)
     }
 
-    /// The bounds, and why they are the pinned harness's rather than chosen here.
     pub fn validate(&self) -> Result<(), Error> {
-        // Fields the pinned harness accepts and this one cannot honour. Each is
-        // refused with its reason rather than ignored: an ignored field is a
-        // request that quietly measured something else.
         if self.path != "socks" {
             return Err(Error::Invalid(format!(
                 "path `{}` is not implemented here: this harness drives a SOCKS \
@@ -628,26 +409,11 @@ impl Request {
         Ok(())
     }
 
-    /// Total payload one flow moves.
-    ///
-    /// Widened before it is multiplied: `payload_size * iterations` is at most
-    /// 65536 * 262144 = 2^34, which a `usize` holds on every target here, but the
-    /// product is a byte count against a `u64` cap and doing the arithmetic in
-    /// the narrower type would make the cap a cap on the wrong quantity.
     pub fn flow_bytes(&self) -> u64 {
         u64::try_from(self.payload_size).unwrap_or(u64::MAX)
             * u64::try_from(self.iterations).unwrap_or(u64::MAX)
     }
 
-    /// Total payload across every flow, **counting both directions of a
-    /// full-duplex cell**.
-    ///
-    /// This is what a flow's `sent + received` must equal, and a full-duplex flow
-    /// moves `flow_bytes` up *and* `flow_bytes` down. The doubled figure is the
-    /// reason a duplex cell used to be reported as a short transfer in the one
-    /// direction it could not be short in: it read `moved 8589934592 of
-    /// 4294967296`, having moved exactly twice what was asked of it, and the
-    /// reader -- correctly, from its own point of view -- called that a fault.
     pub fn total_bytes(&self) -> u64 {
         let per_flow = self.flow_bytes();
         let directions = u64::from(self.traffic.uplink()) + u64::from(self.traffic.downlink());
@@ -657,7 +423,6 @@ impl Request {
     }
 }
 
-/// Read `client_env`, rejecting a non-string value rather than stringifying it.
 fn read_env(root: &Json) -> Result<BTreeMap<String, String>, Error> {
     let mut out = BTreeMap::new();
     let Some(env) = root.get("client_env") else {
@@ -678,14 +443,6 @@ fn read_env(root: &Json) -> Result<BTreeMap<String, String>, Error> {
     Ok(out)
 }
 
-/// One flow's setup, split into stages so a difference between two engines can be
-/// attributed to a stage rather than to a single opaque total. Field-for-field
-/// the pinned harness's `FlowSetupSample` (`lib.rs:804`).
-///
-/// The shared `_us` suffix is the pinned harness's own field naming and is kept
-/// on purpose: it is what makes the `setup` object in a `result.json` written here
-/// readable by a consumer written for their harness. The unit belongs in the name
-/// rather than in the type because a `result.json` field has no type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_field_names)]
 pub struct Setup {
@@ -693,26 +450,11 @@ pub struct Setup {
     pub socks_method_us: u128,
     pub socks_connect_us: u128,
     pub socks_setup_us: u128,
-    /// First byte on the wire to the flow being ready, which is not the same as
-    /// the SOCKS reply: several engines acknowledge SOCKS before the transport
-    /// handshake and the remote CONNECT have finished
-    /// (`upstream/xray-rust/crates/xray-bench/src/stream_transport.rs:767`).
-    ///
-    /// The `_us` suffix is on every field on purpose: it is the pinned harness's
-    /// own field naming (`FlowSetupSample`, `lib.rs:804`), and a request or a
-    /// result file whose keys match theirs is the whole point of speaking their
-    /// schema. The unit is in the name, not in the type.
     pub total_us: u128,
 }
 
-/// One setup stage and how to read it out of a [`Setup`].
-///
-/// A named type because the alternative is a bare `(&str, fn(&Setup) -> u128)`
-/// pair repeated in two places, and a signature that has to be re-read to learn
-/// which end is which is exactly the kind that gets transposed.
 type SetupStage = (&'static str, fn(&Setup) -> u128);
 
-/// A `min`/`median`/`p95`/`p99` summary, as `LatencySummary` (`lib.rs:788`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quartiles {
     pub min: u128,
@@ -721,34 +463,22 @@ pub struct Quartiles {
     pub p99: u128,
 }
 
-/// What one run measured.
 #[derive(Debug, Clone)]
 pub struct Outcome {
     pub bytes_sent: u64,
     pub bytes_received: u64,
-    /// Earliest flow's first validated byte to the latest flow's last. Setup is
-    /// excluded from every flow's window, so this is a transfer window and not
-    /// a wall clock.
     pub transfer: Duration,
     pub wall: Duration,
     pub setup: Vec<Setup>,
     pub peak_rss_kib: u64,
     pub cpu_millis: u64,
-    /// How many readings landed inside the transfer window. Below a handful the CPU
-    /// column is a single `ps` reading and is reported as such rather than as a
-    /// measurement — the kernel's own resolution is 10 ms
-    /// ([`cpu_resolution_floor_millis`]) and the sampling period is 100 ms, so a
-    /// window shorter than a few intervals cannot be resolved.
     pub traffic_samples: usize,
     pub threads_peak: Option<u64>,
-    /// Cumulative CPU at the first sample after the engine answered.
     pub startup_cpu_millis: u64,
     pub startup_seconds: f64,
     pub samples: Vec<(Phase, ps::Sample)>,
 }
 
-/// One complete run: the samples, the derived metrics, and the engine identity
-/// the numbers are attributable to.
 #[derive(Debug)]
 pub struct Run {
     pub engine: String,
@@ -757,8 +487,6 @@ pub struct Run {
 }
 
 impl Run {
-    /// `(sent + received) / MiB / seconds`: the pinned harness's
-    /// `throughput_mib_s` (`protocol_bench.rs:301`).
     pub fn throughput_mib_s(&self) -> f64 {
         let seconds = self.outcome.transfer.as_secs_f64();
         if seconds <= 0.0 {
@@ -768,8 +496,6 @@ impl Run {
         total / (1024.0 * 1024.0) / seconds
     }
 
-    /// CPU milliseconds per GiB moved: the metric both pinned harnesses chart
-    /// (`upstream/zeronet/docs/benchmarks/harness/zbench/report.py:138`).
     pub fn cpu_millis_per_gib(&self) -> f64 {
         let bytes = self.outcome.bytes_sent + self.outcome.bytes_received;
         if bytes == 0 {
@@ -778,12 +504,10 @@ impl Run {
         self.outcome.cpu_millis as f64 / (bytes as f64 / 1_073_741_824.0)
     }
 
-    /// Peak RSS in MiB, the unit both harnesses chart.
     pub fn rss_mib(&self) -> f64 {
         self.outcome.peak_rss_kib as f64 / KIB
     }
 
-    /// `min`/`median`/`p95`/`p99` of a stage, or `None` for no samples.
     fn quartiles(values: &[u128]) -> Option<Quartiles> {
         if values.is_empty() {
             return None;
@@ -798,14 +522,6 @@ impl Run {
         })
     }
 
-    /// Serialise to the pinned harness's `result.json` field set.
-    ///
-    /// Every field is present, with `null` rather than absence for the ones this
-    /// harness cannot measure: a missing key and a `null` read differently to a
-    /// script, and a script is what consumes this file. `tun_fd_buffers`,
-    /// `idle_connections`, `prepare_client` and the latency percentiles are
-    /// emitted because the schema has them, carrying the values that mean
-    /// "not applicable to a SOCKS-path run" rather than being quietly dropped.
     pub fn to_result_json(&self, request: &Request) -> Json {
         let o = &self.outcome;
         let stages: [SetupStage; 5] = [
@@ -879,8 +595,6 @@ impl Run {
         root.insert("engine_binary", Json::Str(self.engine.clone()));
         root.insert("engine_sha256", Json::Str(self.engine_sha256.clone()));
         root.insert("setup", setup);
-        // This harness measures throughput, not per-packet latency; the field is
-        // present and null rather than absent.
         root.insert("latency_us", Json::Null);
         root.insert("tun_fd_buffers", Json::Null);
         root.insert("samples", Json::Arr(samples));
@@ -888,9 +602,6 @@ impl Run {
     }
 }
 
-/// A `Quartiles` as JSON, or `null` when there were no samples. A stage with no
-/// samples is `null` rather than a row of zeroes, so a consumer can tell "no
-/// measurement" from "measured zero".
 fn optional_quartiles_json(q: Option<Quartiles>) -> Json {
     q.map_or(Json::Null, quartiles_json)
 }
@@ -904,22 +615,18 @@ fn quartiles_json(q: Quartiles) -> Json {
     out
 }
 
-/// Median of a slice, averaging the middle pair on an even count.
 pub fn median(sorted: &[u128]) -> u128 {
     if sorted.is_empty() {
         return 0;
     }
     let mid = sorted.len() / 2;
     if sorted.len().is_multiple_of(2) {
-        // `midpoint` cannot overflow for the latencies this measures: both are
-        // microsecond counts far below `u128::MAX / 2`.
         u128::midpoint(sorted[mid - 1], sorted[mid])
     } else {
         sorted[mid]
     }
 }
 
-/// Nearest-rank percentile, as `percentile_nearest_rank` in the pinned harness.
 pub fn nearest_rank(sorted: &[u128], pct: u128) -> u128 {
     if sorted.is_empty() {
         return 0;
@@ -928,11 +635,6 @@ pub fn nearest_rank(sorted: &[u128], pct: u128) -> u128 {
     sorted[((rank.max(1) - 1) as usize).min(sorted.len() - 1)]
 }
 
-/// The deterministic payload template: an xorshift64 keystream.
-///
-/// Not a constant and not a repeated constant, for the reason the pinned
-/// harnesses give: a constant payload cannot detect a core that moves the right
-/// number of bytes in the wrong order.
 pub fn bulk_pattern_template(payload_size: usize) -> Vec<u8> {
     let mut state = BULK_PATTERN_SEED;
     let mut out = Vec::with_capacity(payload_size);
@@ -945,28 +647,6 @@ pub fn bulk_pattern_template(payload_size: usize) -> Vec<u8> {
     out
 }
 
-/// The local non-loopback IPv4 address, so no engine's dial takes a loopback
-/// shortcut the others do not.
-///
-/// The pinned harness's own rule (`lib.rs:5060`): a UDP socket is connected to a
-/// public address purely to make the kernel pick the source address, and the
-/// result is rejected unless it is a real unicast address. Everything bound to
-/// `127.0.0.1` would let each engine take whichever loopback path suits it, and
-/// the comparison would be a comparison of those choices.
-///
-/// # Which address, and why the report has to name it
-///
-/// This resolves through the *routing table* rather than through an interface
-/// list, so what it returns is wherever the kernel would send a packet to the
-/// public internet. With a VPN up that is the tunnel's address, and with it down
-/// it is the ethernet's -- the same binary, the same workload, two different
-/// measurements, and the report could not tell a reader which had happened because
-/// it never said.
-///
-/// So the address is named on the machine line of every gate-5 report. That is the
-/// whole fix: not a preference for one interface over another, which would be a
-/// guess about which is faster, but the removal of a variable the report was
-/// silently carrying.
 pub fn local_non_loopback_ipv4() -> Result<Ipv4Addr, Error> {
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .map_err(io("binding the probe socket"))?;
@@ -992,18 +672,6 @@ pub fn local_non_loopback_ipv4() -> Result<Ipv4Addr, Error> {
     Ok(ip)
 }
 
-/// A port the kernel has just confirmed free.
-///
-/// Racy in principle and the comment in the pinned harness is honest about it: a
-/// listener is bound and dropped, so the port is free at that instant. Used for
-/// the fixture and inbound ports only; readiness is then confirmed by connecting,
-/// so a stolen port shows up as an engine that never listens rather than as a
-/// silent mismeasurement.
-/// `count` consecutive free ports on `ip`, all held until the caller drops them.
-///
-/// **All of them are bound before any is returned**, and that is the point: a
-/// range probed one port at a time can hand out a port the *next* probe is about
-/// to take, which is how the sink and the engine ended up wanting one number.
 fn allocate_port_range(count: usize) -> Result<Vec<u16>, Error> {
     let ip = local_non_loopback_ipv4()?;
     let mut held = Vec::with_capacity(count);
@@ -1020,12 +688,6 @@ fn allocate_port_range(count: usize) -> Result<Vec<u16>, Error> {
     Ok(out)
 }
 
-/// One free port on `ip` that is not in `taken`.
-///
-/// Binds and closes, which is racy in principle and bounded in practice: the
-/// window is microseconds and readiness is confirmed afterwards by connecting,
-/// so a port stolen in the meantime surfaces as an engine that never listens
-/// rather than as a silent mismeasurement.
 fn allocate_port_excluding(ip: Ipv4Addr, taken: &[u16]) -> Result<u16, Error> {
     for _ in 0..64 {
         let listener = TcpListener::bind((ip, 0)).map_err(io("allocating a port"))?;
@@ -1040,20 +702,12 @@ fn allocate_port_excluding(ip: Ipv4Addr, taken: &[u16]) -> Result<u16, Error> {
     ))
 }
 
-/// An engine that is killed and reaped on every exit path, including a failed
-/// workload and an early return.
-///
-/// The same guard the pinned harness uses (`protocol_bench.rs:35-46`): a benchmark
-/// that leaks its engine leaves a process holding the port, and the next repeat
-/// then measures a different machine.
 struct Engine {
     child: Child,
 }
 
 impl Engine {
     fn reap(&mut self) {
-        // Failure to kill is not an error: the process may already have exited,
-        // which is the outcome wanted.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1065,34 +719,8 @@ impl Drop for Engine {
     }
 }
 
-/// Measure one engine against one request.
-///
-/// The measured process is the engine and only the engine: the sink is in this
-/// process and is never sampled, exactly as the pinned harness excludes its
-/// fixture (`upstream/xray-rust/docs/benchmarks.md:209-211`). Sampling the sink
-/// too would charge our own driver to whichever engine happened to be slower.
 pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Result<Run, Error> {
     let ip = local_non_loopback_ipv4()?;
-    // Both ports are allocated on the address the harness actually binds, and the
-    // sink's whole **range** is reserved before the engine's port is drawn.
-    //
-    // Two things were wrong and either alone breaks every multi-flow cell.
-    //
-    // `allocate_port` probed `127.0.0.1:0` while every listener is bound on the
-    // non-loopback address, so the two were drawn from disjoint pools and the
-    // number the kernel handed the engine was never checked against the number
-    // the sink was about to take. And the sink takes `connections` consecutive
-    // ports, not one, so even a same-address probe that only checked the sink's
-    // *first* port would miss the engine sitting seven ports along inside the
-    // range.
-    //
-    // The result was that at two flows the engine's `SOCKS` inbound and one of
-    // the sink's per-flow listeners wanted the same port on the same address.
-    // Whoever bound second lost: either the engine exits (`Address already in
-    // use`) and every flow then reports "could not connect to the engine", or the
-    // sink's listener is gone and its flow reports the engine closed the upload.
-    // Both messages blame the engine, and the run takes the full start-up timeout
-    // to say so.
     let sink_ports = allocate_port_range(request.connections)?;
     let sink_port = sink_ports[0];
     let engine_port = allocate_port_excluding(ip, &sink_ports)?;
@@ -1122,15 +750,11 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
         });
     }
 
-    // Startup phase: the pre-work sleep, sampled, which is also where the startup
-    // CPU figure is taken from.
     let startup_samples = sample_for(pid, Phase::Startup, PRE_SLEEP)?;
     let startup_cpu_millis = startup_samples
         .first()
         .map(|(_, s)| s.cpu_millis)
         .unwrap_or_default();
-    // `startup_samples` is moved into the window below, so the CPU total is taken
-    // against the same first reading the samples vector starts with.
 
     if request.warmup {
         warmup(socks, &bulk_pattern_template(request.payload_size))?;
@@ -1149,18 +773,11 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
         )));
     }
 
-    // One last traffic-phase reading after the flows close, so a peak that appears
-    // as the workload ends is inside the window rather than after it.
     std::thread::sleep(SAMPLE_INTERVAL + Duration::from_millis(20));
     stop.store(true, Ordering::Relaxed);
     let _ = sampler_thread.join();
-    // The startup readings are part of the window, and they have to be in it: the
-    // CPU figure is a delta from the first of them, so leaving them out of the
-    // vector would make the published total unre-derivable from the published
-    // samples. That is not a formatting preference — `revalidate` checks it.
     let mut samples = startup_samples;
     samples.extend(rx.try_iter());
-    // Settle, then more readings, so the settled figure is in the samples too.
     samples.extend(sample_for(pid, Phase::Settle, SETTLE)?);
 
     engine.reap();
@@ -1204,7 +821,6 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
     })
 }
 
-/// What the sample vector says, once.
 struct Summary {
     peak_rss_kib: u64,
     cpu_millis: u64,
@@ -1213,13 +829,6 @@ struct Summary {
     transfer: Duration,
 }
 
-/// Fold the readings and the flows into the figures the report publishes.
-///
-/// The CPU total is a delta from the *first* reading, which is a startup reading:
-/// it is what the engine had spent before the workload began. The union of the
-/// flows' own windows is the transfer window, because each flow's window already
-/// excludes that flow's setup — and with no flow having moved bytes there is no
-/// window at all, and reporting zero would make throughput infinite.
 fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis: u64) -> Summary {
     Summary {
         peak_rss_kib: samples
@@ -1243,7 +852,6 @@ fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis:
     }
 }
 
-/// Spawn the engine, with its output redirected to files in the run directory.
 fn spawn_engine(
     request: &Request,
     config_arg: ConfigArg,
@@ -1267,12 +875,6 @@ fn spawn_engine(
     Ok(Engine { child })
 }
 
-/// The traffic phase: one thread per flow and one sampling thread.
-///
-/// Flows are on their own threads so `full-duplex` is genuinely concurrent and a
-/// slow flow cannot serialise the others behind it. The sampler reads `ps` on a
-/// fixed interval for the whole window, exactly as the pinned harness's
-/// `sample_while_phased` does at the traffic phase (`protocol_bench.rs:271`).
 type TrafficPhase = (
     Vec<JoinHandle<FlowResult>>,
     JoinHandle<()>,
@@ -1297,32 +899,15 @@ fn start_traffic(
     )
 }
 
-/// What every flow together moved.
 struct Moved {
     sent: u64,
     received: u64,
-    /// The union of the flows' own transfer windows.
     window: Option<(Instant, Instant)>,
     setup: Vec<Setup>,
-    /// Why a flow stopped early, if one did.
     stopped: Option<String>,
-    /// Every flow's reason, not just the first.
-    ///
-    /// With one flow the two are the same thing. With several, keeping only the
-    /// first means the report names whichever flow happened to be collected first
-    /// and drops the rest -- and those two can be *different faults*, one from
-    /// the driver and one from the sink, which is exactly the case where naming
-    /// one alone sends the reader after the wrong subsystem. It cost real time
-    /// here: an upload cell at two flows reported "could not connect to the
-    /// engine" from the driver while the sink had independently seen "the engine
-    /// closed the upload after 0 bytes", and neither line explained the failure.
     all_stopped: Vec<String>,
 }
 
-/// Join every flow and fold their windows together.
-///
-/// A missing window on either side keeps the other: a flow that moved nothing is
-/// absent from the window rather than collapsing it to zero.
 fn collect_flows(
     flows: Vec<JoinHandle<FlowResult>>,
     stop: &Arc<AtomicBool>,
@@ -1356,7 +941,6 @@ fn collect_flows(
     Ok(moved)
 }
 
-/// Read the last few lines of the engine's stderr, for a failure message.
 fn tail(path: &Path) -> String {
     std::fs::read_to_string(path).map_or_else(
         |_| "<unreadable>".into(),
@@ -1370,11 +954,6 @@ fn tail(path: &Path) -> String {
     )
 }
 
-/// Wait for the engine to answer on its SOCKS port.
-///
-/// Readiness is a successful connect, not a log line: the two engines log
-/// differently and neither is required to log at all. A process that has exited
-/// will never listen, so that is reported first rather than after the timeout.
 fn wait_for_listener(child: &mut Child, addr: SocketAddr, stderr: &Path) -> Result<(), Error> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
@@ -1398,7 +977,6 @@ fn wait_for_listener(child: &mut Child, addr: SocketAddr, stderr: &Path) -> Resu
     }
 }
 
-/// Take `duration` worth of samples in one phase.
 fn sample_for(
     pid: u32,
     phase: Phase,
@@ -1409,9 +987,6 @@ fn sample_for(
     let first = sample_at(host, pid, 0)?;
     let mut samples = vec![(phase, first)];
     while start.elapsed() < duration {
-        // `saturating_sub` because the loop condition is checked against a
-        // *fresh* `elapsed()`: the two reads can straddle the deadline, and a
-        // panic on a subtraction that raced would be the worst possible report.
         let remaining = duration.saturating_sub(start.elapsed());
         std::thread::sleep(SAMPLE_INTERVAL.min(remaining));
         samples.push((phase, sample_at(host, pid, start.elapsed().as_millis())?));
@@ -1425,9 +1000,6 @@ fn sample_at(host: Host, pid: u32, elapsed_ms: u128) -> Result<ps::Sample, Error
     })
 }
 
-/// Sample the engine every interval until `stop`, tagging every reading
-/// `Traffic`. The pinned harness's `sample_while_phased` at the traffic phase
-/// (`protocol_bench.rs:271`).
 fn spawn_sampler(
     pid: u32,
     stop: Arc<AtomicBool>,
@@ -1442,8 +1014,6 @@ fn spawn_sampler(
                 break;
             }
             if let Ok(sample) = ps::sample(host, pid, start.elapsed().as_millis()) {
-                // A closed channel means the reader is gone; stop rather than
-                // spin on a send that will never be received.
                 if tx.send((Phase::Traffic, sample)).is_err() {
                     break;
                 }
@@ -1452,67 +1022,30 @@ fn spawn_sampler(
     })
 }
 
-/// One flow's validated outcome.
 struct FlowResult {
     bytes_sent: u64,
     bytes_received: u64,
-    /// This flow's own transfer window: first validated byte to last. Excludes
-    /// this flow's setup, which is what makes the union of them a transfer window
-    /// rather than a wall clock.
     window: Option<(Instant, Instant)>,
     setup: Setup,
-    /// Why the flow stopped early, if it did. Recorded rather than inferred: a
-    /// short transfer reported as a byte count sends the reader looking at the
-    /// engine, when the fault may have been in the handshake, in this harness, or
-    /// in the kernel.
     stopped: Option<String>,
 }
 
-/// What a flow needs, computed once on the calling thread.
 struct FlowPlan {
     bytes: u64,
-    /// The flow's rotation of the shared keystream: same length for every flow,
-    /// different content, so two flows' bytes can never be mistaken for one
-    /// another's.
     pattern: Vec<u8>,
     traffic: Traffic,
-    /// The measured engine's `SOCKS` listener. The flow opens this.
     engine: SocketAddr,
-    /// The validated sink, in this process. The flow asks the engine to dial
-    /// *this* — naming the engine's own port here instead would have the engine
-    /// connect to itself, which is a loop that never terminates and a hang that
-    /// looks like a slow benchmark.
     target: SocketAddr,
-    /// This flow's index, for the error message.
     index: usize,
 }
 
-/// The sink: an accept loop plus whatever the flows reported on their way out.
 struct SinkThread {
     accept: JoinHandle<()>,
-    /// One entry per flow that stopped early, with the reason.
     reasons: Arc<std::sync::Mutex<Vec<String>>>,
-    /// Set when the run is over, so a listener nobody ever connected to stops
-    /// polling instead of making `join` wait forever.
-    ///
-    /// **This is what made every multi-flow cell hang, and it is the second half
-    /// of the same defect as the sequential accept loop.** A listener's job is to
-    /// serve one flow; a flow that never connected -- because the engine refused
-    /// the connection, or because the driver gave up on it -- leaves that listener
-    /// with nothing to accept and nothing to time out against. Joining it is then
-    /// an unbounded wait, which is the one way this harness hangs rather than
-    /// fails. The flow's own reason is already recorded and reported; the listener
-    /// only needs to stop.
     done: Arc<AtomicBool>,
 }
 
 impl SinkThread {
-    /// Tell the accept loops the run is over, then wait for them.
-    ///
-    /// The flag is set **before** the join and not by a timeout: a bounded wait
-    /// would still leave a thread running past the point the process reads its
-    /// results, and the join would then race the flag. The loops poll every 20 ms,
-    /// so the cost of finishing is bounded and small.
     fn join(self) -> Result<(), Error> {
         self.done.store(true, Ordering::Relaxed);
         self.accept
@@ -1521,13 +1054,11 @@ impl SinkThread {
         Ok(())
     }
 
-    /// Why a flow stopped early, if one did.
     fn reasons(&self) -> Vec<String> {
         self.reasons.lock().map(|r| r.clone()).unwrap_or_default()
     }
 }
 
-/// Spawn one thread per flow.
 fn spawn_flows(
     request: &Request,
     engine: SocketAddr,
@@ -1541,10 +1072,6 @@ fn spawn_flows(
                 pattern: rotate(&template, index, request.connections),
                 traffic: request.traffic,
                 engine,
-                // The target carries this flow's index in its port. That is what lets
-                // the sink know which rotation of the keystream this flow carries
-                // without inferring it from the order connections arrived in -- which
-                // is a thing the two ends cannot agree on, and did not.
                 target: SocketAddr::new(target.ip(), sink_port_of(target.port(), index)),
                 index,
             };
@@ -1553,18 +1080,10 @@ fn spawn_flows(
         .collect()
 }
 
-/// A distinct rotation of the keystream per flow.
-///
-/// Rotating rather than slicing keeps every flow the same length, so two flows
-/// move the same number of bytes and neither can be distinguished by count — only
-/// by content, which is the property rule 1 needs.
 fn rotate(template: &[u8], index: usize, flows: usize) -> Vec<u8> {
     if flows <= 1 || template.is_empty() {
         return template.to_vec();
     }
-    // A stride coprime with nothing in particular is enough: the offsets differ,
-    // so the byte sequences differ unless the template is periodic, which the
-    // seed guarantees it is not.
     let shift = (index * 977) % template.len();
     let mut out = Vec::with_capacity(template.len());
     out.extend_from_slice(&template[shift..]);
@@ -1572,11 +1091,6 @@ fn rotate(template: &[u8], index: usize, flows: usize) -> Vec<u8> {
     out
 }
 
-/// The `SOCKS5` greeting: offer no authentication, expect the engine to pick it.
-///
-/// A wrong answer is named rather than treated as a short read, because "the engine
-/// answered `0502`" and "the engine said nothing" are different faults and the
-/// reader needs to know which happened.
 fn socks_greet(stream: &mut TcpStream) -> Result<(), String> {
     stream
         .write_all(&[5, 1, 0])
@@ -1593,18 +1107,11 @@ fn socks_greet(stream: &mut TcpStream) -> Result<(), String> {
     Ok(())
 }
 
-/// Arm a flow socket with the I/O timeout, so a dead peer fails the flow
-/// instead of hanging the join in [`collect_flows`].
-///
-/// Factored out rather than inlined so a test can assert the timeouts are set
-/// without moving any bytes: a test that waited out the timeout would take
-/// thirty seconds to prove anything.
 fn apply_flow_timeouts(stream: &TcpStream) {
     let _ = stream.set_read_timeout(Some(FLOW_IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(FLOW_IO_TIMEOUT));
 }
 
-/// Run one flow: connect, SOCKS5 handshake, then move validated bytes.
 fn run_flow(plan: &FlowPlan) -> FlowResult {
     let mut result = FlowResult {
         bytes_sent: 0,
@@ -1622,15 +1129,10 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
         ));
         return result;
     };
-    // Nagle would batch the driver's writes and measure the coalescing rather
-    // than the engine.
     let _ = stream.set_nodelay(true);
     apply_flow_timeouts(&stream);
     result.setup.tcp_connect_us = t0.elapsed().as_micros();
 
-    // SOCKS5, no authentication: greeting, then CONNECT to the sink. A failure
-    // here is not reported as an engine fault: the byte count check in `measure`
-    // catches a flow that never moved, with the whole run's context.
     let t1 = Instant::now();
     if let Err(reason) = socks_greet(&mut stream) {
         result.stopped = Some(reason);
@@ -1639,15 +1141,7 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     result.setup.socks_method_us = t1.elapsed().as_micros();
 
     let t2 = Instant::now();
-    // ATYP with the sink's real address. It has to be the address the sink is
-    // *bound* to, not `127.0.0.1`: every listener in this harness is on the
-    // non-loopback address (see [`local_non_loopback_ipv4`]), so asking an engine
-    // to dial the loopback would either be refused outright or take a loopback
-    // path the other engine did not, which is the whole thing that function
-    // exists to prevent.
     let mut connect = vec![5, 1, 0];
-    // The reply is variable-length with the address family, so the length is
-    // known before the request is built rather than assumed afterwards.
     let reply_len = match plan.target.ip() {
         std::net::IpAddr::V4(v4) => {
             connect.push(1);
@@ -1683,21 +1177,10 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     }
     result.setup.socks_connect_us = t2.elapsed().as_micros();
     result.setup.socks_setup_us = t1.elapsed().as_micros();
-    // Taken here, at the first end-to-end readiness point, which is not the same as
-    // the end of the flow. Reading it after the transfer would report the whole
-    // run's duration in a column named "setup", and the two engines' setup times
-    // would differ only by how fast they moved bytes.
     result.setup.total_us = t0.elapsed().as_micros();
 
-    // The transfer window opens here, after the handshake: rule 2.
     let window_start = Instant::now();
     if plan.traffic.uplink() {
-        // Written in chunks rather than as one buffer. Materialising the whole
-        // payload would put the entire workload in this process's heap — half a
-        // gigabyte at the default size, and it is the *harness's* memory, which
-        // would then show up in nothing and eventually in an OOM kill. The engine
-        // still receives the bytes in whatever sizes its own relay reads them, so
-        // chunking here does not change what is being measured.
         if let Err(e) = plan.stream_up(&mut stream, &mut result.bytes_sent) {
             result.stopped = Some(format!(
                 "upload write failed after {} of {} bytes: {e}",
@@ -1708,9 +1191,6 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     }
 
     if plan.traffic.downlink() {
-        // `Err` is a short read, not a corrupt one: recorded as a reason like any
-        // other and the flow returns, so `measure` reports it beside the sink's
-        // own account of the same flow instead of the process dying here.
         match plan.stream_down(&mut stream) {
             Ok(received) => result.bytes_received = received,
             Err(why) => {
@@ -1723,47 +1203,14 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     if (plan.traffic.uplink() || plan.traffic.downlink()) && result.stopped.is_none() {
         result.window = Some((window_start, Instant::now()));
     }
-    // Both directions drained: a half-closed flow would leave the engine's relay
-    // thread running and its buffers resident, which the next flow's RSS would
-    // then measure.
     let _ = stream.shutdown(Shutdown::Both);
     result
 }
 
-/// How much of the payload is built in memory at once for an upload.
-///
-/// 1 MiB: large enough that the syscall count is not what is being measured, small
-/// enough that the harness' own footprint stays a rounding error next to the
-/// engines'.
 const UPLOAD_CHUNK: usize = 1024 * 1024;
 
-/// How much of a download the driver reads per `read(2)`.
-///
-/// 64 KiB, and that is the pinned harness's own figure
-/// (`upstream/xray-rust/crates/xray-bench/src/protocol_bench.rs:436`), kept for
-/// the same reason the payload size is: the number of syscalls the driver picks
-/// must not be what the engines are measured against.
 const DOWNLOAD_CHUNK: usize = 64 * 1024;
 
-/// Read `bytes` from `stream`, checking every one against the ring `pattern`.
-///
-/// One function for both callers that read a validated download: the flow that
-/// drives an engine, and [`ceiling_flow`], which measures the same loop with no
-/// engine in the path. They have to be the same loop or the ceiling is not a
-/// ceiling -- see [`ceiling_flow`].
-///
-/// A mismatch is an `Err` rather than a number, and every caller here turns it
-/// into a harness fault that ends the process: a driver and a sink that disagree
-/// invalidate every number beside them, so there is nothing to report and
-/// something to stop.
-///
-/// The comparison itself allocates nothing. This used to materialise the expected
-/// bytes into a fresh `Vec` per chunk and compare against that, which on this
-/// thread -- the busiest one in the harness, inside the measured window -- meant
-/// one 64 KiB allocation and one 64 KiB copy for every 64 KiB of payload: three
-/// passes over the data where the read from the socket and one comparison
-/// suffice. The guarantee is unchanged and so is the coverage; only the copies
-/// are gone.
 fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<u64, String> {
     let mut chunk = vec![0u8; pattern.len().clamp(1, DOWNLOAD_CHUNK)];
     let mut read_total = 0u64;
@@ -1786,11 +1233,6 @@ fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<
     Ok(read_total)
 }
 
-/// Whether `chunk` is `pattern`'s ring at `offset`, without building it.
-///
-/// The pattern repeats, so a chunk at `offset` is at most two slices of it: the
-/// tail from `start`, then the head. Each is compared where it lies, which is the
-/// whole of the difference between one pass over the payload and three.
 fn matches_pattern(pattern: &[u8], offset: usize, chunk: &[u8]) -> bool {
     let period = pattern.len();
     if period == 0 {
@@ -1806,33 +1248,9 @@ fn matches_pattern(pattern: &[u8], offset: usize, chunk: &[u8]) -> bool {
 }
 
 impl FlowPlan {
-    /// Read this flow's download, checking every byte, and count what arrived.
-    ///
-    /// [`read_validated`] does the work. Its two failures are **not** the same
-    /// fault and are no longer treated as one:
-    ///
-    /// - a byte that is not the pattern is a *disagreement* between the driver
-    ///   and the sink. There is no engine that can fix it and no byte count worth
-    ///   reporting beside it, so this still ends the process.
-    /// - a stream that **ends early** is not a disagreement. The bytes that did
-    ///   arrive were all correct; the flow simply stopped short, which is the same
-    ///   shape as a flow whose engine hung up, and the sink already records a
-    ///   reason for that on its own side.
-    ///
-    /// The second used to `exit(3)` here, which threw away the only evidence that
-    /// could name a cause: `measure` reads `sink_thread.reasons()` *after* the
-    /// flows are collected, so a process that exits inside a flow never reaches
-    /// the line where the sink's reason is printed. What reached the log was
-    /// `download read failed after 536805376 of 1073741824 bytes` and nothing
-    /// else -- a byte count that says the transfer stopped and not who stopped it.
-    /// It now returns `Err` and lets `measure` report it beside the sink's own
-    /// account, which is the half that can name the cause.
     fn stream_down(&self, stream: &mut TcpStream) -> Result<u64, String> {
         read_validated(&mut *stream, &self.pattern, self.bytes).map_err(|why| {
             if why.starts_with("bytes at offset") {
-                // Still fatal, still here rather than propagated: nothing that
-                // follows can be trusted once the two ends disagree, so the run
-                // stops now instead of collecting numbers beside a bad stream.
                 eprintln!(
                     "harness fault: flow {} saw bytes that are not the validated \
                      pattern: {why}",
@@ -1840,18 +1258,10 @@ impl FlowPlan {
                 );
                 std::process::exit(3);
             }
-            // An early end. Recorded like any other reason a flow stopped, so the
-            // sink's account of the same flow is reported next to this one.
             format!("flow {} download stopped early: {why}", self.index)
         })
     }
 
-    /// Write `bytes` of this flow's pattern, counting what the socket took.
-    ///
-    /// One `write_all` per [`UPLOAD_CHUNK`], not per iteration and not for the
-    /// whole payload: the measurement is the engine's copy path, so neither the
-    /// number of syscalls this driver picks nor the harness' own heap should
-    /// decide it.
     fn stream_up(&self, stream: &mut TcpStream, sent: &mut u64) -> std::io::Result<()> {
         let mut chunk: Vec<u8> = Vec::with_capacity(UPLOAD_CHUNK);
         while chunk.len() < UPLOAD_CHUNK {
@@ -1867,15 +1277,7 @@ impl FlowPlan {
     }
 }
 
-/// Start the validated sink on `ip:port`.
-///
-/// `expect_bytes` of zero means download-only, so the sink is a pure source. The
-/// sink lives in this process and is deliberately never sampled.
 fn spawn_sink(ip: Ipv4Addr, ports: &[u16], request: &Request) -> Result<SinkThread, Error> {
-    // The ports were already reserved by `measure`, on this address, disjoint from
-    // the engine's. Binding them here is the second half of that reservation; the
-    // range is re-derived from `ports` rather than from a first port plus a count
-    // so the two cannot drift apart.
     let listeners = per_flow_sink_ports(ip, ports)?;
     for listener in &listeners {
         listener
@@ -1884,17 +1286,6 @@ fn spawn_sink(ip: Ipv4Addr, ports: &[u16], request: &Request) -> Result<SinkThre
     }
     let pattern = Arc::new(bulk_pattern_template(request.payload_size));
     let flows = request.connections;
-    // Per **flow**, not per workload. `total_bytes` is the whole cell
-    // (`flow_bytes * connections`) and each flow reads exactly `flow_bytes`, so
-    // handing every flow the cell's total asks each one for `connections` times
-    // what it is willing to send. At one connection the two are equal and the bug
-    // is invisible; at eight the sink offers 64x the bytes the workload reads,
-    // and the cell dies as a short transfer with the harness -- not the engine --
-    // at fault. `docs/methodology.md` calls the eight-flow rows part of the matrix
-    // and they had never run on a runner that reported it.
-    //
-    // A full-duplex flow moves `flow_bytes` each way, so `sent + received` is
-    // `2 * flow_bytes` for it; that is the reader's accounting and is separate.
     let upload_bytes = if request.traffic.uplink() {
         request.flow_bytes()
     } else {
@@ -1908,35 +1299,17 @@ fn spawn_sink(ip: Ipv4Addr, ports: &[u16], request: &Request) -> Result<SinkThre
     let reasons = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let accept_reasons = Arc::clone(&reasons);
     let done = Arc::new(AtomicBool::new(false));
-    // One thread **per listener**, all accepting concurrently. The obvious
-    // shape — one thread looping over the listeners in order — deadlocks every
-    // multi-flow cell: flow 1 is not accepted until flow 0's `serve_flow`
-    // returns, and on a download `serve_flow` cannot return until the driver has
-    // read every byte, which needs flow 1's socket to have been accepted and be
-    // emitting. Both wait for the other. At `connections = 1` there is no second
-    // listener, so the deadlock is invisible -- which is why six of the standard
-    // tier's eleven cells hung or timed out on every runner while the
-    // single-flow rows were green, and why this is a test of the harness itself
-    // rather than of any engine.
     let sink_done = Arc::clone(&done);
     let accept = std::thread::spawn(move || {
         let done = sink_done;
         let mut handles = Vec::with_capacity(listeners.len());
         for (index, listener) in listeners.into_iter().enumerate() {
-            // This flow's own rotation, named by the port it dialled.
             let flow = Arc::new(rotate(&pattern, index, flows));
             let sink_reasons = Arc::clone(&accept_reasons);
             let thread_done = Arc::clone(&done);
             handles.push(std::thread::spawn(move || {
-                // Non-blocking, and that is load-bearing. A blocking accept would
-                // wait forever for a flow that never connected, and an unbounded
-                // join is the one way this harness can hang rather than fail.
-                // Polling costs nothing here: the accept fires the instant the
-                // engine connects.
                 let listener_done = thread_done;
                 let (stream, _) = loop {
-                    // Asked before the accept as well as after it, so a run that
-                    // has already finished does not wait out one more poll.
                     if listener_done.load(Ordering::Relaxed) {
                         return;
                     }
@@ -1948,11 +1321,6 @@ fn spawn_sink(ip: Ipv4Addr, ports: &[u16], request: &Request) -> Result<SinkThre
                         Err(_) => return,
                     }
                 };
-                // A socket accepted from a non-blocking listener *inherits*
-                // `O_NONBLOCK` on Linux and the BSDs, macOS included. Left alone,
-                // every `write_all` in `emit` fails with `EAGAIN` the moment the
-                // kernel's send buffer fills, which reads exactly like an engine
-                // that hung up.
                 if stream.set_nonblocking(false).is_err() {
                     return;
                 }
@@ -1975,11 +1343,6 @@ fn spawn_sink(ip: Ipv4Addr, ports: &[u16], request: &Request) -> Result<SinkThre
     })
 }
 
-/// Serve one flow's sink end: validate an upload, produce a download.
-///
-/// Returns why it stopped, if it stopped early. A silent return here would look
-/// identical to an engine that hung up, and the reader would blame the engine —
-/// which is how a harness fault becomes an engine regression in a report.
 fn serve_flow(
     stream: TcpStream,
     pattern: &Arc<Vec<u8>>,
@@ -1987,8 +1350,6 @@ fn serve_flow(
     upload_bytes: u64,
     download_bytes: u64,
 ) -> Option<String> {
-    // The download is produced by a thread so an upload-only flow's sink does not
-    // sit idle waiting for a write that will never come, and vice versa.
     let downloader = if download_bytes > 0 {
         let Ok(read_half) = stream.try_clone() else {
             return Some("the sink could not clone its socket".to_owned());
@@ -2005,9 +1366,6 @@ fn serve_flow(
         return validate(stream, pattern, index, upload_bytes);
     }
     match downloader {
-        // A panicking sink thread has already taken the process down in every
-        // other path; here it can only mean the flow ended for an unknown reason,
-        // which is itself reported.
         Some(handle) => match handle.join() {
             Ok(reason) => reason,
             Err(_) => Some("the sink's flow thread panicked".to_owned()),
@@ -2016,9 +1374,6 @@ fn serve_flow(
     }
 }
 
-/// Check every uploaded byte against this flow's pattern.
-///
-/// Returns why it stopped early, if it did.
 fn validate(
     mut stream: TcpStream,
     pattern: &Arc<Vec<u8>>,
@@ -2054,15 +1409,6 @@ fn validate(
     None
 }
 
-/// Emit exactly `expect` bytes of this flow's pattern.
-///
-/// Returns why it stopped early, if it did. A silent `return` on a write error
-/// here is indistinguishable from an engine that hung up, so the reader of a
-/// short transfer would blame the engine for a fault in the harness — which is
-/// how a harness bug becomes an engine regression in somebody's report.
-///
-/// Every byte handed to the socket is validated by construction: it comes from
-/// the shared keystream. The check that matters is the reader's.
 fn emit(
     mut stream: TcpStream,
     pattern: &Arc<Vec<u8>>,
@@ -2089,13 +1435,6 @@ fn emit(
     None
 }
 
-/// Open and close one flow, for a warmup connection.
-///
-/// Capped and its errors ignored: a warmup exists to page the engine in and to
-/// let TCP window growth settle, so failing it should not decide the run. What
-/// *is* reported is the case where the engine cannot complete a single flow at
-/// all, because then every subsequent flow will fail and the run would be
-/// reported as a short transfer with no explanation.
 fn warmup(socks: SocketAddr, pattern: &[u8]) -> Result<(), Error> {
     let mut stream = TcpStream::connect_timeout(&socks, Duration::from_secs(10))
         .map_err(io("warmup connect"))?;
@@ -2124,15 +1463,6 @@ fn warmup(socks: SocketAddr, pattern: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Add the harness's SOCKS inbound to a request's outbound-only config.
-///
-/// The inbound carries the tag `harness-socks`, so matrix configs can route
-/// it to a protocol outbound while the protocol's own server side falls
-/// through to `freedom`.
-///
-/// The request's own outbounds are kept, not replaced: the engine's whole job is
-/// to dial through whatever outbound the request names, and dropping it would
-/// measure a different configuration than the one a reader of the request expects.
 pub fn inject_inbound(
     config: &str,
     listen: Ipv4Addr,
@@ -2158,11 +1488,6 @@ pub fn inject_inbound(
         .map_err(|e| Error::Invalid(format!("config cannot be re-serialised: {e}")))
 }
 
-/// SHA-256 of a file, so a number is attributable to a binary and not to a path.
-///
-/// Computed here rather than by shelling out, so the harness depends on neither
-/// `sha256sum` (absent on macOS) nor `shasum` (absent on slim Linux images): a
-/// missing tool must not turn into an unattributable measurement.
 pub fn file_sha256(path: &Path) -> String {
     let mut state = Sha256::new();
     if let Ok(bytes) = std::fs::read(path) {
@@ -2171,7 +1496,6 @@ pub fn file_sha256(path: &Path) -> String {
     state.hex()
 }
 
-/// Minimal SHA-256, so the harness needs no hashing dependency.
 struct Sha256 {
     state: [u32; 8],
     buffer: [u8; 64],
@@ -2179,7 +1503,6 @@ struct Sha256 {
     length: u64,
 }
 
-/// The round constants from FIPS 180-4.
 const K: [u32; 64] = [
     0x428a_2f98,
     0x7137_4491,
@@ -2295,8 +1618,6 @@ impl Sha256 {
         self.state = compress_block(&self.state, block);
     }
 
-    /// Finalise. The padding is written through a path that does not disturb the
-    /// message length, which is the one thing that is easy to get wrong here.
     fn hex(self) -> String {
         let bits = self.length;
         let mut padded = Vec::with_capacity(self.buffered + 72);
@@ -2322,14 +1643,6 @@ impl Sha256 {
     }
 }
 
-/// One block of compression, as a function of state so finalisation can run it
-/// without mutating a `Sha256` whose length field must not move.
-/// One block of compression, FIPS 180-4 §6.2.2.
-///
-/// The working variables keep the specification's names: this is the one function
-/// where `a` through `h` are the names the standard uses, and renaming them to
-/// satisfy a lint would make the code harder to check against the standard
-/// rather than easier.
 #[allow(clippy::many_single_char_names)]
 fn compress_block(state: &[u32; 8], block: &[u8; 64]) -> [u32; 8] {
     let mut w = [0u32; 64];
@@ -2377,41 +1690,10 @@ fn compress_block(state: &[u32; 8], block: &[u8; 64]) -> [u32; 8] {
     ]
 }
 
-/// The port flow `index` of a run whose first flow uses `first`.
-///
-/// `saturating_add`, so an index past the end of the range lands on the highest port
-/// rather than wrapping onto an unrelated listener -- and [`per_flow_sink_ports`]
-/// refuses to build that range in the first place.
 fn sink_port_of(first: u16, index: usize) -> u16 {
     first.saturating_add(u16::try_from(index).unwrap_or(u16::MAX))
 }
 
-/// One listener per flow, on consecutive ports from `first`.
-///
-/// # Why a flow's identity is its port and not its place in the accept queue
-///
-/// The two ends of a flow have to agree on which rotation of the keystream it carries.
-/// At `connections = 1` there is only one rotation, so nothing can disagree and nothing
-/// is checked. At sixteen there are sixteen, and this is where it broke: the sink
-/// numbered flows in **accept** order and the driver numbered them in **spawn** order,
-/// so a flow could be validated against a different flow's bytes. What that looks like,
-/// verbatim from `linux x86_64` at `connections=16`:
-///
-/// ```text
-/// harness fault: flow 8 saw bytes that are not the validated pattern: bytes at
-/// offset 0 are not the validated pattern
-/// ```
-///
-/// which is a fault in the **harness**, not in the engine: the engine faithfully
-/// relayed flow 8's bytes to a driver that was checking them against flow 9's
-/// keystream. No engine change could have fixed it, and reading it as an engine fault
-/// would have been the wrong conclusion from the right measurement.
-///
-/// Consecutive ports make the identity something both ends already know. The driver
-/// asks for `first + index`; the sink owns `first + index`. Nothing then depends on
-/// which connection arrives first, on thread scheduling, or on how many CPUs the
-/// runner has -- which is the property that was missing and the reason a concurrency
-/// number could not be trusted at all before this.
 fn per_flow_sink_ports(ip: Ipv4Addr, ports: &[u16]) -> Result<Vec<TcpListener>, Error> {
     let mut listeners = Vec::with_capacity(ports.len());
     for &port in ports {
@@ -2420,40 +1702,13 @@ fn per_flow_sink_ports(ip: Ipv4Addr, ports: &[u16]) -> Result<Vec<TcpListener>, 
     Ok(listeners)
 }
 
-/// Run the same validated loop with no engine in the path: rule 3's ceiling.
-///
-/// One socket hop, no engine: the rate at which this process and the kernel move
-/// the validated bytes over the shortest path the harness can give them.
-///
-/// Every engine row is a *two*-hop relay, so this is a reference point and not a
-/// bound. An engine at or above it is not exceeding anything -- it is doing two
-/// hops at one-hop speed, which is a good result -- and the report says so in
-/// those words. See [`crate::compare_process::Comparison::ceiling_fraction`].
-///
-/// Measuring it is cheap and omitting it is how a chart comes to imply more
-/// precision than the harness has.
-///
-/// Called once per repeat, interleaved with the engines rather than once before
-/// them. One sample taken at the start of a thirty-second sweep is a sample of
-/// the runner *at that moment*, and the runner moves: eight `linux x86_64` runs
-/// of one tree published ceilings from 2220 to 5724 MiB/s, which is a 2.7x spread
-/// in the machine alone, and the ceiling column that number is used for is then
-/// not a bound on anything measured after it. Interleaved, the ceiling is a
-/// covariate: the same repeat's engines and the same repeat's ceiling were
-/// measured seconds apart, and [`crate::compare_process::Comparison::runner_spread`]
-/// can read how far the machine moved between them rather than asserting that it did
-/// not.
 pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> Result<f64, Error> {
     let ip = local_non_loopback_ipv4()?;
-    // The same reservation `measure` makes, for the same reason: the range is
-    // bound before it is used, and it is drawn on the address it is bound to.
     let ports = allocate_port_range(connections)?;
     let port = ports[0];
     let listeners = per_flow_sink_ports(ip, &ports)?;
     let pattern = Arc::new(bulk_pattern_template(payload_size));
 
-    // The sink is a pure source here: with no engine in the path there is nothing
-    // to validate against a driver, so it emits and the driver checks.
     let sink = std::thread::spawn({
         let pattern = Arc::clone(&pattern);
         move || {
@@ -2492,16 +1747,6 @@ pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> R
     Ok(best)
 }
 
-/// One flow of the ceiling run: open a connection straight to the sink and read.
-///
-/// Returns MiB/s over the read window, or `0.0` for a flow that did not complete —
-/// a zero is skipped by the caller rather than averaged in, because a flow that
-/// never started is not a slow flow.
-///
-/// No `SOCKS` handshake here, and that is the point: the ceiling is the rate at
-/// which this process and the kernel can move bytes with nothing else in the path.
-/// Any handshake would put a parser back on the path and raise the ceiling above
-/// what the engines are being compared against.
 fn ceiling_flow(
     addr: SocketAddr,
     template: &Arc<Vec<u8>>,
@@ -2513,20 +1758,8 @@ fn ceiling_flow(
         return 0.0;
     };
     let _ = stream.set_nodelay(true);
-    // This flow's own rotation, as an engine run's flow gets: the ceiling then
-    // moves the same bytes the engines are asked to move, not a privileged set.
     let pattern = rotate(template, index, flows);
     let started = Instant::now();
-    // The same validated loop the engines are measured through, not a cheaper one.
-    //
-    // This counted bytes and checked none of them, and a ceiling that skips work
-    // the subject does is not a ceiling. That is how `xray-core` came to read
-    // 1.4x *above* the published ceiling of the same run: it was above it because
-    // the ceiling was measuring something easier, and "vs harness ceiling"
-    // printed 141% as though it meant the ceiling had been exceeded. A run that
-    // cannot validate its own bytes moved nothing that counts, so a failure here
-    // reads `0.0` and the caller reports it unmeasured rather than publishing a
-    // rate it cannot stand behind.
     let read_total = read_validated(&mut stream, &pattern, bytes).unwrap_or(0);
     let elapsed = started.elapsed();
     let _ = stream.shutdown(Shutdown::Both);
@@ -2556,7 +1789,6 @@ mod tests {
         );
     }
 
-    /// A complete, valid request with `overrides` applied afterwards.
     fn request_with(overrides: &[(&str, &str)]) -> String {
         let mut fields = base_fields();
         for (key, value) in overrides {
@@ -2566,15 +1798,12 @@ mod tests {
         render(fields)
     }
 
-    /// The same document with a `client_env` member.
     fn request_with_env(env: &str) -> String {
         let mut fields = base_fields();
         fields.push(("client_env".into(), env.to_owned()));
         render(fields)
     }
 
-    /// A complete, valid request's fields. `path` is present because the
-    /// validator requires it, even though only `"socks"` is implemented.
     fn base_fields() -> Vec<(String, String)> {
         vec![
             ("binary".into(), quote(&engine_path())),
@@ -2591,8 +1820,6 @@ mod tests {
         ]
     }
 
-    /// Fields to a document, sorted so the text is stable and an override lands in
-    /// one place rather than two.
     fn render(mut fields: Vec<(String, String)>) -> String {
         fields.sort();
         let body: Vec<String> = fields.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
@@ -2605,13 +1832,10 @@ mod tests {
             .expect("a string always has a json spelling")
     }
 
-    /// Any readable file stands in for an engine: these tests exercise the
-    /// request schema, not the spawn.
     fn engine_path() -> String {
         std::env::current_exe().map_or_else(|_| "/dev/null".to_owned(), |p| p.display().to_string())
     }
 
-    /// A path under the target directory, which does not exist.
     fn out_dir() -> String {
         format!(
             "{}/ferrox-bench-request-test-{}-{}",
@@ -2632,8 +1856,6 @@ mod tests {
         assert!(r.client_env.is_empty());
     }
 
-    /// An unknown field is an error, not a shrug: a request one implementation
-    /// reads and the other ignores is two different measurements of one name.
     #[test]
     fn rejects_an_unknown_field() {
         let doc = request_with(&[("iterations", "10"), ("somethingNew", "true")]);
@@ -2658,24 +1880,12 @@ mod tests {
         }
     }
 
-    /// The ceiling is a byte count, not an iteration count: `payload_size` and
-    /// `iterations` are separately bounded, so their product has to be bounded
-    /// too. Without this a request can ask for a run that cannot finish inside
-    /// `RUN_TIMEOUT`, and a truncated transfer is a fault rather than a rate.
-    /// The allocation-free comparison must accept exactly the rotations of the
-    /// pattern and reject everything else, at every phase and every wrap point.
-    /// It replaced a `Vec`-building compare that agreed with it, so the
-    /// interesting cases are the ones where a ring wraps mid-chunk.
     #[test]
     fn the_pattern_check_sees_every_phase_and_both_wrap_points() {
         let template = bulk_pattern_template(4096);
         let doubled: Vec<u8> = template.iter().chain(template.iter()).copied().collect();
         let period = template.len();
-        // Phase zero, whole period.
         assert!(matches_pattern(&template, 0, &template[..]));
-        // Every phase, at every chunk length that divides the period evenly and
-        // at one that does not: the chunks a flow actually reads are a fixed size
-        // that walks the ring by its own length, so the phase is arbitrary.
         for phase in (0..period).step_by(29) {
             for len in [1, 2, 63, 64 * 1024, period / 2, period - 1, period] {
                 if phase + len > doubled.len() {
@@ -2688,8 +1898,6 @@ mod tests {
                 );
             }
         }
-        // A chunk that straddles the end of the ring: taken from `doubled`, so it
-        // is genuinely two pieces of the period.
         for over in [1, 2, 17, period / 2, period - 1] {
             let start = period - over;
             let len = (over * 2).min(doubled.len() - start);
@@ -2698,21 +1906,14 @@ mod tests {
                 "chunk of {over} past the end of the ring"
             );
         }
-        // One flipped bit anywhere is a failure, at the first and the last byte.
         for at in [0, period / 2, period - 1] {
             let mut bad = template.clone();
             bad[at] ^= 1;
             assert!(!matches_pattern(&template, 0, &bad), "flipped byte {at}");
         }
-        // An empty chunk and an empty pattern are both vacuously true, and a
-        // non-empty chunk against an empty pattern is not.
         assert!(matches_pattern(&template, 7, &[]));
         assert!(matches_pattern(&[], 0, &[]));
         assert!(!matches_pattern(&[], 0, &template[..1]));
-        // Longer than one period: the ring is conceptually infinite, so a genuine
-        // multi-period rotation still matches and a corrupted one still does not.
-        // `read_validated` never asks for more than one period, so this is the
-        // boundary rather than a case the gate can reach.
         assert!(matches_pattern(&template, 0, &doubled[..]));
         let mut stretched = doubled.clone();
         stretched[period + 7] ^= 1;
@@ -2735,31 +1936,6 @@ mod tests {
         );
     }
 
-    /// A download that stops short is reported as a reason, not as a process exit.
-    ///
-    /// This is the `macos-15` failure verbatim, from the standard tier at
-    /// `connections = 8`:
-    ///
-    /// ```text
-    /// harness fault: flow 2 saw bytes that are not the validated pattern: download
-    /// read failed after 536805376 of 1073741824 bytes: failed to fill whole buffer
-    /// ```
-    ///
-    /// and it is worth reading twice. Every byte that arrived *was* correct -- the
-    /// check passed for all 8191 chunks read -- so this is not a disagreement
-    /// between the driver and the sink and the "not the validated pattern"
-    /// heading was simply wrong. It is a short transfer.
-    ///
-    /// Which is the whole problem: `measure` reads `sink_thread.reasons()` only
-    /// *after* the flows are collected, so a flow that calls `process::exit` never
-    /// reaches the code that prints the sink's own account of the same flow. The
-    /// sink records a reason when a write fails or a stream ends -- the half of the
-    /// evidence that can name a cause -- and it was being discarded. What reached
-    /// the log was a byte count that says the transfer stopped, not who stopped it.
-    ///
-    /// Asserted as a pair of halves on one socket, because that is what the bug
-    /// was: a real short read, and a message that does not blame the sink for
-    /// something it can only be told about after the fact.
     #[test]
     fn a_download_that_stops_short_is_a_reason_and_not_a_process_exit() {
         let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
@@ -2768,8 +1944,6 @@ mod tests {
         let addr = listener.local_addr().expect("has an address");
         let pattern = b"0123456789abcdef".to_vec();
 
-        // A sink that sends three periods and then closes: every byte correct,
-        // the stream simply ends before `bytes`.
         let sink = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("one flow");
             let _ = stream.write_all(&b"0123456789abcdef0123456789abcdef0123456789abcdef"[..48]);
@@ -2790,11 +1964,6 @@ mod tests {
         drop(client);
         let _ = sink.join();
 
-        // The other half: bytes that are *wrong* still stop the process, because
-        // nothing measured beside a stream the two ends disagree about is
-        // trustworthy. That branch is `process::exit`, so it is asserted by
-        // message rather than by running it -- `stream_down` is the only caller
-        // that exits, and the split between the two is its contract.
         assert!(
             matches_pattern(&pattern, 0, &pattern),
             "the pattern matches itself at offset 0, or this test proves nothing"
@@ -2805,12 +1974,6 @@ mod tests {
         );
     }
 
-    /// The gate-5 default has to stay inside the pinned schema's own bound, or
-    /// the claim that one request file measures either binary stops holding.
-    ///
-    /// A compile-time fact, so it is checked as one: the pinned bounds are read at
-    /// `protocol_bench.rs:65`-`:69` and a default that drifted past them would
-    /// only be caught by a pinned harness refusing a request this one wrote.
     #[test]
     fn the_default_request_is_one_the_pinned_harness_also_accepts() {
         const {
@@ -2862,16 +2025,10 @@ mod tests {
             Request::parse(request_with_env(r#"{"A":"1"}"#).as_bytes()).expect("valid with env");
         assert_eq!(r.client_env.get("A").map(String::as_str), Some("1"));
 
-        // A non-string value is refused rather than stringified: `A: 1` and
-        // `A: "1"` would set different environment values, and only one of them
-        // is what the document says.
         assert!(Request::parse(request_with_env(r#"{"A":1}"#).as_bytes()).is_err());
         assert!(Request::parse(request_with_env("[1,2]").as_bytes()).is_err());
     }
 
-    /// The pinned harness's payload rule, and this project's own: deterministic,
-    /// and not a constant. A constant payload cannot detect a core that moves the
-    /// right byte count in the wrong order.
     #[test]
     fn the_template_is_deterministic_and_non_constant() {
         let a = bulk_pattern_template(4096);
@@ -2882,8 +2039,6 @@ mod tests {
 
     #[test]
     fn the_template_matches_the_seed_the_pinned_harness_uses() {
-        // Recomputed from the constant, so a change to `BULK_PATTERN_SEED` cannot
-        // silently stop this harness and the pinned one validating the same bytes.
         let mut state = BULK_PATTERN_SEED;
         let mut first = [0u8; 4];
         for slot in &mut first {
@@ -2895,48 +2050,20 @@ mod tests {
         assert_eq!(&bulk_pattern_template(4)[..], &first);
     }
 
-    /// Concurrent flows must not share bytes, or a core that interleaves two
-    /// sessions onto one carrier would validate.
-    /// A flow's identity has to be something both ends already know.
-    ///
-    /// The bug this is for: the sink numbered flows in **accept** order and the driver
-    /// numbered them in **spawn** order, so at sixteen connections a flow could be
-    /// validated against another flow's bytes -- `harness fault: flow 8 saw bytes that
-    /// are not the validated pattern` -- with the engine innocent. Nothing at
-    /// `connections = 1` can see it, which is why it survived.
-    ///
-    /// The property asserted is the one the fix rests on: flow `index` dials
-    /// `first + index`, and the sink's listener `index` is that same port. If either
-    /// side ever went back to counting arrivals, this fails.
     #[test]
     fn a_flows_identity_is_its_port_and_not_its_place_in_the_accept_queue() {
         assert_eq!(sink_port_of(40_000, 0), 40_000);
         assert_eq!(sink_port_of(40_000, 15), 40_015);
-        // Distinct for every flow the schema allows, which is the property the old
-        // accept-order numbering did not have.
         let ports: std::collections::BTreeSet<u16> =
             (0..16).map(|i| sink_port_of(40_000, i)).collect();
         assert_eq!(ports.len(), 16, "two flows must never share a sink port");
-        // And it saturates rather than wrapping, because wrapping lands a flow on an
-        // unrelated listener -- which is the same class of fault one level up.
         assert_eq!(sink_port_of(u16::MAX, 1), u16::MAX);
         assert_eq!(sink_port_of(u16::MAX, u16::MAX as usize + 5), u16::MAX);
     }
 
-    /// One listener per flow, on ports reserved as a whole range, and disjoint
-    /// from the engine's.
-    ///
-    /// The disjointness is the assertion that matters, and it is the one whose
-    /// absence cost every multi-flow cell: the sink takes `connections` ports and
-    /// the engine takes one more, all on the same address, and probing each in
-    /// turn lets the engine be handed a number the sink's range is about to
-    /// include. At two flows that is a coin flip, and the loser is always reported
-    /// as an engine fault.
     #[test]
     fn the_sink_binds_one_listener_per_flow_clear_of_the_engine() {
         let Ok(ip) = local_non_loopback_ipv4() else {
-            // A loopback-only host cannot run the benchmark at all; the port
-            // arithmetic is still worth checking where there is an address.
             return;
         };
         let ports = allocate_port_range(4).expect("four free ports");
@@ -2959,8 +2086,6 @@ mod tests {
             "and they are the ports that were reserved"
         );
 
-        // The range is held for the whole allocation, so a second draw cannot
-        // land inside the first -- the property `allocate_port_range` exists for.
         let again = allocate_port_range(4).expect("four more");
         assert!(
             again.iter().all(|p| !ports.contains(p)),
@@ -2976,7 +2101,6 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), template.len());
         assert_eq!(b.len(), template.len());
-        // One flow is not rotated: there is nothing to be confused with.
         assert_eq!(rotate(&template, 0, 1), template);
     }
 
@@ -3017,15 +2141,6 @@ mod tests {
         );
     }
 
-    /// The defect this dialect exists for: one document, two config languages.
-    ///
-    /// `sing-box` was handed `{"protocol":"freedom"}` and `{"protocol":"socks",
-    /// "port":N}` on every repeat of every run, and answered `outbounds[0]:
-    /// unknown outbound type: ` — an empty type name, because `protocol` is not
-    /// the key it reads. It also rejects `port` outright since 1.13.0, so a
-    /// document with the right keys and the old port field would fail next. Both
-    /// differences are pinned here against the field names read at the pin
-    /// (`option/inbound.go:79`-`:81` and `constant/proxy.go:7`).
     #[test]
     fn each_dialect_writes_the_fields_that_engine_actually_reads() {
         for dialect in [Dialect::Xray, Dialect::SingBox] {
@@ -3067,8 +2182,6 @@ mod tests {
                 "{dialect:?} listens on `{port_key}`"
             );
 
-            // The two spellings must not leak into each other: a `port` in
-            // sing-box's document is a startup failure there, not an ignored key.
             let foreign = match dialect {
                 Dialect::Xray => ("type", "socks"),
                 Dialect::SingBox => ("protocol", "socks"),
@@ -3147,8 +2260,6 @@ mod tests {
         }
     }
 
-    /// Longer than one block, so the buffered path and the padding path are both
-    /// exercised rather than the single-shot one.
     #[test]
     fn sha256_handles_multi_block_input() {
         let mut h = Sha256::new();
@@ -3157,7 +2268,6 @@ mod tests {
             h.hex(),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
-        // Chunked updates must equal one big update.
         let mut h = Sha256::new();
         for chunk in b"abcdefghij".chunks(3) {
             h.update(chunk);
@@ -3167,8 +2277,6 @@ mod tests {
         assert_eq!(h.hex(), once.hex());
     }
 
-    /// The three engines genuinely disagree about how a config file is named, and
-    /// a harness that guessed one shape would leave the other two unable to start.
     #[test]
     fn each_config_argument_shape_names_the_file_the_way_its_engine_expects() {
         let path = Path::new("/tmp/cfg.json");
@@ -3218,8 +2326,6 @@ mod tests {
 
     #[test]
     fn a_short_transfer_is_a_fault_and_not_a_number() {
-        // `measure` refuses to report fewer bytes than the request asked for, so
-        // the request's own arithmetic is what the check compares against.
         let r =
             Request::parse(request_with(&[("iterations", "3"), ("payload_size", "7")]).as_bytes())
                 .expect("valid");

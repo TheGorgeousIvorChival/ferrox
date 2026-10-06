@@ -1,24 +1,4 @@
 #!/usr/bin/env bash
-# Fetch every pinned upstream source into `upstream/<name>/` at its exact rev.
-#
-# Pinned, not tracked, is deliberate: a comparison against "latest" is not a
-# comparison. So this script resolves `repo` plus `rev` from `upstream/pins.toml`
-# and nothing else, checks out exactly that commit, verifies the checkout is at
-# that commit, and writes `upstream/manifest.toml` saying what it got — so a
-# reviewer re-derives the tree without trusting this machine.
-#
-# Rerunnable: an existing checkout that is already at its pin is left alone; one
-# that drifted is rebuilt from scratch, because a checkout that disagrees with
-# its pin is worse than no checkout.
-#
-# `--only a,b` fetches a subset. Twelve depth-1 clones is minutes of wall time,
-# and a workflow that builds two comparators does not need the other ten: the
-# unlisted pins are still *checked* by `check-upstream-pins.sh`, so nothing here
-# is skipped silently — it is not fetched, and it is not used.
-#
-# Never copies anything into this repository. The checkouts are reading copies
-# for agents (see `upstream/pins.toml`); suites run from them unmodified, and
-# `upstream/*` stays out of version control — see `.gitignore`.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -43,9 +23,6 @@ if [[ ! -f "$pins_file" ]]; then
   exit 1
 fi
 
-# Same TOML subset `check-upstream-pins.sh` reads, plus `fallback_repo`: a
-# second URL tried when the first answers nothing (ZeroNet's fork, then the
-# official repo). A pin that resolves nowhere fails loudly below.
 parsed="$(awk '
   /^\[sources\./ {
     name = $0
@@ -77,9 +54,6 @@ fi
 
 fetched=0
 manifest="upstream/manifest.toml"
-# Built aside and moved into place, so a run that dies partway leaves the
-# previous manifest rather than a shorter one: a manifest that lists two of
-# seven pins and stops reads as a complete account of what is on disk.
 manifest_tmp="$manifest.part"
 trap 'rm -f "$manifest_tmp"' EXIT
 {
@@ -87,15 +61,6 @@ trap 'rm -f "$manifest_tmp"' EXIT
   echo "# Each entry is the exact commit the named checkout holds."
 } >"$manifest_tmp"
 
-# Per-source, in a subshell, so two checkouts never share a `git init` and a
-# `manifest_tmp` append. Twelve shallow fetches are independent network round
-# trips; in sequence they cost the sum, which on `xray-core` and `sing-box` is
-# most of a workflow's setup time for sources the caller may not even use.
-#
-# Each source writes its own manifest stanza and its own log, and the verdict is
-# a file rather than the last line of the log — same reason as
-# `check-upstream-pins.sh`: `git` writes its own diagnostics to stderr and
-# "read the last line" reads whichever of those landed last.
 fetch_one() {
   local name="$1" repo="$2" rev="$3" fallback="$4"
   local log="$tmp/$name.log" verdict="$tmp/$name.verdict"
@@ -140,8 +105,6 @@ fetch_one() {
       return 1
     fi
 
-    # The stanza is assembled in its own file and moved in, so a reader of
-    # `manifest.toml` never sees half an entry.
     {
       echo ""
       echo "[checkout.$name]"
@@ -156,11 +119,6 @@ fetch_one() {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"; rm -f "$manifest_tmp"' EXIT
 
-# Peak concurrency is the core count, for the reason
-# `check-upstream-pins.sh` gives: these are network-bound, so the right number is
-# however much the machine can absorb at once. `wait -n` reclaims a slot as soon
-# as one clone lands; macOS bash is 3.2 and does not have it, so the name is
-# probed and the fallback is a batch `wait` at the same peak.
 cores="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 [[ "$cores" =~ ^[0-9]+$ && "$cores" -ge 1 ]] || cores=4
 reclaim="wait"
@@ -186,7 +144,6 @@ while IFS=$'\t' read -r name repo rev fallback; do
 done <<<"$parsed"
 wait
 
-# Collected in pins.toml order, so a red run reads the same way twice.
 for name in $selected; do
   [[ -f "$tmp/$name.log" ]] && cat "$tmp/$name.log"
   if [[ ! -f "$tmp/$name.verdict" || "$(cat "$tmp/$name.verdict")" != "GOOD" ]]; then

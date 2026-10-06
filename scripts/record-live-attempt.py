@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Append one live-speedtest attempt record as a JSON line.
 
 Arguments, in order: config label core repeat status stage

@@ -1,53 +1,15 @@
-//! Per-method proof matrix: one row per transport rung, each naming its proof.
-//!
-//! Ferrox implements one connection method at a time
-//! (`docs/arch/superset.md`). A row moves from "parses" to "dials" only with
-//! its differential proof and its benchmark gate green — the same rule the
-//! comparators enforce by reading each core's own validator rather than its
-//! documentation: support here is read from `VlessLink::support`, not asserted
-//! by hand, wherever the `vless://` format can express the row. Rows that format
-//! cannot express (`TROJAN`, `VMess`, Shadowsocks, `WireGuard`, …) are static
-//! text mirroring the transport matrix, and the test below pins the row count so
-//! a dropped row fails loudly instead of silently narrowing the claim.
-//!
-//! That split is where this table used to lie. It carried rows 5, 6 and 8 as
-//! `planned` months after `proxy.rs` grew the `match` arms for all three, and
-//! `VlessLink::support` — the function this file reads — said `ws` was
-//! `scheduled after tcp-tls` while `transport.rs` said it was implemented. Three
-//! tables, three answers, and the code was the only one right.
-//!
-//! So the carrier half of this table is now read from
-//! [`ferrox_core::transport::TransportKind::is_dialled`], which is the same
-//! `const` list `VlessLink::support` reads, and `ferrox-core`'s
-//! `failure::tests` walks the whole transport space asserting the two agree. A
-//! carrier with a dial arm and a `Planned` cell now fails a unit test rather
-//! than reaching a report.
-//!
-//! When a rung lands, its row gains three things: the differential test name,
-//! the gate that runs it, and the upstream suite flip in `upstream/pins.toml`
-//! (`test_enabled = true`). Until then every suite in Xray-core, ZeroNet/Zray,
-//! xray-rust and sing-box covering the row stays wired to `Planned` or
-//! `UnsafeRequiresOptIn` with its reason — executed in CI from the pin by
-//! `scripts/run-upstream-suite.sh`, never copied into this tree (licence-clean).
-
 use std::fmt::Write as _;
 
-/// A synthetic `vless://` link exercising one rung, TEST-NET hosts and
-/// credentials only (see `scripts/check-fixture-safety.sh`).
 fn rung_link(query: &str, host: &str) -> String {
     format!("vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@{host}:443?{query}#x")
 }
 
-/// The live `transport::Support` of a synthetic rung link,
-/// read from the parser rather than written by hand.
 fn live_support(query: &str, host: &str) -> String {
     let link = ferrox_core::vless::VlessLink::parse(&rung_link(query, host))
         .expect("synthetic rung link parses");
     link.support().to_string()
 }
 
-/// The per-method matrix, appended to every benchmark report so an unimplemented
-/// cell is always empty *with its reason*, never omitted.
 pub fn table() -> String {
     let mut s = String::new();
     let _ = writeln!(s, "\n## Per-method proof (one row per rung)\n");
@@ -169,7 +131,6 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("| "))
             .count();
-        // Header + 12 rungs = 13 pipe rows.
         assert_eq!(
             rows, 13,
             "a rung was added or dropped without updating this table"

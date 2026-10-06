@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Render the benchmark matrix charts from measured cells.
 
 Reads per-scenario `cell.json` documents (written by `ferrox-bench
@@ -319,8 +318,6 @@ def setup_chart(cells, runs_dir, path, foot):
     present = engines_present(cells)
     fig, ax = plt.subplots(figsize=(max(8.0, 1.6 * len(names)), 4.6))
     bar_width = 0.8 / max(1, len(stages))
-    # One group per setup stage; bars are engines. Full per-scenario detail is
-    # in matrix-results.json; the chart would be unreadable with all of it.
     labels = []
     for stage_index, (key, label) in enumerate(stages):
         column = []
@@ -717,9 +714,6 @@ def update_readme(readme_path, results, charts_dir, runner):
     section = "\n".join(lines)
     before, _, rest = text.partition(start)
     area, _, after = rest.partition(end)
-    # Per-runner blocks accumulate: a refresh for one runner replaces only
-    # its own block, so three runners' sections combine instead of the last
-    # run overwriting the other two.
     area = replace_runner_block(area, runner, section)
     Path(readme_path).write_text(before + start + "\n" + area + end + after)
     print(f"README section rewritten in {readme_path}")

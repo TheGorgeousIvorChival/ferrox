@@ -1,34 +1,4 @@
 #!/usr/bin/env bash
-# The benchmark matrix: every scenario in docs/benchmarks/matrix.md that the
-# harness can run, against five pinned engines, with repeats.
-#
-# One invocation measures one tier and writes one directory: per-cell
-# `<scenario>.json` comparison documents (from `ferrox-bench
-# --json-report`), per-repeat `result.json` files beside them, plus
-# `manifest.txt` (versions, digests, host, replay command) and `commands.sh`.
-# `scripts/render-benchmark-charts.py` plots the directory;
-# `scripts/validate-benchmark-matrix.py` re-derives it. Neither lives here, so
-# a plotting bug cannot move a number and a measurement bug cannot move a plot.
-#
-# Topology per cell is a self-relay: each engine serves a protocol inbound and
-# dials it through its own outbound to the harness echo sink, with the harness
-# SOCKS inbound injected on top. Routing sends `harness-socks` to the protocol
-# outbound and everything else to `freedom`; without both rules an engine whose
-# default route is its first outbound would dial itself forever.
-#
-# Usage: run-benchmark-matrix.sh [--tier smoke|standard|full] [--out DIR]
-#          [--engines a,b,...] [--repeats N] [--bench-bin PATH]
-#          [--only SUB] [--exclude SUB] [--probe-only]
-#   --engines names sources from upstream/pins.toml: ferrox is this
-#     workspace's binary; the rest are built from their pins when missing.
-#     A source may be replaced with a path (xray-core=/bin/xray), same as
-#     run-parity.sh. Default: tier smoke runs ferrox,xray-core, the rest run
-#     all five.
-#   --only/--exclude filter scenario ids by substring, repeatable: `--only
-#     vless-raw-tls` narrows a run to one connection type, the fast way to see
-#     whether a change moved it (mirrors the pinned harnesses' `--only`).
-#   --probe-only writes every engine config and lists the cells without moving
-#     traffic: the fast answer to "would this scenario even start here".
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -68,7 +38,6 @@ main() {
 mkdir -p "$out" "$engine_dir" "$out/cells"
 [[ -f "$pins_file" ]] || fail "$pins_file is missing; refusing to guess a comparator"
 
-# --- engines ---------------------------------------------------------------
 
 if [[ -z "$engines_list" ]]; then
   if [[ "$tier" == "smoke" ]]; then
@@ -83,19 +52,11 @@ fi
 
 note "building the harness driver"
 cargo build --locked --release -p ferrox-bench -p ferrox-app 2>&1 | tail -2 >&2
-# Both resolved with `built`, not probed bare. MSYS answers a stat of `foo` with the
-# contents of `foo.exe`, so `[[ -x foo ]]` passes on Windows for a name that does not
-# exist under that name -- and the engine path is then handed to `ferrox-bench`, a
-# native Win32 process, whose `Path::is_file` does no such lookup. Every cell on
-# `windows-latest` died at gate 5 with `binary target/release/ferrox-app is not
-# a file` about a file that was there the whole time. `run-parity.sh` resolves both the
-# same way, which is why parity runs there and this did not. `lib-engines.sh:built`.
 bench_bin="$(built "$bench_bin")" || fail \
   "no executable at $bench_bin(.exe) after the build above"
 ferrox_bin="$(built target/release/ferrox-app)" || fail \
   "no executable at target/release/ferrox-app(.exe) after the build above"
 
-# name=path lines; reference order is imposed below, not here.
 engine_list="${engines_list//,/ }"
 built=()
 skipped=()
@@ -104,8 +65,6 @@ for entry in $engine_list; do
   source="${entry#*=}"
   [[ "$label" != "$entry" ]] || label="$source"
   if [[ "$label" == "ferrox" ]]; then
-    # Resolved once, above, and reused here: this is the path handed to
-    # `ferrox-bench` and the one whose spelling has to survive MSYS.
     path="$ferrox_bin"
   elif [[ "$source" == /* ]]; then
     path="$source"
@@ -121,15 +80,7 @@ for entry in $engine_list; do
   }
   built+=("$label=$path")
 done
-# The reference is always first: every ratio in every cell reads against it,
-# and the harness names the first engine the reference. Ordering the display
-# list alone once shipped ferrox first and gated nothing; the argument list
-# below is built from this order, not the other way round.
 ordered=()
-# `${arr[@]+"${arr[@]}"}` rather than `"${arr[@]}"`: the unguarded form on an
-# empty array is an unbound variable under `set -u` on bash 3.2, which is what
-# macos runners ship — and an empty engine list there must read as "no
-# reference", not as a shell error.
 for want in xray-core ferrox zeronet sing-box xray-rust; do
   for have in ${built[@]+"${built[@]}"}; do
     [[ "${have%%=*}" == "$want" ]] && ordered+=("$have")
@@ -147,8 +98,6 @@ for have in "${engines[@]}"; do
   engine_args+=(--engine "$have")
   shape="$(config_arg_for "$label")"
   [[ "$shape" == "long" ]] || engine_args+=(--config-arg "$label=$shape")
-  # The binary defaults every engine to the Xray spelling; sing-box must be
-  # named or it gets Xray-dialect documents it cannot parse.
   if [[ "$label" == "sing-box" ]]; then
     engine_args+=(--dialect "$label=sing-box")
   fi
@@ -158,7 +107,6 @@ ferrox_present=0
 for have in "${engines[@]}"; do [[ "${have%%=*}" == "ferrox" ]] && ferrox_present=1; done
 [[ "$ferrox_present" == "1" ]] || fail "no ferrox engine: the matrix gates nothing without it"
 
-# --- run -------------------------------------------------------------------
 
 manifest() {
   {
@@ -185,10 +133,6 @@ manifest() {
   } >"$out/manifest.txt"
 }
 
-# Stable per-runner directory name, so three runners' bundles combine without
-# colliding and the README can show one section per runner. Derived from the
-# kernel, never from a workflow input: a label passed by the caller is a second
-# thing to keep in step with the machine that actually measured.
 runner_slug() {
   local sys machine
   sys="$(uname -s)"
@@ -205,7 +149,6 @@ runner_slug() {
   echo "$sys-$machine"
 }
 
-# One line of /proc or sysctl, or the honest admission that it is unavailable.
 cpu_model() {
   if [[ -f /proc/cpuinfo ]]; then
     grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs || echo "unknown"
@@ -249,8 +192,6 @@ manifest
   ((probe_only)) && echo "# probe-only: configs written, no traffic moved"
 } >"$out/commands.sh"
 
-# A scenario the filters keep, with the reason when they do not: a run that
-# silently measured a subset would read as the whole matrix.
 scenario_kept() {
   local id="$1" pattern
   for pattern in ${only[@]+"${only[@]}"}; do
@@ -269,8 +210,6 @@ while read -r id traffic connections iterations payload; do
     continue
   fi
   note "cell $id ($traffic $connections flows)"
-  # A fresh port per cell: see `matrix_srvport` in `lib-matrix.sh` for why a fixed
-  # one cost this run real measurements rather than a style point.
   srvport="$(matrix_srvport)" || {
     cells_failed+=("$id (could not allocate a server port)")
     status=1
@@ -322,8 +261,6 @@ done < <(scenarios "$tier")
 return "$status"
 }
 
-# Sourced for its scenario and config functions without running anything;
-# executed directly, it measures.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
   exit "$?"

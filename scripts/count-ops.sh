@@ -1,23 +1,4 @@
 #!/usr/bin/env bash
-# Exact operation counts for named functions: callgrind instructions plus a
-# syscall summary. Linux-only (valgrind, strace); fails fast when valgrind is
-# absent rather than printing numbers from a different instrument.
-#
-# Instruction counts are deterministic: the same binary and input retire the
-# same count on every machine, unlike wall time. That is what makes an exact
-# count gateable where a duration is only comparable. Syscall counts ride
-# along as information, never as a gate: allocator and loader paths may vary
-# them while the function under test stays identical.
-#
-# Usage:
-#   ./scripts/count-ops.sh report <test-filter> <symbol>...
-#       print Ir per symbol plus the syscall table, exit 0.
-#   ./scripts/count-ops.sh check <test-filter> <expect-file>
-#       fail listing every symbol whose Ir differs; the expect file holds
-#       `symbol ir` lines, one per function, `#` comments allowed. Symbols
-#       must be unique substrings: `base64_encode` would also match
-#       `base64_encode_block`, so gate the longer name or neither.
-# The test filter names one exact unit test, e.g. quic::tests::pem_wraps.
 set -euo pipefail
 
 mode="${1:?usage: count-ops.sh report|check ...}"
@@ -35,10 +16,6 @@ for line in sys.stdin:
         print(m["executable"]); break')"
 [ -n "$bin" ] || { echo "count-ops: no test binary built" >&2; exit 2; }
 
-# Sum retired instructions for every cost line under a matching `fn=` record.
-# The raw callgrind format is stable: `positions: line` plus `events: Ir`
-# makes each cost line `<line> <ir> [...]`, and only `fn=` lines name
-# functions, so a substring match on the short name needs no demangler.
 ir_of() {
     local filter="$1" symbol="$2" data="$outdir/callgrind.out"
     rm -f "$data" "$data".*

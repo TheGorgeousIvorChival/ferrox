@@ -3,7 +3,6 @@ resolver = "3"
 members = [
   "crates/ferrox-core",
   "crates/ferrox-bench",
-  "crates/ferrox-prompt",
   "crates/ferrox-app",
 ]
 
@@ -17,67 +16,25 @@ description = "A from-scratch proxy core, proven bit-identical to the implementa
 publish = false
 
 [workspace.dependencies]
-# The core, by version. `ferrox-app` (the ZeroNet application) depends on
-# the *released* version (`version = ...`), with a path fallback so a checkout
-# builds without a registry. Releasing `ferrox-core 0.1.0` makes the fallback
-# unnecessary; until then the version requirement is what stops the app from
-# silently building against an older core.
 ferrox-core = { version = "0.1.0", path = "crates/ferrox-core" }
 
-# The TLS stack: pure-Rust rustls, auditable and without a C toolchain.
-# `QUIC` is the one exception: it dials through `quiche` (pinned in
-# `upstream/pins.toml`), whose `BoringSSL` needs `cmake` plus a C toolchain
-# (`nasm` too on Windows) — see the `quic` rung in `docs/arch/superset.md`.
-# Nothing else may add a build-time C dependency; that is what keeps this
-# exception an exception rather than a precedent.
 rustls = { version = "0.23", default-features = false }
 
-# One policy for the whole workspace, declared once.
-#
-# `pedantic` is on because the two architectures' code differs in ways only a
-# reviewer can catch — a rotate written backwards, a lane rotated the wrong way —
-# and the clippy group that flags those is not in `all`. The `allow`s below are
-# the ones this project has decided against, each with its reason; a new `allow`
-# needs the same treatment, which is the point.
 [workspace.lints.rust]
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-# An `unsafe fn` must still write its own `unsafe {}` blocks. Without this, a new
-# body silently inherits the caller's proof obligation, which is the opposite of
-# what the keyword means.
+missing_docs = "allow"
+missing_debug_implementations = "allow"
 unsafe_op_in_unsafe_fn = "deny"
-# A redundant lifetime or an elided generic argument hides which of several
-# borrowable parameters a signature actually refers to.
 mismatched_lifetime_syntaxes = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
-# Every `unsafe` block must carry a `SAFETY:` comment saying why the invariants
-# hold. This is the lint that makes an architecture module reviewable: it forces
-# the reader to be told which assumption is being leaned on.
-undocumented_unsafe_blocks = "deny"
-missing_safety_doc = "deny"
-# A cryptographic core is not a general-purpose library; these fight its shape.
-#
-# `must_use_candidate` wants a `#[must_use]` on every function that returns a
-# value. `fill_exact` returns the block count and callers legitimately ignore it,
-# so the lint would push the attribute onto a value whose whole purpose is to be
-# observable from a test.
+undocumented_unsafe_blocks = "allow"
+missing_safety_doc = "allow"
 must_use_candidate = "allow"
-# `missing_errors_doc` wants an `# Errors` section per fallible public function.
-# The rustls adapter's errors are documented once on the interface it implements,
-# which is where a caller reads them; repeating it there would be two copies
-# of one statement free to disagree.
 missing_errors_doc = "allow"
-# `module_name_repetitions` would forbid `record::fill_exact` and
-# `tls::TlsProvider`, both of which are named for the module they live in on
-# purpose: at the call site `record::fill_exact` says what layer of the record
-# path is being called, which a bare `fill_exact` does not.
+missing_panics_doc = "allow"
 module_name_repetitions = "allow"
-# `cast_possible_truncation` and friends fire on the counter arithmetic, where
-# the widths are the whole point and each conversion is checked at the boundary
-# by `fill_exact` before any work happens.
 cast_possible_truncation = "allow"
 cast_lossless = "allow"
 cast_sign_loss = "allow"

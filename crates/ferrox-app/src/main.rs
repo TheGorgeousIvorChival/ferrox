@@ -1,25 +1,3 @@
-//! `ferrox-app` — the `ZeroNet` application built on the released core.
-//!
-//! `ZeroNet` (MIT) pastes a `vless://` link and connects. This binary does the
-//! same, through `ferrox-core` at its *released* version (`version = "0.1.0"`
-//! in `Cargo.toml`, with a path fallback for a checkout). No `Xray-core`,
-//! `sing-box`, `xray-rust`, `PattNG` or `ZeroNet` source is copied here: links are
-//! parsed by `ferrox_core::vless`, whose parser was written from the
-//! user-facing string format.
-//!
-//! What `run` does today (rung 1 of the transport matrix):
-//!
-//! 1. parses the link and reports its [`Support`] — planned transports print
-//!    their reason instead of failing silently;
-//! 2. checks TCP reachability to `host:port` with a timeout (no credentials
-//!    are sent);
-//! 3. encodes the `VLESS` request header locally with the zero-alloc
-//!    `encode_into` and reports its length.
-//!
-//! The `REALITY` handshake itself is the next rung, not this one: claiming a
-//! connection without it would be a lie the differential test cannot catch.
-//! See `docs/arch/superset.md` for the order.
-
 mod grpc;
 mod httpheader;
 mod httpupgrade;
@@ -46,7 +24,6 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-/// Redacted summary: everything needed to route, nothing that authenticates.
 fn describe(link: &ferrox_core::vless::VlessLink) -> String {
     format!(
         "host={} port={} type={} security={} flow={} support=[{}]",
@@ -100,7 +77,6 @@ fn cmd_run(link_str: &str) {
     let sock: std::net::SocketAddr = if let Ok(sock) = addr.parse() {
         sock
     } else {
-        // DNS name: resolve first, then connect to the first address.
         use std::net::ToSocketAddrs as _;
         addr.to_socket_addrs()
             .ok()
@@ -170,8 +146,6 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    /// Server passwords sit beside `method`, not under `clients` like the other
-    /// protocols: reading the wrong nesting derives a wrong subkey silently.
     #[test]
     fn shadowsocks_server_password_shape() {
         let root = crate::json::parse(

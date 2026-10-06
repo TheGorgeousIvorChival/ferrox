@@ -1,25 +1,16 @@
-//! `TCP` `HTTP` camouflage header over blocking `TCP`, both roles.
-//!
-//! One `GET` before the first protocol bytes and one `200` before the first
-//! reply bytes, then raw bytes both ways: no framing follows the blank line.
-
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-/// Largest handshake block read before the header is refused, not buffered.
 const HEAD_LIMIT: usize = 8192;
 
-/// Byte stream past the header; `Read` serves pipelined bytes first.
 #[derive(Debug)]
 pub(crate) struct HeadReader {
     read: TcpStream,
     prefix: Vec<u8>,
-    /// Consumed prefix of `prefix`; takes are counted, never shifted.
     at: usize,
 }
 
 impl Read for HeadReader {
-    /// Fill `buf`; empty means the peer closed a clean `TCP` `EOF`.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -38,31 +29,10 @@ impl Read for HeadReader {
     }
 }
 
-/// Read until `\r\n\r\n`, keeping pipelined bytes; `None` past the limit.
-///
-/// Now [`crate::proxy::read_http_head`], which the other carriers use and which is
-/// the better of the two by construction: it **peeks** for the terminator and then
-/// consumes exactly `at + 4`, so the bytes after the head stay in the kernel. This
-/// module's own version read into a growing `Vec` and then copied everything past
-/// the terminator into a **second** allocation with `head[end..].to_vec()`, which
-/// is one extra allocation and one extra copy of the first payload bytes per
-/// connection for a prefix that the kernel already had.
-///
-/// The consequence the two do not share is that this module's reader is the only
-/// one that needed a `prefix` at all; [`HeadReader::prefix`] stays, because a
-/// peer's payload can still arrive in the same segment as the blank line and the
-/// shared reader is allowed to leave it there, but it is now empty in the case
-/// where it used to be a fresh `Vec`.
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
     crate::proxy::read_http_head(stream, HEAD_LIMIT).map(|head| (head, Vec::new()))
 }
 
-/// The request's target path, without its query, or `None` on a malformed line.
-///
-/// A borrow, where this used to return a `String`. The only caller compared it
-/// against the link's path and dropped it, so every connection allocated a
-/// `String` to hold bytes that were already in the head buffer, and a comparison
-/// against `&str` does the same work.
 fn request_target(head: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(head).ok()?;
     let mut parts = text.split("\r\n").next()?.split_ascii_whitespace();
@@ -73,7 +43,6 @@ fn request_target(head: &[u8]) -> Option<&str> {
     Some(target.split('?').next().unwrap_or(target))
 }
 
-/// Accept the camouflage as a server, checking the configured path exactly.
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(HeadReader, TcpStream)> {
     let mut read = stream;
     let (head, prefix) = read_head(&mut read)?;
@@ -97,7 +66,6 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(HeadReader, TcpSt
     ))
 }
 
-/// Perform the camouflage as a client, checking the `200` before use.
 pub(crate) fn connect(
     stream: TcpStream,
     host: &str,
@@ -153,10 +121,6 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// The path compare is a borrow and a `&str` equality, so the two shapes of
-    /// request this module has to answer both come back without allocating: the
-    /// plain target, and the same target with a query appended by a peer that
-    /// treats this as a cache-buster.
     #[test]
     fn the_request_target_is_a_borrow_and_ignores_the_query() {
         assert_eq!(

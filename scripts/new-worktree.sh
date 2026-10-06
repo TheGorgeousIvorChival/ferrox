@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-# Create an isolated worktree that shares builds and upstreams.
-#
-# One worktree per branch, zero duplicated heavy state: every worktree points
-# its Cargo `target/` at one shared directory, so dependency artifacts build
-# once instead of once per worktree — and `upstream/` checkouts link back here
-# instead of re-downloading gigabytes. Run from anywhere inside the repo:
-#
-#   ./scripts/new-worktree.sh <name> [base-ref]
-#
-# creates `../ferrox-<name>` on branch `<name>` from `base-ref` (default
-# HEAD). Concurrent builds in two worktrees serialize on the shared target
-# lock; that is the price of sharing, and evidence comes from CI anyway.
-#
-# The generated `.cargo/config.toml` holds machine-local absolute paths and is
-# never committed — see `/.cargo/` in `.gitignore`. Point `FERROX_TARGET_DIR`
-# elsewhere to share differently.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -72,4 +56,4 @@ done
 echo "worktree: $dest (branch $name)"
 echo "target-dir: $shared"
 echo "upstream checkouts linked: $linked"
-echo "next: ./scripts/fetch-upstream.sh (only what the links missed), then cargo run -p ferrox-prompt -- next"
+echo "next: ./scripts/fetch-upstream.sh (only what the links missed), then ./scripts/check.sh"

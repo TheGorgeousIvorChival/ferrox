@@ -1,29 +1,14 @@
-//! The `rustls` backend.
-//!
-//! Configuration, handshake and record path are all rustls's; nothing here
-//! reimplements or wraps them. The job of this module is to turn a
-//! [`TlsConfig`] into rustls's own types, to map rustls's errors onto
-//! [`TlsError`] without inventing detail, and to hold the transport so a caller
-//! can treat this like any other byte stream.
-
 use super::{Stream, TlsConfig, TlsError, TlsProvider};
 use std::io::{Read, Write};
 use std::sync::Arc;
 
 type RootStore = rustls::RootCertStore;
 
-/// A client session on `rustls`.
 pub struct RustlsProvider<S: Stream> {
     conn: rustls::ClientConnection,
     io: S,
 }
 
-/// Hand-written rather than derived: `derive(Debug)` would demand `S: Debug`, and
-/// the whole point of `S` being any `Read + Write` is that it need not be.
-///
-/// The negotiated parameters are printed and the transport is not, because a
-/// stream's `Debug` may be a formatter for a socket, a file or a test double, and
-/// one of those is a reasonable thing to log while the others are not.
 impl<S: Stream> std::fmt::Debug for RustlsProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RustlsProvider")
@@ -34,17 +19,7 @@ impl<S: Stream> std::fmt::Debug for RustlsProvider<S> {
 }
 
 impl<S: Stream> RustlsProvider<S> {
-    /// Build the stack's configuration from the backend-neutral one.
-    ///
-    /// The provider is passed explicitly rather than installed globally. rustls
-    /// keeps a process-wide default, and a component that reads the global one
-    /// would depend on whichever component happened to be initialised first —
-    /// which is the difference between a benchmark that compares stacks and one
-    /// that compares whichever stack won a race.
     fn config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError> {
-        // `add` rather than `add_parsable_certificates`: these are anchors the
-        // caller chose deliberately, so one that does not parse is a
-        // configuration error worth reporting rather than a certificate to skip.
         let mut roots = RootStore::empty();
         for der in &cfg.roots {
             roots
@@ -64,12 +39,6 @@ impl<S: Stream> RustlsProvider<S> {
         Ok(Arc::new(config))
     }
 
-    /// Open a client session over `io`, without starting the handshake.
-    ///
-    /// # Errors
-    ///
-    /// If the configuration or the server name is rejected. No I/O happens here,
-    /// so a failure is a programming error rather than a network condition.
     pub fn connect(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
         let name = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
             .map_err(|e| TlsError::Other(format!("rustls server name: {e}")))?;
@@ -78,23 +47,15 @@ impl<S: Stream> RustlsProvider<S> {
         Ok(Self { conn, io })
     }
 
-    /// Finish the handshake, reading and writing on the transport until it is
-    /// done.
     fn drive(&mut self) -> Result<(), TlsError> {
         while self.conn.is_handshaking() {
             if let Err(e) = self.conn.complete_io(&mut self.io) {
                 return Err(recover(e));
             }
         }
-        // Leaving the loop is what flushes rustls' post-handshake key update,
-        // which must happen before plaintext may be written. `complete_prior_io`
-        // is only reachable through rustls' own `Stream` wrapper, which this
-        // module does not use because it would put a second stream type between
-        // the caller and the record path.
         Ok(())
     }
 
-    /// The transport, once the handshake is done.
     pub fn get_ref(&self) -> &S {
         &self.io
     }
@@ -106,8 +67,6 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
     }
 
     fn suites(&self) -> Vec<String> {
-        // Read from the provider, in the provider's own order. Writing this list
-        // out by hand would be a claim about rustls rather than a report of it.
         rustls::crypto::ring::ALL_CIPHER_SUITES
             .iter()
             .map(|cs| format!("{:?}", cs.suite()))
@@ -141,8 +100,6 @@ impl<S: Stream> Write for RustlsProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.drive()?;
         let len = self.conn.writer().write(buf)?;
-        // Push records now, like `rustls::Stream`: buffered plaintext the peer never
-        // receives is a hang wearing a successful write. Errors surface on flush.
         let _ = self.conn.complete_io(&mut self.io);
         Ok(len)
     }
@@ -155,13 +112,11 @@ impl<S: Stream> Write for RustlsProvider<S> {
     }
 }
 
-/// A server session on `rustls`, built from the config files' identity.
 pub struct RustlsServerProvider<S: Stream> {
     conn: rustls::ServerConnection,
     io: S,
 }
 
-/// Hand-written rather than derived, for the same transport reason as the client.
 impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RustlsServerProvider")
@@ -172,12 +127,6 @@ impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
 }
 
 impl<S: Stream> RustlsServerProvider<S> {
-    /// Accept with one certificate chain and no ALPN gate, so a client that offers
-    /// none handshakes and offered protocols are ignored rather than refused.
-    ///
-    /// # Errors
-    ///
-    /// If the identity is rejected. No I/O happens here.
     pub fn accept(cfg: &super::TlsServerConfig, io: S) -> Result<Self, TlsError> {
         use super::ServerKeyKind as Kind;
         let certs: Vec<rustls::pki_types::CertificateDer<'_>> = cfg
@@ -208,10 +157,6 @@ impl<S: Stream> RustlsServerProvider<S> {
         Ok(Self { conn, io })
     }
 
-    /// Finish the handshake, reading and writing on the transport until it is done.
-    ///
-    /// A read wait is a retry, not a refusal: the relay arms its socket with one,
-    /// so a slow peer pauses the handshake rather than failing it.
     fn drive(&mut self) -> Result<(), TlsError> {
         while self.conn.is_handshaking() {
             if let Err(error) = self.conn.complete_io(&mut self.io) {
@@ -227,7 +172,6 @@ impl<S: Stream> RustlsServerProvider<S> {
         Ok(())
     }
 
-    /// The transport underneath, for a caller that needs the socket itself.
     pub fn get_ref(&self) -> &S {
         &self.io
     }
@@ -239,7 +183,6 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
     }
 
     fn suites(&self) -> Vec<String> {
-        // Same report as the client: one stack, one list, read from the provider.
         rustls::crypto::ring::ALL_CIPHER_SUITES
             .iter()
             .map(|cs| format!("{:?}", cs.suite()))
@@ -273,7 +216,6 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.drive()?;
         let len = self.conn.writer().write(buf)?;
-        // Same push as the client: the relay writes once per chunk and never flushes.
         let _ = self.conn.complete_io(&mut self.io);
         Ok(len)
     }
@@ -286,11 +228,6 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
     }
 }
 
-/// Recover the backend's classification from a transport error.
-///
-/// rustls wraps protocol errors in an `InvalidData` I/O error carrying itself
-/// as the source, so the classification `map_error` computes is recoverable
-/// without string matching; anything else keeps the transport mapping.
 fn recover(e: std::io::Error) -> TlsError {
     if e.kind() == std::io::ErrorKind::InvalidData {
         if let Some(inner) = e.get_ref().and_then(|s| s.downcast_ref::<rustls::Error>()) {
@@ -300,44 +237,20 @@ fn recover(e: std::io::Error) -> TlsError {
     TlsError::from(e)
 }
 
-/// Map a rustls error onto the backend-neutral set.
-///
-/// rustls exposes its causes as enum variants, so this is a real mapping rather
-/// than a string match, and every variant it defines in the pinned version is
-/// listed so that the classification is deliberate and reviewable rather than
-/// whatever the last arm happened to catch.
-///
-/// # The wildcard is a real limitation
-///
-/// `rustls::Error` is `#[non_exhaustive]`, so the trailing `_` arm is mandatory.
-/// That means a *new* rustls variant would land in `Other` instead of failing the
-/// build — including a new certificate error, which is the case most likely to be
-/// added and the one a caller most wants classified. So this mapping is re-read
-/// when rustls is bumped, which is why the classification table lives in
-/// `docs/function/tls-provider.md` rather than only here.
-///
-/// `TlsError::Timeout` is unreachable from this arm and reaches the caller through
-/// [`TlsError`]'s `From<io::Error>` impl instead: rustls surfaces a timeout as the
-/// transport's `io::Error`, not as a protocol error.
 fn map_error(e: &rustls::Error) -> TlsError {
     use rustls::Error as E;
     match e {
-        // Everything rustls can say about a chain it refused to trust.
         E::InvalidCertificate(_)
         | E::InvalidCertRevocationList(_)
         | E::NoCertificatesPresented
         | E::UnsupportedNameType => TlsError::BadCertificate,
 
-        // Nothing mutually negotiable, as suites or as ALPN, bare or alerted.
         E::NoApplicationProtocol
         | E::AlertReceived(rustls::AlertDescription::NoApplicationProtocol)
         | E::PeerIncompatible(_)
         | E::PeerMisbehaved(_)
         | E::BadMaxFragmentSize => TlsError::NoSharedCipher,
 
-        // A record that made no sense, or arrived after the handshake ended.
-        // Grouped as `Closed` because the actionable response is the same: this
-        // connection is finished, and writing more plaintext onto it will not help.
         E::DecryptError
         | E::EncryptError
         | E::InvalidMessage(_)
@@ -345,12 +258,8 @@ fn map_error(e: &rustls::Error) -> TlsError {
         | E::InappropriateHandshakeMessage { .. }
         | E::HandshakeNotComplete
         | E::PeerSentOversizedRecord
-        // A close_notify is how a peer hangs up politely, so it belongs with the
-        // cases whose only correct response is to stop using the connection.
         | E::AlertReceived(rustls::AlertDescription::CloseNotify) => TlsError::Closed,
 
-        // Any other alert is a refusal rather than a hangup, reported as such so a
-        // caller can tell "the peer said no" from "the peer left".
         E::AlertReceived(other) => TlsError::Other(format!("rustls alert: {other:?}")),
 
         E::FailedToGetCurrentTime
@@ -360,7 +269,6 @@ fn map_error(e: &rustls::Error) -> TlsError {
         | E::General(_)
         | E::Other(_) => TlsError::Other(format!("rustls: {e:?}")),
 
-        // Mandatory: `rustls::Error` is `#[non_exhaustive]`.
         _ => TlsError::Other(format!("rustls: unmapped error {e:?}")),
     }
 }
@@ -371,8 +279,6 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
-    /// Self-signed P-256 leaf for `tls.test`, valid to 2066; generated once
-    /// with openssl and embedded so the test needs no network, no CA and no clock.
     const ANCHOR: &[u8] = &[
         0x30, 0x82, 0x01, 0x6c, 0x30, 0x82, 0x01, 0x11, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x14,
         0x6d, 0x8e, 0xc2, 0xf5, 0x42, 0x91, 0xda, 0xdb, 0x05, 0xc9, 0xb2, 0x00, 0x71, 0x8b, 0xfb,
@@ -401,7 +307,6 @@ mod tests {
         0x05, 0x95, 0xb1, 0xf2, 0xe1, 0x67, 0x0d, 0x3e,
     ];
 
-    /// Its PKCS#8 private key.
     const ANCHOR_KEY: &[u8] = &[
         0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
         0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30,
@@ -415,7 +320,6 @@ mod tests {
         0x18, 0x38, 0x94,
     ];
 
-    /// Client config trusting only the anchor, offering the test ALPN.
     fn client(name: &str, alpn: &[&[u8]]) -> TlsConfig {
         TlsConfig {
             server_name: name.to_owned(),
@@ -424,7 +328,6 @@ mod tests {
         }
     }
 
-    /// Loopback server speaking the anchor cert and requiring one ALPN.
     fn serve(listener: &TcpListener) {
         let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -449,7 +352,6 @@ mod tests {
         let _ = tls.write_all(&buf);
     }
 
-    /// Run one handshake case against a bound loopback server.
     fn case(dial: impl FnOnce(TcpStream)) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -511,7 +413,6 @@ mod tests {
         });
     }
 
-    /// PEM framing for DER bytes, the shape the identity parser must read back.
     fn anchor_pem(label: &str, der: &[u8]) -> Vec<u8> {
         const TABLE: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

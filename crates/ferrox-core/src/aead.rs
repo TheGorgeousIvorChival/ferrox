@@ -1,47 +1,6 @@
-//! `ChaCha20-Poly1305` (`IETF`, `RFC 8439`) on this crate's own keystream core.
-//!
-//! # Why it exists
-//!
-//! `VMess` negotiates `ChaCha20-Poly1305` for its data frames, and it used to
-//! get it from the `chacha20poly1305` crate. On `aarch64` that crate runs at
-//! 0.45 GB/s, because the `chacha20` crate underneath it will not select its own
-//! NEON backend and so runs the keystream half one dependent chain at a time.
-//! [`crate::record::fill_exact`] does the same twenty rounds at 2.14 GB/s on the
-//! same machine, and it is the same twenty rounds — the differential sweep
-//! against the pinned `chacha20` crate is what that rests on.
-//!
-//! So the keystream half is [`crate::record`], unchanged, and the only new code
-//! here is the `Poly1305` accumulator in [`crate::poly1305`] and the framing
-//! `RFC 8439` puts around it.
-//!
-//! # The construction, and the one copy it does not need
-//!
-//! `C = P XOR keystream`, so encrypting in place is [`crate::record::fill_exact`]
-//! over a buffer that already holds the plaintext. No keystream buffer, no
-//! second pass, no copy.
-//!
-//! Decrypting is the part worth reading twice. The tag is computed over the
-//! *ciphertext*, so the order has to be: authenticate the bytes that arrived,
-//! compare, and only then turn them into plaintext. Both `record::fill_exact`
-//! and [`crate::poly1305::tag`] read `buf` and neither writes it, so the
-//! ciphertext is still intact when the tag is checked and still intact when the
-//! comparison is done — and the decrypt is the same single in-place XOR. A
-//! decrypt-then-authenticate would need a copy of the ciphertext to compare
-//! against, and this does not.
-//!
-//! The comparison is constant time, and not by a `==` on the arrays: `==` is a
-//! lexicographic compare that returns as soon as it finds a difference, and its
-//! running time says how much of a forged tag was right.
-
 use crate::poly1305::Poly1305;
 use crate::record::{fill_exact, fill_exact_with_head};
 
-/// How the `Poly1305` key is derived: one time, from the `ChaCha20` key and the
-/// nonce, by `ChaCha20` with an all-zero block counter.
-///
-/// This is `RFC 8439` section 2.6, and it is the reason the block counter is
-/// pinned to zero rather than left to the caller: the keystream for this key is
-/// the *first* block, whatever counter the message itself starts at.
 fn poly_key(chacha_key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
     let mut block = [0u8; 64];
     fill_exact(chacha_key, nonce, 0, &mut block);
@@ -50,16 +9,6 @@ fn poly_key(chacha_key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
     key
 }
 
-/// Seal `buf` in place and return the tag, the way the pinned crate does.
-///
-/// Identical to calling [`chacha20_poly1305_seal_in_place`], and it exists only
-/// so the differential test can compare the fused keystream pass against the
-/// unfused one at every length. Both are the shipped bytes; the difference is
-/// how many `ChaCha20` blocks were generated to produce them.
-///
-/// # Panics
-///
-/// Never, for lengths the seal itself accepts.
 #[must_use]
 pub fn chacha20_poly1305_seal_in_place_unfused(
     key: &[u8; 32],
@@ -73,48 +22,18 @@ pub fn chacha20_poly1305_seal_in_place_unfused(
     state.finish()
 }
 
-/// The `RFC 8439` section 2.8 MAC input, in the shape it specifies.
-///
-/// `pad16(aad) || pad16(ciphertext) || len(aad) || len(ciphertext)` — the two
-/// sections each zero-padded up to a block boundary, and *both* sixty-four-bit
-/// little-endian lengths in one final block, rather than a length in front of
-/// each section.
-///
-/// That is the part worth being certain about, because the other reading is
-/// plausible and produces a valid-looking tag for every length that is a
-/// multiple of sixteen. The `RFC 8439` section 2.8.2 test vector settles it: the
-/// length-first framing gives `9f ff 5e 04 ...` there and the padded framing
-/// gives the specified `1a e1 0b 59 ...`. Both readings also agree with the
-/// pinned crate, so a test against the crate alone would not have caught a
-/// mistake here — only agreement between the two is evidence.
 fn mac(state: &mut Poly1305, aad: &[u8], ciphertext: &[u8]) {
     for section in [aad, ciphertext] {
         state.update(section);
-        // Every section reaches a block boundary. This is a `memcpy` of at most
-        // fifteen bytes per section — two per message — and it is what the RFC
-        // says; `Poly1305::update` already knows how to carry a partial block
-        // into the next call, so nothing here has to be special-cased.
         let slack = (16 - section.len() % 16) % 16;
         state.update(&[0u8; 16][..slack]);
     }
-    // Two lengths, one block. The total message length is then a multiple of
-    // sixteen by construction, so `finish` never has to terminate it.
     let mut lengths = [0u8; 16];
     lengths[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
     lengths[8..].copy_from_slice(&(ciphertext.len() as u64).to_le_bytes());
     state.update(&lengths);
 }
 
-/// Seal `buf` in place: plaintext in, ciphertext out, and the sixteen-byte tag.
-///
-/// One buffer rather than two, and that is the whole interface. `C = P XOR
-/// keystream` means a caller that already has the plaintext in a buffer it is
-/// going to write out anyway never needs to hand the bytes over twice — which is
-/// the shape [`crate::record::fill_exact`] is already in, and the reason this
-/// takes one `&mut [u8]` and not a `&[u8]` beside it.
-///
-/// The tag is over the *ciphertext*, so it is computed after the xor, from the
-/// bytes now sitting in `buf`.
 #[must_use]
 pub fn chacha20_poly1305_seal_in_place(
     key: &[u8; 32],
@@ -122,15 +41,6 @@ pub fn chacha20_poly1305_seal_in_place(
     aad: &[u8],
     buf: &mut [u8],
 ) -> [u8; 16] {
-    // The one-time key and the message keystream are consecutive blocks of one
-    // keystream: block zero's first 32 bytes, then block one onward. Asking for
-    // them as one pass generates block zero once instead of twice, and — the part
-    // that was actually slow — puts it on the wide core with the message's blocks
-    // already in flight rather than on the scalar one-block core, which is where
-    // a 64-byte `fill_exact` lands because a single chain has nothing to
-    // interleave with. The bytes are unchanged and
-    // `chacha20_poly1305_seal_in_place_unfused` is the before, kept so the
-    // differential test can hold the two to each other at every length.
     let mut one_time = [0u8; 32];
     fill_exact_with_head(key, nonce, 0, &mut one_time, buf);
 
@@ -139,11 +49,6 @@ pub fn chacha20_poly1305_seal_in_place(
     state.finish()
 }
 
-/// Open `buf`, which holds the ciphertext, in place, if `tag` is the tag for it.
-///
-/// Returns the plaintext length on success and `None` on a tag that does not
-/// match. On `None` the contents of `buf` are unspecified but unchanged: nothing
-/// is decrypted until the tag has been checked.
 #[must_use]
 pub fn chacha20_poly1305_decrypt_in_place(
     key: &[u8; 32],
@@ -156,8 +61,6 @@ pub fn chacha20_poly1305_decrypt_in_place(
     mac(&mut state, aad, buf);
     let want = state.finish();
 
-    // Every byte, always: the running time must not say how much of a forged
-    // tag was right, and `want == tag` would say exactly that.
     let mut diff = 0u8;
     for (a, b) in want.iter().zip(tag.iter()) {
         diff |= a ^ b;
@@ -170,15 +73,6 @@ pub fn chacha20_poly1305_decrypt_in_place(
     Some(buf.len())
 }
 
-/// The tag `chacha20_poly1305_seal_in_place` produces for these ciphertext bytes,
-/// without sealing anything.
-///
-/// A `VMess` data frame authenticates its length prefix along with its body, so
-/// the tag has to exist a moment before the frame does. Computing it this way
-/// means the frame is built twice rather than staged in a buffer the caller then
-/// has to keep — so it is *not* free, and
-/// [`chacha20_poly1305_seal_in_place`] exists for the callers who can afford the
-/// single pass.
 #[must_use]
 pub fn chacha20_poly1305_tag(
     key: &[u8; 32],
@@ -197,18 +91,6 @@ mod tests {
     use chacha20poly1305::aead::AeadInPlace as _;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 
-    /// The `RFC 8439` section 2.8.2 vector, spelled out.
-    ///
-    /// The sweep against the pinned crate below is the stronger claim about what
-    /// `VMess` talks to, but it cannot catch a mistake that the crate and this
-    /// implementation share — and the `MAC` framing is exactly that kind of
-    /// mistake. Two of them, in fact: whether the lengths go in front of each
-    /// section or behind both, and whether the sections are zero-padded. Both
-    /// readings give a tag the other does not, and the length-first one agrees
-    /// with the padded one on every message whose length is a multiple of
-    /// sixteen, so it survives a sweep that only tried round lengths.
-    ///
-    /// This vector is the specification itself, and it is what decides.
     #[test]
     fn the_rfc_8439_vector_is_the_framing() {
         let key: [u8; 32] = std::array::from_fn(|i| 0x80u8.wrapping_add(i as u8));
@@ -256,15 +138,6 @@ mod tests {
         );
     }
 
-    /// Every length, both keys, three nonces, and every `aad` length that changes
-    /// the padding — against the crate, not against a vector.
-    ///
-    /// A published vector decides whether this matches a *specification*; this
-    /// decides whether it matches what `VMess` actually talks to, which is the
-    /// question that matters and the only one a swap-in can be allowed to ask.
-    /// It covers the shapes a hand-written list of lengths would miss: the block
-    /// boundaries at 15/16/17, and every `aad` length across the same boundary,
-    /// because the `aad` padding is a separate `mod 16` from the message's.
     #[test]
     fn is_byte_identical_to_the_crate_it_replaces() {
         let keys = [
@@ -312,9 +185,6 @@ mod tests {
         assert!(checked > 5_000, "the sweep should be dense, not a sample");
     }
 
-    /// Open is the inverse of seal at every length, and a tag one bit off is
-    /// refused without the caller's bytes being touched.
-
     #[test]
     fn opens_what_seal_made_and_refuses_a_forged_tag() {
         let key = [0x11u8; 32];
@@ -340,8 +210,6 @@ mod tests {
         }
     }
 
-    /// A rejected tag must leave the caller's bytes alone: they are still the
-    /// ciphertext, and a caller that retries has to be able to.
     #[test]
     fn a_refused_message_is_left_encrypted() {
         let key = [0x33u8; 32];
@@ -357,7 +225,6 @@ mod tests {
         assert_eq!(buf, ciphertext, "a wrong tag must not decrypt");
     }
 
-    /// `aad` is part of the tag, so changing it must break it.
     #[test]
     fn aad_is_authenticated() {
         let key = [0x55u8; 32];

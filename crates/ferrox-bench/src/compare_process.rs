@@ -1,32 +1,3 @@
-//! The comparison itself: several engines, one workload, `ZeroNet`'s gate.
-//!
-//! This is the part that answers the question the four gates in `main.rs` cannot.
-//! Those gates compare this workspace's record layer against a same-language
-//! reference, at nanoseconds per call, in one process. They say nothing about the
-//! path an engine actually takes: accept a SOCKS connection, relay through a
-//! `VLESS` header, copy bytes, and be resident while doing it. That path is where
-//! a Rust core and a Go core differ, and it is the only one a user experiences.
-//!
-//! # What is measured and against whom
-//!
-//! Each engine is measured as a child process over the *same* validated workload
-//! and the *same* config shape, and the comparison is paired on the repeat index
-//! with the engine order rotated and reversed (`stats::rotate`). The engines come
-//! from `upstream/pins.toml`, each built from its pin, so a number names the thing
-//! it was measured against.
-//!
-//! # The rows, and which of them can fail
-//!
-//! | row | direction | gated |
-//! |---|---|---|
-//! | throughput | higher is better | yes |
-//! | CPU per GiB | lower is better | yes |
-//! | peak RSS | lower is better | with [`stats::RSS_TOLERANCE`] |
-//! | setup, median | lower is better | reported |
-//!
-//! RSS is held to a tolerance rather than to `ZeroNet`'s zero allowance, for the
-//! reason given in `stats`. The publish/report side is in [`Comparison::report`].
-
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -34,12 +5,6 @@ use crate::json::{self, Json};
 use crate::parity::{self, ConfigArg, Error, Request, Run};
 use crate::stats::{self, Cell, Direction};
 
-/// What a gate-5 row is not, printed on every report.
-///
-/// The gaps are named rather than left out. `ZeroNet`'s coverage grid is explicit
-/// that a row's absence must be marked as a gap and not silently dropped
-/// (`upstream/zeronet/docs/benchmarks/harness/zbench/xrayrust_suite.py:19`), and
-/// this is the same statement for this harness.
 fn caveat() -> String {
     format!(
         "\n> **What this row is not.** `ps` samples RSS and CPU from outside the \
@@ -55,85 +20,34 @@ fn caveat() -> String {
     )
 }
 
-/// Readings inside the transfer window below which the CPU column is a reading
-/// rather than a measurement.
-///
-/// The sampling period is 100 ms and the kernel's CPU accounting resolution is
-/// 10 ms, so three readings is the point at which a delta has more than one
-/// interval in it. Below this the cell is printed in bold, which means "do not
-/// read this as a CPU cost".
 pub const MIN_TRAFFIC_SAMPLES: usize = 3;
 
-/// One engine to measure.
 #[derive(Debug, Clone)]
 pub struct Engine {
-    /// The label that appears in every table and in the pin it came from.
     pub name: &'static str,
-    /// The executable.
     pub path: PathBuf,
-    /// How this engine is told which config file to serve.
     pub config_arg: ConfigArg,
-    /// Whether this is the engine under test, and so the one whose rows decide
-    /// gate 5. False for a pinned comparator.
     pub gated: bool,
-    /// The config shape this engine parses.
     pub dialect: parity::Dialect,
-    /// The inbound protocols this engine can serve, as the scenario ids name them.
-    ///
-    /// An empty list means "every protocol", which is what an engine that parses
-    /// the whole Xray config surface gets. A non-empty one is an engine that serves
-    /// only some of them, and the matrix has one of those: `xray-rust` at its pin
-    /// accepts `socks`, `http` and `tun` inbounds and rejects `vless`, `vmess`,
-    /// `shadowsocks` and `trojan` outright (`crates/xray-config/src/parser.rs:636`).
-    ///
-    /// Without this, every protocol scenario handed it a config it could not parse,
-    /// it exited during startup, and the harness reported that as a **failed
-    /// engine** -- three red rows per cell, on every runner, for a binary that was
-    /// never going to serve those protocols. The distinction the report draws
-    /// between skipped and failed is exactly the one being lost: skipped is the
-    /// roadmap, failed is a fault, and an engine that does not implement a protocol
-    /// is the first of those.
     pub protocols: &'static [&'static str],
 }
 
-/// The workload every engine is measured against.
 #[derive(Debug, Clone)]
 pub struct Workload {
     pub traffic: String,
     pub connections: usize,
     pub iterations: usize,
     pub payload_size: usize,
-    /// Whether each engine gets a warmup connection before its measured run.
     pub warmup: bool,
-    /// Full engine config used instead of the dialect default, empty for none.
-    ///
-    /// Custom scenario documents are Xray-dialect: only engines that read that
-    /// spelling run them, and the rest sit the scenario out with a named
-    /// reason rather than failing every repeat. The freedom default keeps its
-    /// empty string, so gate 5 never touches this path.
     pub outbound_config: String,
-    /// The scenario id this cell belongs to, whose leading rung names the protocol.
-    ///
-    /// `participant_names` reads it to decide which engines can serve the cell, so
-    /// an engine that does not implement the scenario's protocol sits out with a
-    /// reason instead of being handed a config it cannot parse and reported as
-    /// broken. Empty for a workload with no scenario behind it.
     pub scenario: String,
 }
 
 impl Workload {
-    /// Bytes each flow moves.
     fn flow_bytes(&self) -> u64 {
         (self.iterations * self.payload_size) as u64
     }
 
-    /// Bytes the whole workload moves, **both directions of a full-duplex cell**.
-    ///
-    /// The report header prints this as "MiB total", so for `full-duplex` it was
-    /// naming half the bytes the run actually moved -- the same miscount the
-    /// harness itself had, which is what failed the duplex rows. `parity` decides
-    /// what a run must actually deliver; this is the number a reader compares it
-    /// against, and the two have to agree.
     fn total_bytes(&self) -> u64 {
         let directions = match self.traffic.as_str() {
             "full-duplex" => 2u64,
@@ -142,18 +56,9 @@ impl Workload {
         (self.flow_bytes() * self.connections as u64).saturating_mul(directions)
     }
 
-    /// The request an engine is measured with, written to `output`.
-    ///
-    /// `output` must not exist, which the request validator enforces, so each
-    /// repeat gets its own directory and a stale one cannot be read as a result.
     fn request(&self, engine: &Engine, output: &Path) -> String {
         let mut root = Json::object();
         root.insert("binary", Json::Str(engine.path.display().to_string()));
-        // The config the engine is handed is built from its own dialect, so one
-        // workload means the same work in four config languages and no engine is
-        // asked to parse a document written for a different one. A scenario
-        // document overrides that per engine that reads it; the rest sit out
-        // with a reason in `run` rather than failing to parse.
         let config = if self.outbound_config.trim().is_empty() {
             engine
                 .dialect
@@ -175,7 +80,6 @@ impl Workload {
             .expect("a document built from strings and counts always serialises")
     }
 
-    /// One line naming the workload, for the report header.
     fn describe(&self) -> String {
         format!(
             "{} x {} flows of {} iterations at {} B ({} MiB total)",
@@ -188,52 +92,25 @@ impl Workload {
     }
 }
 
-/// What one engine's repeats produced.
 #[derive(Debug)]
 pub struct EngineRuns {
     pub engine: &'static str,
-    /// The config shape this engine was handed, kept beside its runs so the
-    /// report can name it even when the engine produced none -- an engine that
-    /// failed to start is precisely the one whose config shape a reader needs.
     pub dialect: parity::Dialect,
     pub runs: Vec<Run>,
 }
 
-/// Everything the report needs.
 #[derive(Debug)]
 pub struct Comparison {
     pub workload: Workload,
     pub repeats: usize,
     pub by_engine: Vec<EngineRuns>,
-    /// One ceiling measurement per repeat, taken with no engine in the path and
-    /// interleaved with that repeat's engines.
-    ///
-    /// A vector rather than one number because one number is a sample of the
-    /// runner at one moment, and the runner is what varies: the same tree
-    /// published 2220 to 5724 MiB/s of ceiling across eight `linux x86_64` runs.
-    /// Per repeat, each engine has a ceiling measured seconds away from it, and
-    /// the spread across repeats is the machine's own variance *measured* rather
-    /// than assumed -- see [`Comparison::runner_spread`].
     pub ceilings_mib_s: Vec<f64>,
-    /// The engine whose rows decide the gate, or `None` when the caller named no
-    /// engine under test — which fails the gate rather than passing it vacuously.
     pub gated: Option<&'static str>,
-    /// Errors, per engine, with the reason. A cell that failed is never blank.
     pub failures: Vec<(String, String)>,
-    /// Engines that never attempted the scenario, with the reason. Custom
-    /// scenario documents are Xray-dialect; an engine that reads another
-    /// spelling sits out rather than failing to parse, which would measure a
-    /// config error and report it as the engine. Skipped is gray, failed is
-    /// red: one is the roadmap and the other is a fault.
     pub skipped: Vec<(String, String)>,
     pub machine: String,
 }
 
-/// One repeat as JSON: throughput plus the cost columns the charts need
-/// beside it (peak threads, cold start, transfer window). All three are in
-/// every result.json already; carrying them keeps the cell self-contained so
-/// the renderer never re-globs the runs directory for a number beside the
-/// medians. A run without a thread peak contributes null, never zero.
 fn run_cell_json(run: &Run) -> Json {
     let mut cell = Json::object();
     cell.insert("throughput_mib_s", Json::Num(run.throughput_mib_s()));
@@ -255,7 +132,6 @@ fn run_cell_json(run: &Run) -> Json {
 }
 
 impl Comparison {
-    /// Throughput cells for one engine, one per repeat.
     fn throughput_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
@@ -267,7 +143,6 @@ impl Comparison {
             .collect()
     }
 
-    /// CPU-per-GiB cells for one engine.
     fn cpu_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
@@ -279,7 +154,6 @@ impl Comparison {
             .collect()
     }
 
-    /// RSS cells for one engine.
     fn rss_cells(&self, engine: &str) -> Vec<Cell> {
         self.runs(engine)
             .iter()
@@ -298,14 +172,10 @@ impl Comparison {
             .map_or(&[], |e| e.runs.as_slice())
     }
 
-    /// The engine every other engine is measured against: the first one, which
-    /// the caller orders as the reference. Named in the report so a ratio cannot
-    /// be read without knowing what it is against.
     fn reference(&self) -> Option<&'static str> {
         self.by_engine.first().map(|e| e.engine)
     }
 
-    /// Every engine other than the reference.
     fn candidates(&self) -> Vec<&'static str> {
         let Some(reference) = self.reference() else {
             return Vec::new();
@@ -317,20 +187,6 @@ impl Comparison {
             .collect()
     }
 
-    /// Whether a throughput row that *could not tell* should say whose fault that is.
-    ///
-    /// The paired interval is the resolution measure and it alone decides the
-    /// verdict; this never overrides it, in either direction. The raw ceiling spread
-    /// is a coarser, unpaired number, and letting it overrule a tight interval is how
-    /// one run printed `better, 95% interval [1.221x, 1.632x]` and `NOT CERTIFIED`
-    /// on the same line.
-    ///
-    /// What it adds is the *reason* a row includes 1.0. Eight `linux x86_64` runs of
-    /// one unchanged tree published throughput ratios from 0.696x to 1.126x while the
-    /// runner's own ceiling moved 2.7x: with a ceiling spread in hand, "this run
-    /// cannot tell" is attributable rather than merely stated. So the marker applies
-    /// exactly when the interval is inconclusive *and* the machine moved further than
-    /// the tolerance, which is additive and can never contradict the verdict above it.
     fn throughput_uncertain_because_of_the_runner(
         &self,
         interval: Option<stats::Interval>,
@@ -343,16 +199,6 @@ impl Comparison {
             })
     }
 
-    /// The gate: one row per metric, per engine, against the reference.
-    ///
-    /// Every engine is measured and every row is published; only the rows for the
-    /// engine under test decide the verdict. Gating the comparators as well would
-    /// be the same defect as printing a table of four and gating one: it makes the
-    /// job's pass condition a property of a pinned binary this repository does not
-    /// build. See [`stats::Row::gates`].
-    ///
-    /// A throughput row that cannot tell says whether the runner is why; see
-    /// [`Comparison::throughput_uncertain_because_of_the_runner`].
     pub fn gate(&self) -> stats::Gate {
         if self.reference().is_none() {
             return stats::Gate::no_comparison();
@@ -364,9 +210,6 @@ impl Comparison {
         stats::gate_rows(&self.rows())
     }
 
-    /// The gate rows without the verdict: the same rows [`Comparison::gate`]
-    /// judges, for the machine-readable cell [`Comparison::comparison_json`]
-    /// reports alongside the markdown.
     fn rows(&self) -> Vec<stats::Row> {
         let Some(reference) = self.reference() else {
             return Vec::new();
@@ -430,14 +273,6 @@ impl Comparison {
             .collect()
     }
 
-    /// One measured cell as machine-readable JSON, for the benchmark matrix.
-    ///
-    /// The markdown [`Comparison::report`] is for readers; this document is for
-    /// `scripts/render-benchmark-charts.py`, which plots it, and
-    /// `scripts/validate-benchmark-matrix.py`, which re-derives every verdict
-    /// from the intervals here rather than trusting them. Verdicts come from the
-    /// same [`Comparison::gate`] rows the report prints, so the two documents
-    /// cannot disagree about what was measured.
     pub fn comparison_json(&self, scenario: &str) -> Result<String, String> {
         fn interval_json(interval: Option<stats::Interval>) -> Json {
             match interval {
@@ -530,11 +365,6 @@ impl Comparison {
         root.to_string()
     }
 
-    /// The markdown section, appended to the benchmark report.
-    /// The markdown section, appended to the benchmark report.
-    ///
-    /// Split into one method per table so each is readable on its own and a
-    /// change to one does not have to be read past the other three.
     pub fn report(&self) -> String {
         let mut s = self.preamble();
         s.push_str(&self.failure_note());
@@ -546,7 +376,6 @@ impl Comparison {
         s
     }
 
-    /// What was measured, against whom, and how.
     fn preamble(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "\n## Gate 5 — process-level comparison\n");
@@ -627,11 +456,6 @@ impl Comparison {
         s
     }
 
-    /// The engines that produced nothing, each with the reason.
-    ///
-    /// Never omitted: a blank cell is indistinguishable from a cell nobody looked
-    /// at, which is how a failed engine reads as parity
-    /// (`upstream/zeronet/docs/benchmarks/harness/zbench/report.py:72`).
     fn failure_note(&self) -> String {
         if self.failures.is_empty() {
             return String::new();
@@ -649,7 +473,6 @@ impl Comparison {
         s
     }
 
-    /// Every run, not summarised, so the medians below are checkable against it.
     fn per_repeat_table(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "### Per-repeat measurements\n");
@@ -663,8 +486,6 @@ impl Comparison {
         );
         for entry in &self.by_engine {
             for (i, run) in entry.runs.iter().enumerate() {
-                // A CPU figure with one reading behind it is a reading, not a
-                // measurement, and is marked where it is printed.
                 let cpu = if run.outcome.traffic_samples < MIN_TRAFFIC_SAMPLES {
                     format!("**{:.2}**", run.cpu_millis_per_gib())
                 } else {
@@ -688,7 +509,6 @@ impl Comparison {
         s
     }
 
-    /// Medians over the repeats, each re-derived from the table above it.
     fn medians_table(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "\n### Medians over {} repeats\n", self.repeats);
@@ -699,9 +519,6 @@ impl Comparison {
         let _ = writeln!(s, "| --- | ---: | ---: | ---: | ---: | ---: |");
         for entry in &self.by_engine {
             let m = self.medians(entry.engine);
-            // Re-derive each published median from the cells in the table above it.
-            // A disagreement prints the reason in place of the number, because an
-            // aggregate a reader cannot reproduce is an assertion.
             let cell = |values: &[f64], median: f64, places: usize| -> String {
                 match mean_of(values).and_then(|mean| stats::rederive(values, median, mean)) {
                     Ok(()) => format!("{median:.places$}"),
@@ -721,24 +538,6 @@ impl Comparison {
         s
     }
 
-    /// The row's share of the single-hop ceiling, with the right label.
-    ///
-    /// Against the *median* ceiling, because a median over repeats is the only
-    /// summary of a noisy machine a reader can check against the per-repeat table.
-    /// An engine's median and the ceiling's median come from different instants, so
-    /// this is a marker on the row and not a measurement.
-    ///
-    /// The label is the part that was wrong. The ceiling is the same validated loop
-    /// over **one** socket hop -- the driver talks to the sink -- while every row
-    /// here is a **two**-hop relay: driver to engine to sink. A relay therefore
-    /// moves every byte across the loopback twice, and it is entirely possible, and
-    /// good, for it to reach the single-hop rate: on `linux x86_64` `sing-box`
-    /// measured 137% of it. So a share at or above the ceiling is the *generator*
-    /// saturating, not the ceiling being exceeded, and `ZeroNet`'s
-    /// [`stats::HARNESS_BOUND`] -- a row at 85% of the harness rate is
-    /// generator-bound -- is a rule about a single-hop row and does not apply here.
-    /// Applying it inverted the meaning of the number: a relay at 81% of a
-    /// single-hop rate was labelled as though it had hit a limit it never reached.
     fn ceiling_fraction(&self, throughput: f64) -> String {
         self.ceiling_summary().map_or_else(
             || "unknown".to_owned(),
@@ -757,8 +556,6 @@ impl Comparison {
         )
     }
 
-    /// The median, minimum and maximum of the per-repeat ceilings, or `None` when
-    /// none was measured.
     fn ceiling_summary(&self) -> Option<(f64, f64, f64)> {
         if self.ceilings_mib_s.is_empty() {
             return None;
@@ -770,21 +567,6 @@ impl Comparison {
         Some((median_of(&sorted), low, high))
     }
 
-    /// How far this runner's own throughput moved between repeats: the spread of
-    /// the ceilings as a fraction of their median.
-    ///
-    /// This is the number that decides whether a throughput row on this runner can
-    /// mean anything. `docs/methodology.md` records eight `linux x86_64` runs of
-    /// one unchanged tree whose throughput ratios ran 0.696x to 1.126x while this
-    /// number ran 2.7x; a gate whose own instrument moves further than its
-    /// tolerance cannot separate its subject from its runner, and the project
-    /// already has the rule for that case: *a run that resolves nothing is a
-    /// failure, not a pass*. Here it is neither -- the measurement is real and the
-    /// instrument is not good enough -- so the row is reported and marked
-    /// uncertified rather than being given a verdict.
-    ///
-    /// `None` when no ceiling was measured, which is the same verdict for a
-    /// stronger reason.
     pub fn runner_spread(&self) -> Option<f64> {
         let (median, low, high) = self.ceiling_summary()?;
         if median <= 0.0 {
@@ -793,12 +575,6 @@ impl Comparison {
         Some((high - low) / median)
     }
 
-    /// Every engine against the reference, one row each.
-    ///
-    /// This is the table a reader looks at first, so it comes before the per-repeat
-    /// detail and it names the reference in its own header. A ratio without the
-    /// engine it is against is not a comparison, and the gate lines below carry the
-    /// intervals this table summarises.
     fn headline_table(&self) -> String {
         let Some(reference) = self.reference() else {
             return String::new();
@@ -839,12 +615,8 @@ impl Comparison {
                 );
                 continue;
             }
-            // The ratio and the absolute together, so the direction of the number is
-            // never something the reader has to infer from the row heading.
             let cell = |value: Option<stats::Interval>, absolute: String| -> String {
                 match value {
-                    // No interval at all is a different failure from an interval
-                    // that straddles 1.0, and reads differently on purpose.
                     None => format!("{absolute} (**unproven**)"),
                     Some(i) if !resolved_verdict(Some(i)) => {
                         format!(
@@ -875,9 +647,6 @@ impl Comparison {
                 &self.rss_cells(reference),
                 Direction::Lower,
             ));
-            // How many of the three rows this run could actually resolve. Printed
-            // per engine so a row that reads "within noise" everywhere is visibly
-            // a run that separated nothing, not a set of three ties.
             let resolved = [throughput, cpu, rss]
                 .into_iter()
                 .filter(|i| resolved_verdict(*i))
@@ -894,7 +663,6 @@ impl Comparison {
         s
     }
 
-    /// The gate, and the rule that produced it.
     fn gate_section(&self) -> String {
         let gate = self.gate();
         let mut s = String::new();
@@ -936,13 +704,6 @@ impl Comparison {
         s
     }
 
-    /// The medians over an engine's repeats, each accompanied by the cells it was
-    /// computed from.
-    ///
-    /// The cells come back because [`Comparison::report`] re-derives every
-    /// published median from them and prints the reason instead of the number if
-    /// they disagree. An aggregate a reader cannot reproduce from the table above
-    /// it is an assertion, not a measurement.
     fn medians(&self, engine: &str) -> Medians {
         let runs = self.runs(engine);
         let throughput: Vec<f64> = runs.iter().map(Run::throughput_mib_s).collect();
@@ -965,7 +726,6 @@ impl Comparison {
     }
 }
 
-/// A dialect as a report cell, spelling the two fields that differ.
 fn dialect_cell(dialect: parity::Dialect) -> &'static str {
     match dialect {
         parity::Dialect::Xray => "(`protocol`, `port`)",
@@ -973,19 +733,10 @@ fn dialect_cell(dialect: parity::Dialect) -> &'static str {
     }
 }
 
-/// A spread as a readable multiple, `1.0x` for none at all.
-///
-/// `max/min` rather than `max-min`, because a spread is read as "the machine's
-/// best was how many times its worst", and printing `0.42` for that invites the
-/// reader to check it against the wrong number.
 fn spread_text(spread: f64) -> String {
     format!("{:.2}x", 1.0 + spread.max(0.0))
 }
 
-/// Whether an interval resolved a difference beyond the tolerance.
-///
-/// Used for the "rows resolved" count, so the headline table and the gate below it
-/// cannot disagree about what counted as resolved.
 fn resolved_verdict(interval: Option<stats::Interval>) -> bool {
     !matches!(
         stats::verdict(interval, Direction::Higher),
@@ -993,7 +744,6 @@ fn resolved_verdict(interval: Option<stats::Interval>) -> bool {
     )
 }
 
-/// One engine's published medians and the cells they came from.
 struct Medians {
     throughput: f64,
     cpu: f64,
@@ -1004,7 +754,6 @@ struct Medians {
     rss_cells: Vec<f64>,
 }
 
-/// Median of a sample, averaging the middle pair on an even count.
 fn median_of(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -1019,8 +768,6 @@ fn median_of(values: &[f64]) -> f64 {
     }
 }
 
-/// Mean of a sample, or `None` when there are no samples — a mean of nothing is
-/// not a number a re-derivation check can compare against.
 fn mean_of(values: &[f64]) -> Result<f64, String> {
     if values.is_empty() {
         return Err("there are no cells to average".to_owned());
@@ -1028,28 +775,6 @@ fn mean_of(values: &[f64]) -> Result<f64, String> {
     Ok(values.iter().sum::<f64>() / values.len() as f64)
 }
 
-/// The protocols a scenario id's leading rung can name.
-///
-/// Two lists in one, because the question is the same either way: is this token
-/// a protocol? `scripts/lib-matrix.sh:standard_scenarios` builds its cell ids as
-/// `<protocol>-<carrier>-<direction>-<flows>`, so the leading rung of every
-/// matrix cell is one of `vless`, `vmess`, `trojan` or `shadowsocks`; and
-/// `xray-rust`'s own inbound table is `socks`, `http`, `tun`, so an id naming
-/// one of those has to be recognisable as a protocol too or a scenario serving it
-/// would slip past the filter that exists for it.
-///
-/// **A token that is not in here is not a protocol**, and saying so is the point
-/// of the list. `--scenario` defaults to `gate5` and `run-parity.sh` never
-/// overrides it, so the commonest id reaching [`protocol_of`] names a *run*, not
-/// a transport. Treating that token as a protocol skips an engine and reports
-/// "`gate5` is not served by xray-rust at its pin", a claim about the engine
-/// that is not true.
-///
-/// The drift risk is named rather than handled: if the matrix grows a protocol
-/// this list does not have, `protocol_of` returns `None` and that protocol goes
-/// unfiltered -- which is the red rows this whole table exists to remove, so it
-/// fails loudly instead of quietly. `every_matrix_scenario_id_names_a_protocol`
-/// is what keeps the two in step.
 const SCENARIO_PROTOCOLS: &[&str] = &[
     "vless",
     "vmess",
@@ -1060,28 +785,11 @@ const SCENARIO_PROTOCOLS: &[&str] = &[
     "tun",
 ];
 
-/// The protocol a scenario id names, if it names one.
-///
-/// `vless-raw-down-8` is `vless`: only the leading rung is read, so a carrier
-/// suffix (`-ws`, `-grpc`, `-xhttp`) does not hide the protocol behind it, and
-/// the flows count at the end is not mistaken for one.
-///
-/// `None` for an id that names no protocol -- the default `gate5`, an empty
-/// string, or a token outside [`SCENARIO_PROTOCOLS`]. The caller must then leave
-/// every engine in: there is no protocol to sit one out on, and a skip needs a
-/// reason that is true.
 fn protocol_of(scenario: &str) -> Option<&str> {
     let rung = scenario.split('-').next().unwrap_or_default();
     SCENARIO_PROTOCOLS.contains(&rung).then_some(rung)
 }
 
-/// Engines that measure this workload, plus the ones sitting it out.
-///
-/// Custom scenario documents are Xray-dialect; an engine that reads another
-/// spelling sits out with one named reason rather than failing every repeat,
-/// which would measure a parse error and report it as the engine. The default
-/// freedom shape runs everywhere, so this only ever triggers on a named
-/// scenario. Split out so `run` stays under the line budget.
 fn participant_names(
     engines: &[Engine],
     workload: &Workload,
@@ -1102,14 +810,6 @@ fn participant_names(
                 ));
                 return false;
             }
-            // A protocol this engine does not serve is a roadmap row, not a fault.
-            // Checked against the scenario rather than by trying to start the
-            // engine, because the alternative is a startup failure whose message
-            // names a config field and reads as the engine being broken.
-            //
-            // Gated on the scenario naming a protocol at all: with nothing to
-            // compare against there is no reason to skip, and a reason that is
-            // not true is worse than no skip.
             if let Some(protocol) = protocol.filter(|_| !e.protocols.is_empty()) {
                 if !e.protocols.contains(&protocol) {
                     skipped.push((
@@ -1130,12 +830,6 @@ fn participant_names(
     (names, skipped)
 }
 
-/// Measure every engine against the workload, `repeats` times each.
-///
-/// The order is rotated and reversed by the repeat index (`stats::rotate`), so a
-/// systematic "the first engine measured is warmer" effect lands on both engines
-/// equally often. Each run writes its own `result.json` in the pinned harness's
-/// schema, so a run can be re-read or handed to the other harness afterwards.
 pub fn run(
     engines: &[Engine],
     workload: &Workload,
@@ -1160,9 +854,6 @@ pub fn run(
         )));
     }
 
-    // The ceiling is measured once per repeat, inside the loop below and
-    // interleaved with the engines, so that each repeat's engines and its ceiling
-    // are seconds apart rather than a sweep's worth of minutes apart.
     let mut ceilings: Vec<f64> = Vec::new();
 
     let mut by_engine: Vec<EngineRuns> = engines
@@ -1187,11 +878,6 @@ pub fn run(
             }
         }
         for name in stats::rotate(&names, repeat) {
-            // By name, not by position: `names` skips engines sitting the
-            // scenario out, so its indices do not match `engines`. Every name
-            // comes from `engines` two dozen lines above, so a miss would mean
-            // the list changed under the loop; skipping keeps that from
-            // measuring the wrong engine under the right name.
             let Some(engine) = engines.iter().find(|e| e.name == name) else {
                 continue;
             };
@@ -1207,10 +893,6 @@ pub fn run(
                     source,
                 }
             })?;
-            // Read the request back off disk rather than reusing the string that
-            // was written. The file is the artefact — it is what a reader inspects
-            // and what the other harness would be handed — so measuring from the
-            // in-memory copy would leave the published file unproven.
             let request = Request::read(&request_path)?;
             match parity::measure(&request, engine.config_arg, engine.dialect) {
                 Ok(run) => {
@@ -1223,20 +905,12 @@ pub fn run(
                         action: "writing result.json".into(),
                         source,
                     })?;
-                    // And read the result back, re-deriving every aggregate from
-                    // the raw fields beside it. A report that cannot be
-                    // re-derived from its own cells is a report nobody can check
-                    // (`upstream/zeronet/docs/benchmarks/harness/zbench/validate_results.py:11`),
-                    // so this runs on every run rather than in a test.
                     match revalidate(&result_path) {
                         Ok(checked) => {
                             debug_assert_eq!(
                                 checked.engine_sha256, run.engine_sha256,
                                 "the re-read result names a different binary"
                             );
-                            // By name, like the engine lookup above: skipped
-                            // engines keep an empty slot that must not collect
-                            // another engine's runs.
                             let Some(slot) = by_engine.iter_mut().find(|e| e.engine == name) else {
                                 continue;
                             };
@@ -1265,14 +939,6 @@ pub fn run(
     })
 }
 
-/// The host, recorded with the number because a number without its host is not a
-/// measurement.
-///
-/// Including the address every listener bound. That address comes from the
-/// routing table, so it changes when a VPN comes up, and a report that named
-/// only the OS and the CPU count would show two runs on the same runner as
-/// indistinguishable while they were measured through different interfaces. See
-/// [`parity::local_non_loopback_ipv4`].
 fn machine_description() -> String {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
@@ -1287,14 +953,6 @@ fn machine_description() -> String {
     )
 }
 
-/// Read a `result.json` back into a [`Run`], re-deriving its aggregates from its
-/// own raw fields and failing on any disagreement.
-///
-/// This is the counterpart to `ZeroNet`'s `validate_results.py` discipline: a stored
-/// result is re-read and its aggregates re-derived rather than trusted, because a
-/// report that cannot be re-derived from its own cells is a report nobody can
-/// check. It is also what lets a dated result group be re-gated later without
-/// re-measuring it.
 pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
     let text = std::fs::read_to_string(result_path).map_err(|source| Error::Io {
         action: format!("reading {}", result_path.display()),
@@ -1376,10 +1034,6 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
     })
 }
 
-/// Re-derive the two published aggregates from the raw fields beside them.
-///
-/// The tolerance is relative, so a large throughput is not held to a tighter
-/// absolute standard than a small one.
 fn check_derived(root: &Json, moved: f64, seconds: f64, cpu_millis: f64) -> Result<(), Error> {
     let num = |key: &str| {
         root.get(key)
@@ -1415,11 +1069,6 @@ fn check_derived(root: &Json, moved: f64, seconds: f64, cpu_millis: f64) -> Resu
     Ok(())
 }
 
-/// Re-derive the summary figures from the raw `ps` readings beside them.
-///
-/// The peak RSS must be the samples' maximum and the CPU total their delta. A
-/// summary that is not reachable from its own readings cannot be checked by
-/// anyone, including by this harness the next time it reads the file.
 fn check_samples(root: &Json, cpu_millis: f64) -> Result<(), Error> {
     let Some(items) = root.get("samples").and_then(Json::as_arr) else {
         return Err(Error::Invalid(
@@ -1458,7 +1107,6 @@ fn check_samples(root: &Json, cpu_millis: f64) -> Result<(), Error> {
     Ok(())
 }
 
-/// The raw readings, as `ps` produced them.
 fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
     root.get("samples")
         .and_then(Json::as_arr)
@@ -1491,7 +1139,6 @@ fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
 mod tests {
     use super::*;
 
-    /// An engine in the Xray family, which is `run -config <path>`.
     fn engine(name: &'static str, path: &str) -> Engine {
         Engine {
             name,
@@ -1584,10 +1231,6 @@ mod tests {
         assert_eq!(skipped, Vec::new());
     }
 
-    /// The engine the protocol table was written for: `xray-rust` at its pin
-    /// accepts `socks`, `http` and `tun` inbounds and rejects the rest
-    /// (`upstream/xray-rust/crates/xray-config/src/parser.rs:626`, at
-    /// `7a4fb2dd`).
     fn protocol_limited_engine() -> Engine {
         Engine {
             protocols: &["socks", "http", "tun"],
@@ -1602,14 +1245,6 @@ mod tests {
         }
     }
 
-    /// The bug this table was added for: a protocol scenario handed an engine
-    /// that cannot parse it, it exits during startup, and the harness reports
-    /// that as a **failed engine**.
-    ///
-    /// Asserted on the participant list, because that is where the report reads
-    /// it: an engine that sits out is named under `skipped`, which is the
-    /// roadmap, and one that starts and dies is named under the failures, which
-    /// is a fault. The distinction is the whole point of the table.
     #[test]
     fn an_engine_that_cannot_serve_the_scenarios_protocol_sits_out_with_a_reason() {
         let engines = vec![
@@ -1630,9 +1265,6 @@ mod tests {
             "the reason names the protocol and what the pin does accept: {reason}"
         );
 
-        // A carrier suffix is not part of the protocol: `vless-ws-down-8` is
-        // still `vless`, and reading only the leading rung is what keeps the
-        // transport out of the comparison.
         for id in [
             "vless-ws-down-8",
             "vless-grpc-down-8",
@@ -1654,25 +1286,11 @@ mod tests {
             );
         }
 
-        // And it is not skipped from a scenario it *can* serve.
         let (names, skipped) = participant_names(&engines, &scenario_workload("socks-down-1"));
         assert_eq!(names, vec!["xray-rust", "xray-core"]);
         assert_eq!(skipped, Vec::new());
     }
 
-    /// The case that makes the protocol table a trap if it is read naively.
-    ///
-    /// `--scenario` defaults to `gate5` (`main.rs`), and `run-parity.sh` --
-    /// which is gate 5 -- never passes one. So the ids that reach this function
-    /// are not all protocol-shaped: `gate5` is a *label for a run*, not a
-    /// protocol, and reading its leading rung as one skips an engine with the
-    /// reason "`gate5` is not served by xray-rust at its pin", which is a claim
-    /// about the engine that is not true and cannot be made true.
-    ///
-    /// A skipped engine is not a red row, it is an absent one, so this would
-    /// have cost gate 5 its comparator without going red: the worst way for a
-    /// gate to be wrong. The same holds for an empty scenario, where the leading
-    /// rung is the empty string.
     #[test]
     fn a_scenario_that_names_no_protocol_never_sits_an_engine_out() {
         let engines = vec![protocol_limited_engine()];
@@ -1687,17 +1305,6 @@ mod tests {
         }
     }
 
-    /// Every cell the matrix can run names a protocol [`protocol_of`] recognises.
-    ///
-    /// `SCENARIO_PROTOCOLS` is a second list next to the matrix that generates
-    /// the ids, and a second list is a promise to keep them in step. This reads
-    /// the ids back out of `scripts/lib-matrix.sh` rather than restating them
-    /// here, because a copy in the test would agree with the copy in the source
-    /// even when both had drifted from the shell.
-    ///
-    /// It reads the `echo` lines that name a cell: `<protocol>-<carrier>-...`
-    /// followed by a traffic word. The `full` tier and `standard_scenarios` are
-    /// both covered because both are read, and the smoke tier is one of them.
     #[test]
     fn every_matrix_scenario_id_names_a_protocol() {
         let script =
@@ -1713,8 +1320,6 @@ mod tests {
             let Some(id) = rest.split(' ').next() else {
                 continue;
             };
-            // A cell id is `<protocol>-<carrier>-...`; the `echo` lines that are
-            // not cells either end in a `.txt`/`.sh` path or hold prose.
             if id.split('-').count() >= 2 && !id.contains(['/', '"']) {
                 ids.push(id.to_owned());
             }
@@ -1793,8 +1398,6 @@ mod tests {
                 .collect(),
             _ => panic!("rows is an array"),
         };
-        // Twice as fast at half the CPU and memory: every row resolves better,
-        // with throughput reading higher-is-better and the rest lower-is-better.
         assert_eq!(
             pairs
                 .iter()
@@ -1809,9 +1412,6 @@ mod tests {
             .get("gate_passed")
             .and_then(Json::as_bool)
             .unwrap_or(false));
-        // The cost columns beside throughput: peak threads, cold start, and
-        // the transfer window. The charts read them from the cell, so the
-        // cell carries them even when a synthetic run has nothing to say.
         let engines = root.get("engines").expect("engines");
         let first_run = match engines {
             Json::Arr(items) => match items.first().expect("an engine").get("runs") {
@@ -1864,12 +1464,9 @@ mod tests {
         assert_eq!(root.get("warmup").and_then(Json::as_bool), Some(false));
     }
 
-    /// The request the harness builds must be one its own validator accepts —
-    /// otherwise the file it writes is not the file it would read back.
     #[test]
     fn the_request_it_writes_is_one_it_accepts() {
         let w = workload();
-        // The test binary itself: the one file every runner is guaranteed to have.
         let exe = std::env::current_exe().expect("a test binary has a path");
         let text = w.request(
             &engine("ferrox", &exe.to_string_lossy()),
@@ -1897,14 +1494,8 @@ mod tests {
         w.iterations = 100;
         w.payload_size = 16384;
         assert_eq!(w.flow_bytes(), 100 * 16_384);
-        // `upload` is one direction, so four flows is four times `flow_bytes`.
         assert_eq!(w.total_bytes(), 4 * 100 * 16_384);
 
-        // A full-duplex cell moves `flow_bytes` **each way**, so the total is
-        // twice the single-direction figure. Reading it as the single-direction
-        // number is what reported `moved 8589934592 of 4294967296` -- moved
-        // exactly twice what was asked, and called a short transfer -- and it
-        // failed six of the standard tier's eleven cells on every runner.
         let mut duplex = workload();
         duplex.traffic = "full-duplex".into();
         duplex.connections = 8;
@@ -1912,18 +1503,12 @@ mod tests {
         duplex.payload_size = 65536;
         assert_eq!(duplex.flow_bytes(), 16384 * 65536);
         assert_eq!(duplex.total_bytes(), 2 * 8 * 16384 * 65536);
-        // The report header prints this same figure, so the two cannot disagree:
-        // a reader comparing "MiB total" against what the run was asked for is
-        // reading a number this method produced.
         assert!(
             duplex.describe().contains("(16384 MiB total)"),
             "the header names the same figure the accounting does: {}",
             duplex.describe()
         );
 
-        // A download is one direction, and eight flows are eight times one flow:
-        // at one connection the two readings coincide, which is why a
-        // multi-connection bug here is invisible until a row uses eight.
         let mut down = workload();
         down.traffic = "download".into();
         down.connections = 1;

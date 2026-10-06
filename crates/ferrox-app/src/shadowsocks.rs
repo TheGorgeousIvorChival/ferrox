@@ -1,12 +1,3 @@
-//! `shadowsocks` chunk transport over `TCP` and datagrams over `UDP`, both roles.
-//!
-//! Salt first, then length-prefixed sealed chunks; the target address rides in
-//! the first chunk. Over `UDP` each datagram is its own salt plus one sealed
-//! address-and-payload chunk. The cipher table, the key derivation and the
-//! per-chunk `AEAD` are [`ferrox_core::shadowsocks`]'s, which is where the
-//! bit-identity proofs are; what is left here is the socket half, the address
-//! header and the relay.
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -17,14 +8,9 @@ use ferrox_core::shadowsocks::{Cipher, MasterKey, Method, LENGTH_LEN, MAX_CHUNK,
 
 use crate::proxy::{push_addr, read_exact, RELAY_POLL, UDP_BUF};
 
-/// Largest salt on the wire; each method sends its key length (16 for
-/// `aes-128-gcm`, 32 for the other two), which is what Xray-core's per-method
-/// `IVBytes` says and what the oracle's `aes-256-gcm` row checks.
 const SALT_LEN: usize = 32;
-/// Largest plaintext read per relay turn.
 const READ_CHUNK: usize = 0x4000;
 
-/// Serve one `shadowsocks` connection: salt, address chunk, dial, relay sealed.
 pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom: bool) {
     let Some(method) = Method::parse(method) else {
         return;
@@ -67,7 +53,6 @@ pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom
     pump_relay(&uplink, &stream, send, Recv::Ready(recv));
 }
 
-/// Serve one `shadowsocks` connection inside `WebSocket` messages.
 pub(crate) fn serve_ws(stream: TcpStream, password: &str, method: &str, path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
         return;
@@ -81,7 +66,6 @@ pub(crate) fn serve_ws(stream: TcpStream, password: &str, method: &str, path: &s
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-/// Serve one `shadowsocks` connection past the `HTTPUpgrade` `101`.
 pub(crate) fn serve_httpupgrade(
     stream: TcpStream,
     password: &str,
@@ -105,7 +89,6 @@ pub(crate) fn serve_httpupgrade(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-/// Serve one `shadowsocks` connection inside a `gRPC` tunnel.
 pub(crate) fn serve_grpc(
     stream: TcpStream,
     password: &str,
@@ -125,7 +108,6 @@ pub(crate) fn serve_grpc(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-/// Serve one `shadowsocks` connection inside `XHTTP` chunks.
 pub(crate) fn serve_xhttp(
     stream: TcpStream,
     password: &str,
@@ -146,7 +128,6 @@ pub(crate) fn serve_xhttp(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-/// Serve one `shadowsocks` connection past the camouflage `GET`.
 pub(crate) fn serve_httpheader(
     stream: TcpStream,
     password: &str,
@@ -170,7 +151,6 @@ pub(crate) fn serve_httpheader(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-/// Read one handshake off any byte stream: salt, sealed address, dial, answer salt.
 fn accept_on(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
@@ -199,7 +179,6 @@ fn accept_on(
     Some((uplink, send, Recv::Ready(recv)))
 }
 
-/// Dial a `shadowsocks` server for a target: salt and sealed address, no waiting.
 pub(crate) fn client_send_handshake(
     uplink: &mut dyn Write,
     password: &str,
@@ -221,15 +200,11 @@ pub(crate) fn client_send_handshake(
     Some((send, Recv::Waiting(method, master)))
 }
 
-/// Receive cipher: ready, or still waiting on the peer's salt.
 pub(crate) enum Recv {
-    /// Salt read, cipher derived; unboxed, since the schedules inside are already.
     Ready(Cipher),
-    /// Salt unread; the method and the master key to derive it from on arrival.
     Waiting(Method, MasterKey),
 }
 
-/// Relay plaintext one side against sealed chunks the other, both ways to close.
 pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Cipher, recv: Recv) {
     let Ok(sealed_read) = sealed.try_clone() else {
         return;
@@ -246,7 +221,6 @@ pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Cipher, re
     pump_relay_carried(plain, sealed_read, sealed_write, &close, send, recv);
 }
 
-/// Relay plaintext against sealed chunks where the sealed side is a carrier.
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &TcpStream,
     mut reader: R,
@@ -307,15 +281,6 @@ pub(crate) fn pump_relay_carried<R, W>(
     let _ = done.join();
 }
 
-/// Serve `shadowsocks` datagrams on an address: open each packet, forward its
-/// payload where it says, seal every reply back to its client.
-///
-/// Two sockets like the direction split in [`pump_relay`]: one bound here
-/// talks to clients only, one ephemeral talks to targets only, so replies and
-/// requests never need demultiplexing. Replies map to clients by target, last
-/// writer wins; the table is bounded because a legitimate client re-establishes
-/// its entry on its next datagram. Both sockets poll on [`RELAY_POLL`]
-/// windows, which costs idle wakeups per inbound rather than per flow.
 pub(crate) fn serve_udp(address: &str, password: &str, method: &str, freedom: bool) {
     let Ok(clients) = UdpSocket::bind(address) else {
         return;
@@ -323,19 +288,6 @@ pub(crate) fn serve_udp(address: &str, password: &str, method: &str, freedom: bo
     serve_udp_on(&clients, password, method, freedom);
 }
 
-/// [`serve_udp`] on a socket the caller has already bound.
-///
-/// The bind belongs to the caller so that a caller who needs to know the port can
-/// read it off the socket instead of guessing one: a server that binds `:0` in
-/// here has no way to tell anyone, and a caller that picks a port and asks for it
-/// to be bound later is in a race with every other socket in the process. It also
-/// makes the one failure that matters visible instead of silent. Every early
-/// return in this body is a `return` with nothing said, so a `serve_udp` whose
-/// bind failed was indistinguishable from a client that never answered -- which is
-/// exactly what `shadowsocks_udp_reaches_echo` reported on `windows x86_64` after
-/// the `QUIC` dial landed: fifteen retries, each failing in milliseconds because
-/// the port nothing was listening on answered with `ICMP port unreachable`, and
-/// on Windows that error poisons the sending socket for every later read.
 pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, freedom: bool) {
     let Some(method) = Method::parse(method) else {
         return;
@@ -388,7 +340,6 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     }
 }
 
-/// Seal every `MAX_CHUNK` slice of plaintext into length-plus-payload chunks.
 fn seal_all(
     send: &mut Cipher,
     plain: &[u8],
@@ -403,13 +354,6 @@ fn seal_all(
     Ok(())
 }
 
-/// Seal one plaintext slice plus its tag onto the stream, staging through the
-/// caller's buffer: the old per-chunk `to_vec` allocated and copied every
-/// chunk on the way out, and `staging` is already warm after the first one.
-///
-/// The sixteen tag bytes ride behind the ciphertext in the same write — one
-/// `write_all` where there were two, same bytes in the same order, so a peer
-/// reading length-plus-tag and body-plus-tag off the byte stream cannot tell.
 fn seal_into(
     send: &mut Cipher,
     plain: &[u8],
@@ -424,12 +368,6 @@ fn seal_into(
     Ok(())
 }
 
-/// Open one length-plus-payload chunk pair into the caller's buffer.
-///
-/// Returns the plaintext borrowed from `chunk`: a function handing back `&'a [u8]`
-/// tied to `&'a mut Vec<u8>` cannot also have copied it somewhere, because there
-/// is nowhere to return it from. The length prefix rides on the stack; `chunk`
-/// is resized, never reallocated, so only growth past its high-water mark memsets.
 fn open_chunk<'a>(
     stream: &mut dyn Read,
     recv: &mut Cipher,
@@ -451,20 +389,10 @@ fn open_chunk<'a>(
     Some(&chunk[..plain])
 }
 
-/// Decrypt one sealed buffer in place, returning the plaintext length.
-///
-/// The plaintext is the buffer's own prefix; returning its length instead of a
-/// fresh `Vec` removes one allocation and one copy per chunk.
 fn open_into(recv: &mut Cipher, chunk: &mut [u8]) -> Option<usize> {
     recv.open_in_place(chunk)
 }
 
-/// Seal one `UDP` datagram: fresh salt plus the address and payload sealed
-/// under it as a single chunk.
-///
-/// A fresh salt per datagram means the nonce starts at zero every time, which
-/// is what makes the zero nonce safe: no key-nonce pair ever repeats. Same
-/// bytes as Xray-core's `EncodeUDPPacket`, down to the salt lengths.
 pub(crate) fn seal_udp_datagram(
     master: &MasterKey,
     method: Method,
@@ -487,11 +415,6 @@ pub(crate) fn seal_udp_datagram(
     Some(out)
 }
 
-/// Open one `UDP` datagram into destination and payload.
-///
-/// Salt length follows the method like everywhere else here; anything shorter
-/// than salt plus tag, or with a tag that does not match, is dropped rather
-/// than answered, so a scanner learns nothing per probe.
 pub(crate) fn open_udp_datagram(
     master: &MasterKey,
     method: Method,
@@ -508,7 +431,6 @@ pub(crate) fn open_udp_datagram(
     Some((target, sealed[used..len].to_vec()))
 }
 
-/// Parse a `SOCKS`-order address header, returning the target and bytes used.
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     let &atyp = buf.first()?;
     match atyp {
@@ -560,7 +482,6 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
 mod tests {
     use super::*;
 
-    /// Every method this rung names, with the spellings a real `ss://` link uses.
     fn methods() -> [(&'static str, Method); 8] {
         [
             ("aes-128-gcm", Method::Aes128Gcm),
@@ -574,13 +495,6 @@ mod tests {
         ]
     }
 
-    /// The application's own framing — length sealed as a chunk of its own, then
-    /// the payload — for every method and every spelling, over a real socket.
-    ///
-    /// This is the row the cipher table exists for: a `serve` that used to compare
-    /// the `method=` string against `"aes-256-gcm"` and close the connection on
-    /// anything else now carries a `ping` for all three. The bytes themselves are
-    /// `ferrox_core::shadowsocks`'s business and are proved there.
     #[test]
     fn every_named_method_and_spelling_relays_an_echo() {
         for (name, method) in methods() {
@@ -634,9 +548,6 @@ mod tests {
         }
     }
 
-    /// A method this rung does not name is still refused, and refused by closing
-    /// rather than by relaying: the neighbours are in the matrix and this rung's
-    /// boundary is a decision, not an accident.
     #[test]
     fn a_method_outside_the_rung_is_refused() {
         for name in [
@@ -672,12 +583,6 @@ mod tests {
         }
     }
 
-    /// Every carrier this rung names relays an echo both ways over loopback.
-    ///
-    /// The framing is [`ferrox_core::shadowsocks`]'s business and is proved
-    /// there; what this proves is the plumbing: the salt and the sealed chunks
-    /// are the same bytes through `ws` messages, the `httpupgrade` `101`,
-    /// `gRPC` `Hunk` envelopes and `xhttp` chunks as through raw `TCP`.
     #[test]
     fn carried_transports_relay_an_echo() {
         fn echo() -> u16 {
@@ -775,8 +680,6 @@ mod tests {
         round_trip(&mut reader, &mut writer, &target);
     }
 
-    /// The framing's own round trip: the length is sealed as a chunk of its own,
-    /// then the payload, and a damaged chunk never reaches the caller.
     #[test]
     fn chunks_open_that_seal_sealed_and_reject_damage() {
         let salt = [7u8; SALT_LEN];
@@ -799,9 +702,6 @@ mod tests {
         assert!(open_chunk(&mut damaged, &mut fresh, &mut Vec::new()).is_none());
     }
 
-    /// Salt sizes follow the method: 16 for `aes-128-gcm`, 32 below, on sends
-    /// and receives alike, which is what the oracle checks for `aes-256-gcm`
-    /// and what Xray-core's per-method `IVBytes` says for the rest.
     #[test]
     fn udp_salts_follow_the_method() {
         for (name, salt_len) in [
@@ -821,7 +721,6 @@ mod tests {
         }
     }
 
-    /// Sealed datagrams open only with the right password and intact bytes.
     #[test]
     fn udp_datagrams_reject_damage() {
         let method = Method::Aes256Gcm;

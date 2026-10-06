@@ -11,64 +11,21 @@ description = "ZeroNet-compatible application built on the released ferrox-core 
 workspace = true
 
 [dependencies]
-# Single-block cipher for `VMess` auth ids.
 aes = "0.8"
-# AEAD for the `VMess` data frames; the `shadowsocks` `aes-*` methods moved to
-# `ferrox_core::shadowsocks` with the rest of the cipher half.
 aes-gcm = "0.10"
-# The ZeroNet app on the *released* core: `version = "0.1.0"` is the requirement
-# (see the workspace `ferrox-core` entry) and `path` is the checkout fallback
-# so this builds without a registry. Releasing `ferrox-core 0.1.0` keeps this
-# line unchanged — the version requirement is what stops the app from silently
-# building against an older core. No Xray-core/sing-box/xray-rust/PattNG/ZeroNet
-# source is copied here; links are parsed by `ferrox_core::vless`.
 ferrox-core = { workspace = true }
-# Portable randomness for `x25519` key generation (no other entropy source).
 getrandom = "0.2"
-# The `QUIC` dial stack (pinned in `upstream/pins.toml`): `BoringSSL` inside
-# needs `cmake` and a C toolchain at build time (`nasm` too on Windows), which
-# is why it is the workspace's only C dependency — see the `rustls` entry in
-# the workspace manifest. Only `quic.rs` may reach it.
 quiche = "0.30"
-# The relay's Linux zero-copy path. `splice(2)` is what the pinned Go core uses to
-# move bytes between two sockets there — `net.TCPConn.ReadFrom` — and it is the
-# whole of the gate-5 gap on Linux: ferrox reads 0.774x of Xray-core on
-# `linux aarch64` and 1.237x on `macos aarch64`, same ISA, same relay, because Go
-# splices on one and memcpys on the other. `libc` is already in this graph through
-# `rustls`, so naming it adds no crate; it is `#[cfg(target_os = "linux")]`-gated in
-# the source, so nothing links it on macOS or Windows.
 libc = "0.2"
-# Master keys for the `shadowsocks` chunk transport (`EVP_BytesToKey`).
 md5 = "0.7"
-# Hash behind the `shadowsocks` subkey derivation, which moved to
-# `ferrox_core::shadowsocks` with the rest of the cipher half.
 sha1 = "0.10"
-# Length masking stream for the `VMess` rung (`SHAKE128`).
 sha3 = { version = "0.10", features = ["asm"] }
-# Password hashing for the `trojan` handshake (`SHA224`, hex). No `asm` here:
-# it is added per-target below, because `sha2/asm` feeds GAS `.S` files to the
-# C compiler and MSVC `cl` rejects them (`LNK1181` on `windows x86_64`).
 sha2 = { version = "0.10" }
-# Real X25519 for the `x25519` subcommand the oracle seams call for keys.
 x25519-dalek = "2"
 
 [dev-dependencies]
-# The `AEAD` the data path used before `ferrox_core::aead` took over, used
-# *only* by the differential test that decides whether the swap is allowed in.
-# A dev-dependency is not linked into the shipped binary, which is the whole
-# point: if the shipped path could reach it, "bit-identical" would be a
-# statement about this crate comparing itself.
 chacha20poly1305 = "0.10"
-# Self-signed certificates minted at test time for the `QUIC` loopback: the
-# server side needs a chain and key no fixture file may carry (fixtures are
-# assertions, and an assertion checked into the tree stops asserting anything
-# the day it rots). Pure Rust, test-only like the entry above.
 rcgen = "0.13"
 
-# Hardware SHA where the toolchain can assemble it. Cargo features are purely
-# additive across tables, so the base `sha2` above stays bare and this table
-# adds `asm` back everywhere except Windows: on `windows x86_64` nobody
-# enables it, `sha2-asm` leaves the unit graph, and its build script never
-# runs. Same API either way — `asm` only swaps the backend.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

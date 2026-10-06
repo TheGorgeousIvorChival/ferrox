@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Validate a benchmark matrix bundle: schema, verdicts, digests, freshness.
 
 Re-derives every verdict from its interval with the whole-interval rule and

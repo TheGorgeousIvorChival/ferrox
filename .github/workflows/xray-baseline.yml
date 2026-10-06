@@ -1,6 +1,5 @@
 name: xray-baseline
 
-# Informational, not a gate: runs all pinned xray-core Go tests against upstream itself. Test failures never fail this job; only infra failures (bad pin, no Go) go red.
 
 on:
   pull_request:

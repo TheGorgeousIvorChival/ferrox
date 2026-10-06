@@ -1,20 +1,5 @@
 name: deps
 
-# The dependency graph's licence and provenance claims, checked rather than
-# asserted. `deny.toml` is what makes "every dependency permits MIT OR Apache-2.0"
-# a fact about the graph instead of a sentence in the root `Cargo.toml`.
-#
-# It has its own workflow rather than a job in `ci.yml` for the reason `pins.yml`
-# does: this question only changes when a manifest changes, and a Markdown edit
-# outside `crates/` should start nothing at all. The `paths` filter below is what
-# makes that true, so adding a job here costs nothing on a docs-only pull request.
-#
-# No `push: main` leg. The pull request is where a licence event is cheap to
-# catch, and a merge cannot introduce a dependency the pull request did not — the
-# graph in `main` is the graph a green pull request merged. The schedule below
-# covers `main` on its own, which also means the two automated commiters
-# (`safety.yml`, `benchmark-matrix.yml` refresh) no longer each start a
-# `cargo-deny` install to re-verify a lockfile nobody touched.
 on:
   pull_request:
     paths:
@@ -24,9 +9,6 @@ on:
       - "crates/*/Cargo.toml"
       - ".github/workflows/deps.yml"
   schedule:
-    # Weekly, because an advisory is published against a version already in
-    # `Cargo.lock` and no manifest edit is needed for the graph to become
-    # unsound.
     - cron: "41 5 * * 1"
   workflow_dispatch:
 
@@ -41,23 +23,12 @@ jobs:
   deny:
     name: licence, source and advisory policy
     runs-on: ubuntu-latest
-    # `cargo-deny` reads the graph and downloads the RUSTSEC advisory database.
-    # An hour is generous for both; the default six hours is only ever reached by
-    # a hung registry read.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # Pinned rather than floating: a dependency-policy tool that changes under
-      # the policy it is enforcing can start failing the build without a change to
-      # this repository, and that failure would be indistinguishable from a real
-      # finding.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: Cargo.toml
-          # `deny.toml` at the root is the default; named here so a rename shows
-          # up as this job failing rather than as a silently default policy.
           deny-path: deny.toml
           command: check advisories bans licenses sources
-          # A lockfile the job did not read is a policy check over nothing, and
-          # this job's only output is that verdict.
           use-lockfile: true

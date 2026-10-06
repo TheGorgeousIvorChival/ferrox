@@ -1,19 +1,3 @@
-//! The pinned upstream implementation, and what it actually compiles to.
-//!
-//! This module is deliberately small. The keystream itself lives in the
-//! crate-private `chacha` module; what remains here is the thing the keystream
-//! is *checked against*, and the honest name of the backend that check runs on.
-//!
-//! Both are compiled out of every shipped build, behind `cfg(test)` or the
-//! `bench-reference` feature. If the shipped path could reach the reference,
-//! then "bit-identical" would be a claim about comparing the reference against
-//! itself.
-//!
-//! The cipher traits are imported inside `reference_xor` rather than at module
-//! scope for the same reason: a module-scope import would warn in exactly the
-//! builds that must stay warning-free.
-
-/// The reference: the `chacha20` crate, used only by tests and benchmarks.
 #[cfg(any(test, feature = "bench-reference"))]
 pub fn reference_xor(key: &[u8; 32], nonce: &[u8; 12], start: u32, buf: &mut [u8]) {
     use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
@@ -22,18 +6,6 @@ pub fn reference_xor(key: &[u8; 32], nonce: &[u8; 12], start: u32, buf: &mut [u8
     c.apply_keystream(buf);
 }
 
-/// Which backend the `chacha20` crate actually compiled on this build, and how
-/// many blocks it keeps in flight per iteration.
-///
-/// This exists because the crate does not choose its NEON backend on aarch64.
-/// Its `backends.rs` only selects NEON when a `chacha20_force_neon` cfg is set,
-/// and nothing in the crate sets it, so on aarch64 it silently runs the scalar
-/// `soft` backend at one block per iteration. A benchmark that compared against
-/// "chacha20 0.9.1" without saying so would credit that gap to this workspace's
-/// own work. So the name is reported, not inferred.
-///
-/// The x86 answer is a runtime CPUID check, which is the same source of truth
-/// the reference itself uses (`cpufeatures::new!(avx2_cpuid, "avx2")`).
 #[cfg(any(test, feature = "bench-reference"))]
 pub fn backend() -> &'static str {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -48,7 +20,6 @@ pub fn backend() -> &'static str {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // Not "neon": the crate will not use it here. See the doc comment.
         "chacha20 0.9 / soft scalar, 1 block per iteration (its NEON backend is gated behind a cfg nothing sets)"
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
@@ -65,16 +36,10 @@ mod tests {
     fn every_rung_matches_the_reference() {
         let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
         let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(53).wrapping_add(7));
-        // A second pair, so nothing passes by being right for one constant input.
         let key2: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(97).wrapping_add(29));
         let nonce2: [u8; 12] =
             std::array::from_fn(|i| (i as u8).wrapping_mul(101).wrapping_add(61));
 
-        // Cross every rung boundary, both sides of it, and every 512-byte group
-        // boundary. The group boundaries are the ones that matter most: a length
-        // below the second group never reaches the loop that advances the
-        // counter, so a sweep that stops at 1023 cannot tell a correct core from
-        // one that replays the first group's keystream forever.
         for len in [
             0usize, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 383, 384, 447, 448, 511, 512, 513,
             575, 576, 639, 640, 767, 768, 769, 1023, 1024, 1025, 1087, 1088, 1089, 1535, 1536,
@@ -94,8 +59,6 @@ mod tests {
 
     #[test]
     fn the_second_group_is_not_the_first_group() {
-        // Stated directly, so the failure names the cause rather than only
-        // reporting that some 1024-byte buffer came out wrong.
         let key = [7u8; 32];
         let nonce = [9u8; 12];
         let mut first = vec![0u8; 512];

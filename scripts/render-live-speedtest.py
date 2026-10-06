@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Render a live speedtest report from attempt records.
 
 Reads `records.jsonl` (one JSON object per config x core x repeat attempt,
@@ -121,9 +120,6 @@ def write_summary(out_dir, meta, configs):
         "",
         f"_Measured {meta.get('date', '?')} on {meta.get('host', '?')}. "
         f"Target: `{meta.get('target', '?')}` "
-        # Whichever digest the run carried, named by its algorithm. Printing
-        # "sha256: unverified" for an MD5-verified download would misreport the
-        # check that actually ran.
         f"({digest_note(meta)}). "
         "One config at a time, one core at a time: same server, same path, "
         "same hour. These are end-to-end numbers (server plus path plus "

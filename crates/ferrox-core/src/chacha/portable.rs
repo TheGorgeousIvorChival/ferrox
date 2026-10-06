@@ -1,18 +1,5 @@
-//! The portable backend: four words per register, in plain arrays.
-//!
-//! This is the only backend with no `unsafe` in it, which is the point. Miri
-//! interprets the whole of it — the ladder, the counter arithmetic, the group
-//! boundaries, every store offset — so the arithmetic the other backends copy is
-//! machine-checked for use-after-free, out-of-bounds access and leaks without
-//! needing a target-specific interpreter. The architecture modules are then thin
-//! enough to review as five instructions each.
-
 use super::Lanes;
 
-/// `rotate_left` as a function value, for `array::map`.
-///
-/// `u32::rotate_left::<N>` cannot be turbofished as a path — it names the method,
-/// not a value — so each rotation needs its own monomorphised shim.
 macro_rules! rols {
     ($($name:ident => $n:expr),* $(,)?) => {
         $(
@@ -23,7 +10,6 @@ macro_rules! rols {
 }
 rols!(rotl16 => 16, rotl12 => 12, rotl8 => 8, rotl7 => 7);
 
-/// Four 32-bit words: one register of one state.
 #[derive(Clone, Copy)]
 pub(crate) struct U4(pub(crate) [u32; 4]);
 
@@ -84,8 +70,6 @@ impl Lanes for U4 {
     #[inline]
     fn rot_chunks(self, n: usize) -> Self {
         let a = self.0;
-        // `n` is one of three literals at every call site, so the modulo folds
-        // away and this is a fixed shuffle.
         Self([a[n % 4], a[(n + 1) % 4], a[(n + 2) % 4], a[(n + 3) % 4]])
     }
 
@@ -107,18 +91,6 @@ impl Lanes for U4 {
     }
 }
 
-/// XOR one block of keystream at `counter` over `out`, which may be shorter than
-/// 64 bytes, and return the one block it generated.
-///
-/// This is the tail of every rung, so it is the one place a partial block is
-/// produced. Generating a whole block and copying out the part that was wanted is
-/// the cost the record layer exists to remove, so a short `out` is rounded *down*:
-/// only the words that fall inside `out` are touched, and no keystream beyond the
-/// caller's buffer is ever computed for it.
-///
-/// Not compiled on `x86_64`, where [`super::sse2`] is the one-block core: the
-/// portable one is scalar code there, and nothing else in this module needs a
-/// one-block entry.
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn xor_block(state: &[u32; 16], counter: u32, out: &mut [u8]) -> u32 {
     let mut state = *state;
@@ -136,10 +108,6 @@ pub(crate) fn xor_block(state: &[u32; 16], counter: u32, out: &mut [u8]) -> u32 
         regs[0][g] = regs[0][g].add(init[0][g]);
     }
 
-    // Sixteen bytes at a time while a whole chunk is inside `out`, then the words
-    // that are left, one at a time, so a tail ending mid-word touches only the
-    // bytes it owns. Every index is bounded by `out.len()`, so a write past the
-    // end is an index panic rather than a silent overrun.
     let (chunks, tail) = out.as_chunks_mut::<16>();
     for (chunk, reg) in chunks.iter_mut().zip(regs[0].iter()) {
         reg.xor_chunk(0, chunk);
@@ -161,6 +129,5 @@ pub(crate) fn xor_block(state: &[u32; 16], counter: u32, out: &mut [u8]) -> u32 
             *dst ^= k;
         }
     }
-    // One block of rounds ran, whatever fraction of it the caller had room for.
     1
 }

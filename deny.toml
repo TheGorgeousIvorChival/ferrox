@@ -1,61 +1,22 @@
-# Dependency policy: a new licence or source must be reviewed, never assumed in.
-#
-# Every dependency here permits `MIT OR Apache-2.0`, which is what the root
-# `Cargo.toml` says and what `LICENSE-MIT` / `LICENSE-APACHE` carry. This file is
-# what makes that a checked claim rather than an assertion: `bans` refuses a
-# wildcard version so a transitive `foo = "*"` cannot silently become the newest
-# release in a graph nobody re-reviewed, `sources` refuses anything that is not
-# crates.io so no dependency arrives from a URL whose content is not pinned by a
-# revision in this repository, and `licenses.allow` is an explicit list rather
-# than a wildcard.
-#
-# Run by `.github/workflows/deps.yml` on every pull request that touches
-# `Cargo.toml`, `Cargo.lock`, this file, or a crate's `Cargo.toml`. `advisories`
-# needs no ignore entries today, and an entry added to silence an advisory needs a
-# `reason` in the same edit — the comment above it says why each one is absent.
-#
-# Licence-clean by construction, like the rest of the tree: `upstream/` is read
-# for behaviour and executed from its pin, never vendored, so no upstream
-# licence enters this graph to be allowed here. See `docs/conformance.md`.
 
 [advisories]
-# A crate nobody maintains is a crate nobody will patch, and this tree's claim is
-# that its bytes are bit-identical to a pinned reference forever.
 unmaintained = "workspace"
 unsound = "all"
 yanked = "deny"
 
 [bans]
-# Two versions of one crate in one graph is a way for a per-crate `patch` to
-# select the wrong one, and this repository has no `patch` section today.
 multiple-versions = "warn"
-# A wildcard version resolves to whatever is newest at build time, which is the
-# opposite of the pin discipline every upstream comparator in `upstream/pins.toml`
-# is held to. `allow-wildcard-paths` covers this repository's own crates, which
-# carry `version` and a `path` and are not published.
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 deny = [
-  # The two crates this work replaces, and the two that would make its licence
-  # undecidable if they entered the graph: sing-box is GPL-3.0 and PattNG is
-  # GPL-3.0, so either one linking in would put a copyleft obligation on code
-  # this repository claims is `MIT OR Apache-2.0`. They are read at their pins
-  # under `upstream/`, which is where a comparator belongs.
   { name = "sing-box", reason = "GPL-3.0; a comparator is read at its pin, never linked" },
   { name = "v2ray-rust", reason = "the upstream implementation ferrox-core replaces" },
-  # Copyleft reach: a link-time dependency on any of these would put an
-  # obligation on the shipped binary. None is in the graph today.
   { name = "gpl-3.0", reason = "no copyleft dependency may enter the graph" },
 ]
 
 [licenses]
-# 0.8 is cargo-deny's default and is the floor at which a licence expression is
-# understood well enough to compare against this list.
 confidence-threshold = 0.8
-# Every licence currently in `Cargo.lock`, with no wildcard and nothing accepted
-# on faith. `Unicode-3.0` and `Unlicense OR MIT` arrive through `url`/`idna`;
-# `MPL-2.0` through `option-ext`; the LLVM exception through `zerocopy`.
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
@@ -69,16 +30,9 @@ allow = [
   "Unlicense",
   "Unicode-3.0",
 ]
-# The dual-permissive spellings a crate may use, checked rather than assumed:
-# every one of these resolves to a licence already in `allow` above.
 allow-osi-fsf-free = true
 
 [sources]
-# Nothing but crates.io. A git dependency is a URL whose content can change under
-# a fixed revision string on a forge that allows force-push, and the only git
-# source this project would ever need is `upstream/` — which is read from a
-# checkout `scripts/fetch-upstream.sh` derives at a pinned commit, and is not a
-# Cargo dependency at all.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

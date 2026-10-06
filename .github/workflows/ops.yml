@@ -1,10 +1,5 @@
 name: ops
 
-# Exact operation counts are deterministic where durations are not, so this
-# workflow gates them: a diff that changes what a hot function executes must
-# say so in scripts/expected-ops.txt, with the measured number blessed by a
-# human who read the diff. Linux-only: valgrind and strace exist there, and
-# nowhere else that matters here, without a toolchain fight.
 on:
   pull_request:
     paths:
@@ -21,30 +16,17 @@ jobs:
   counts:
     name: exact operation counts
     runs-on: ubuntu-latest
-    # Callgrind interprets the test machine instruction by instruction, so this is
-    # minutes rather than seconds even though it counts one symbol. The default
-    # six-hour ceiling is only ever reached by a hang.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Its own key, not `ci`'s: this job builds with `RUSTFLAGS: -C
-      # debuginfo=line-tables-only` and that changes every fingerprint in the
-      # graph. Sharing the key would make this job evict `ci`'s cache and
-      # `ci`'s next run evict this one, so both pay full price forever.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ops-line-tables
       - name: install the counting tools
-        # `--no-install-recommends` because the recommended set pulls in a
-        # desktop and a mail transfer agent for a headless counter.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends valgrind strace
-      # Line tables only: release inlining folds small functions into their
-      # callers, and without line info callgrind cannot attribute them back,
-      # so the gated symbols vanish. This changes no generated instruction,
-      # only the map back to source.
       - name: check exact counts
         env:
           RUSTFLAGS: -C debuginfo=line-tables-only

@@ -1,33 +1,10 @@
 name: safety
 
-# Memory safety moves at a slower speed than development: Miri interprets
-# rather than executes, so it takes hours and would hold every push hostage for
-# a verdict that changes only when the `unsafe` surface or the nightly
-# toolchain does. It therefore runs once a week, and writes its one-line verdict
-# into the README status table itself — so the claim "no use-after-free, no
-# leak" carries the date it was checked rather than living in somebody's head.
-#
-# Weekly, not three times a week and not daily. Miri interprets rather than
-# executes: it reads every instruction a test performs, which is what makes it
-# worth a runner, and it is the slowest thing in this repository by an order of
-# magnitude. What it interprets changes only when the `unsafe` surface or the
-# nightly toolchain does — a weekly interval means a verdict is never more than
-# seven days old, and the README row carries that date, so the claim reads as a
-# dated measurement rather than as somebody's memory of one.
 on:
   schedule:
-    # Mondays, 03:11 UTC. Deliberately alone in that hour: the nightly `ci.yml`
-    # runs at 06:37 and the daily timing workflows from 03:41 onwards, so Miri
-    # never shares a runner with anything that needs a quiet CPU for a
-    # measurement — which matters more here than anywhere, because Miri is
-    # already interpreting in slow motion and a co-tenant's cache pressure shows
-    # up as a timeout rather than as a slower number.
     - cron: "11 3 * * 1"
   workflow_dispatch:
 
-# Never cancelled and never run twice at once: the last step rewrites one README
-# row and rebases onto `main` before pushing, so a cancelled run is a half-finished
-# rebase against the default branch with a verdict row staged.
 concurrency:
   group: safety-${{ github.ref }}
 
@@ -37,110 +14,32 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # The same cfgs as ci.yml. Inert here, and the reason is reachability rather than
-  # a feature probe reading false: this job interprets `-p ferrox-core`, whose
-  # ChaCha20 and Poly1305 are this repository's own portable Rust, so nothing in
-  # what Miri executes is built differently by them. On the `ubuntu-latest` x86_64
-  # runner both crates ignore the cfgs anyway, since they gate on `aarch64`.
-  #
-  # What Miri cannot reach, and why each is not a loss of coverage rather than a
-  # hole in it:
-  #
-  # - `sha2/asm`, which `4c45c1c` briefly put in this crate. Its `sha256_compress`
-  #   is an `extern "C"` declaration, and the run died four hours in on
-  #   `tls::reality::tests::a_short_id_is_zero_padded_to_eight_bytes` with
-  #   `unsupported operation: can't call foreign function 'sha256_compress'`. The
-  #   dependency no longer asks for the feature; nothing shipped loses the backend,
-  #   because Cargo unifies features and `ferrox-app` still enables it.
-  # - Fifteen `TLS` and `REALITY` tests: nine that bind a loopback listener, and
-  #   six more that reach `ring`. Miri's isolation has no `socket(2)` and `ring` is C
-  #   and assembly. Each carries `#[cfg_attr(miri, ignore)]` with that reason on the
-  #   attribute rather than being deleted, so they run in every other build:
-  #   `ci.yml`'s matrix runs them on three operating systems and `conformance.yml`
-  #   runs the pinned Xray-core suite against a built `ferrox-app`. Two
-  #   `REALITY` tests stay in — the ones that only scan a `ClientHello` for an
-  #   `X25519` share, which is byte work plus `x25519-dalek` and no `ring`.
-  # - The architecture intrinsics, which is what the existing README row already
-  #   says: the SIMD cores are checked by the differential test, not by Miri.
-  #
-  # So the verdict covers the safe-Rust core — the ChaCha20 ladder and its counter
-  # arithmetic and every store offset, Poly1305, the record framing and the AEAD —
-  # and says so rather than implying more.
   RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
 
 jobs:
-  # Sharded, because Miri's cost is per *test* and the tests do not need each
-  # other. One `cargo miri test -p ferrox-core` interprets all 159 of them in a
-  # single process, sequentially, and that is the four-hour run this file used to
-  # schedule. Six runners interpret the same 159 in parallel, so the wall time is
-  # the slowest shard rather than the sum — the same coverage, the same verdicts,
-  # the same README row, and no longer a four-hour window during which `main`
-  # moves far enough to turn the rebase below into a conflict.
-  #
-  # The partition is by *module*, because cost tracks module and not test count:
-  # `poly1305` is 3000 lines of interpreted arithmetic behind thirteen tests,
-  # while `core` is two. So the shards are weighted rather than equal — 13 / 23 /
-  # 7 / 62 / 49 / 5 tests, which is not a flat split on purpose.
-  #
-  # libtest takes several positional filters and unions them, so each shard is a
-  # list of module prefixes rather than one prefix with a pile of `--skip`s. That
-  # matters for a reason beyond tidiness: a complement shard (`--skip` everything
-  # the others took) silently stops covering a module the day someone adds one,
-  # and it stops covering it *quietly*. Named modules cannot lose a test that
-  # exists. The five library shards cover all 154 `--lib` tests and the sixth is
-  # the `parsers` integration binary, and every shard asserts it interpreted at
-  # least one test, so a mistyped filter is red rather than a PASS.
   miri:
     name: miri (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # One and a half hours. The heaviest shard has finished well inside this on a
-    # warm cache; the ceiling is here so a regression that sends Miri down an
-    # exponential path costs one runner-hour rather than the six-hour default.
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          # The modular arithmetic core alone. It is the densest interpreted loop
-          # in the crate — 64-bit limbs multiplied and reduced, no I/O, no
-          # allocation — and it is the one a Miri verdict is most worth having.
           - shard: poly1305
             target: --lib
             filters: "poly1305::"
-          # The record framing, the AEAD wrapper over it, and both AES cores:
-          # `record::` is where every store offset into a caller-supplied buffer
-          # is computed, so an out-of-bounds write would land here first.
           - shard: record-aead
             target: --lib
             filters: "record:: aead:: aesgcm::"
-          # The ChaCha ladder and the calibration that chooses between cores.
-          # `chacha::` covers `chacha/calibrate` too, which is the only place a
-          # clock read exists, and Miri checking that it cannot reach the output
-          # is the whole reason that file is a named exception in
-          # `check-leak-surface.sh`.
           - shard: chacha
             target: --lib
             filters: "chacha::"
-          # The parsers and the protocol surface: multiplexing, VLESS, transport
-          # framing, address parsing, Shadowsocks. The largest shard by test count
-          # and the one that gains most from parallelism, because these tests
-          # build and tear down structures rather than call a cipher in a loop.
           - shard: protocols
             target: --lib
             filters: "mux:: vless:: transport:: addr:: shadowsocks::"
-          # The relay and everything around a connection's lifetime: KCP's
-          # window and segment machinery, the TLS and REALITY adapters, the
-          # failure taxonomy, and the crate's own re-exports. The REALITY tests
-          # here are the two that only scan a `ClientHello` for an `X25519`
-          # share; the fifteen that bind a listener or reach `ring` carry
-          # `#[cfg_attr(miri, ignore)]` and are skipped by Miri itself.
           - shard: relay
             target: --lib
             filters: "kcp:: tls:: failure:: core::"
-          # `crates/ferrox-core/tests/parsers.rs` is a separate binary, so it
-          # cannot be reached by a `--lib` filter and needs its own shard. It is
-          # the smallest one and it is the one that runs 4096 seeded cases per
-          # parser.
           - shard: parsers
             target: --test parsers
             filters: ""
@@ -151,55 +50,15 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # One key across all six shards. `cargo miri setup` builds a std sysroot
-          # under `target/`, and that build is byte-identical on every shard and
-          # is the one part of a cold run that is neither small nor fast. The
-          # first shard to finish publishes it for the rest, which turns five of
-          # the six cold runs into cache restores.
           shared-key: miri
-      # Miri proves the absence of a use-after-free, an out-of-bounds access and
-      # a leak for the code it can interpret. It cannot interpret the
-      # architecture intrinsics, which is why `chacha::portable` is deliberately
-      # the whole algorithm in safe Rust: Miri runs the ladder, the counter
-      # arithmetic and every store offset through it, so the SIMD modules are left
-      # with nothing but five instructions each to get wrong — and those are gated
-      # by the differential test instead.
-      #
-      # The verdict is kept, not failed on: the exit code is recorded as a step
-      # output before the job fails, so a red shard still reaches the report and
-      # the README row names it.
       - name: run this shard of Miri
         id: shard
         shell: bash
-        # Both expansions are unquoted on purpose: `target` is a cargo flag and
-        # `filters` is a list of libtest substring filters, and word-splitting
-        # them is what turns `record:: aead:: aesgcm::` into three filters rather
-        # than one nonsense string. Neither value comes from a pull request or a
-        # dispatch input; both are literals in the matrix above.
-        #
-        # The `--` is load-bearing and was the bug this file had: without it,
-        # cargo reads the first filter as a *package* name and fails with
-        # "package ID specification `record::` did not match any packages", so
-        # three of the six shards ran nothing. Filters go to the test binary;
-        # everything before `--` goes to cargo.
         run: |
           set +e
-          # `--no-fail-fast` is load-bearing. Without it a shard stops at its
-          # first failing test and everything after it in that shard goes
-          # uninterpreted, so one failure quietly reduces the coverage of the
-          # weekly verdict. With it, a shard reports every defect it found.
-          #
-          # `--test-threads 2` is a runner-tuning knob, not a semantic one: Miri
-          # runs each test in its own interpreter, so a thread is mostly waiting
-          # on a lock, and 2 beats the runner default of 1 on the shard shapes
-          # that are not a single long test.
           cargo +nightly miri test -p ferrox-core ${{ matrix.target }} \
             --no-fail-fast --test-threads 2 -- ${{ matrix.filters }} 2>&1 | tee /tmp/miri.log
           rc="${PIPESTATUS[0]}"
-          # Counted rather than trusted: a filter that matches nothing exits 0,
-          # and a shard that silently interpreted nothing would read as a PASS.
-          # This is what stops a mistyped filter from deleting a module from the
-          # weekly verdict.
           ran="$(grep -c ' \.\.\. ok$' /tmp/miri.log || true)"
           failed="$(grep -c ' \.\.\. FAILED$' /tmp/miri.log || true)"
           echo "### miri: ${{ matrix.shard }} — $ran ok, $failed failed" >> "$GITHUB_STEP_SUMMARY"
@@ -209,38 +68,20 @@ jobs:
           fi
           echo "exit=$rc" >> "$GITHUB_OUTPUT"
           exit "$rc"
-      # No "record the verdict" step here: `GITHUB_ENV` is per-job, so writing a
-      # shard's exit code into it would be readable only inside the job that wrote
-      # it. The `report` job below reads `needs.*.result`, which is the one channel
-      # that actually crosses a job boundary — an earlier version of this file had
-      # both, and the dead one read like it was load-bearing.
 
   report:
-    # One README line, written from every shard's verdict rather than from one
-    # job's. `needs` fails when any shard fails, so a red shard is a red report
-    # — and because each shard wrote its own exit code to its environment before
-    # failing, the row says *which* shard failed instead of only that something
-    # did.
-    #
-    # Five minutes: this job only reads six environment variables, rewrites one
-    # line of one file, and pushes. It does not compile anything, and the ceiling
-    # here is a backstop against a rebase waiting on a lock.
-    name: one README line
+    name: weekly verdict
     needs: miri
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: collect the shard verdicts
         id: verdicts
         run: |
-          # `needs.*.result` is the only verdict channel that crosses a job
-          # boundary, and it is a coarse one — success, failure, or cancelled.
-          # A shard that fails here is named in its own log, so this only has to
-          # answer "did every shard pass".
           verdicts="${{ join(needs.*.results, ' ') }}"
           failed=0
           for result in $verdicts; do
@@ -250,49 +91,22 @@ jobs:
           done
           echo "shards=$verdicts" >> "$GITHUB_STEP_SUMMARY"
           echo "failed=$failed" >> "$GITHUB_OUTPUT"
-      - name: write the one README line
+      - name: write the verdict file
         env:
           FAILED: ${{ steps.verdicts.outputs.failed }}
         run: |
           if [ "$FAILED" = "0" ]; then verdict="PASS"; else verdict="FAIL"; fi
           today="$(date -u +%F)"
-          # Seven days, because the cron is weekly. The row used to say
-          # "tomorrow" while the cron ran three times a week, so the date printed
-          # on the claim was wrong two times in three — and a date nobody trusts
-          # is the same as no date at all.
           next="$(date -u -d 'next monday' +%F)"
-          row="| memory safety | Miri nightly on the safe-Rust core, 6 shards on 6 runners: $verdict $today — next check $next 03:11 UTC (SIMD cores: differential test, not Miri) |"
-          awk -v row="$row" '{ if (index($0, "| memory safety |") == 1) print row; else print }' README.md > README.md.next
-          mv README.md.next README.md
-          grep '^| memory safety |' README.md
-      - name: commit the README line
-        env:
-          FAILED: ${{ steps.verdicts.outputs.failed }}
-        run: |
-          git config user.name "ferrox-safety"
-          git config user.email "ferrox-safety@users.noreply.github.com"
-          git add README.md
-          if git diff --cached --quiet; then
-            echo "README line unchanged"
-          else
-            if [ "$FAILED" = "0" ]; then verdict="PASS"; else verdict="FAIL"; fi
-            git commit -m "safety: Miri $verdict $(date -u +%F)"
-            # Rebase, never merge, and never push blind. Sharding took this job
-            # from four hours to about one, which narrows the window in which
-            # `main` moves underneath it — but it does not close it, and a plain
-            # push is still rejected, which is how the 2026-10-04 run finished:
-            # Miri green, `MIRI_EXIT: 0`, the README line written, and then
-            # `! [rejected]  main -> main (fetch first)` from a commit built
-            # against an older tree. A gate that reports the state of a tree
-            # nobody can reach is reporting on a branch that does not exist.
-            #
-            # A rebase conflict here means the same table row was edited while
-            # Miri was running, which is worth failing on rather than resolving
-            # blindly: the row is a verdict with a date on it, and two of those
-            # at once is a question for a person.
-            git pull --rebase origin main
-            git push origin HEAD:main
-          fi
+          echo "Miri weekly $verdict $today, next check $next" > miri-verdict.txt
+          cat miri-verdict.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the verdict
+        uses: actions/upload-artifact@v4
+        with:
+          name: miri-verdict-${{ github.run_id }}
+          path: miri-verdict.txt
+          retention-days: 90
+          if-no-files-found: error
       - name: fail when any shard failed
         if: steps.verdicts.outputs.failed != '0'
         run: exit 1

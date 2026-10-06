@@ -1,144 +1,63 @@
-//! `Vision` framing: the padding protocol that rides inside a `VLESS` session.
-//!
-//! # The frame
-//!
-//! One frame is a five-byte header with the payload in the middle and random
-//! padding around it, and the user id heads the first frame in each direction:
-//!
-//! ```text
-//! [uuid, once, first frame in each direction]
-//! [command: 1] [content length: 2] [padding length: 2] [content] [padding]
-//! ```
-//!
-//! Content is the payload. Padding hides a handshake record among request
-//! headers. The command says what happens next: `0` while padding is still
-//! running, `1` at the first real payload, and `2` at the first `TLS`
-//! application record of an inner `TLS` stream — the point where the outer
-//! session stops earning its keep and that direction is copied raw.
-//!
-//! # Why the phase is counted rather than signalled
-//!
-//! A frame says when padding ends, never when it begins: both ends decide that
-//! from how many buffers they have handled, sharing one budget between their
-//! reading and their writing. This is the one place the framing is not
-//! self-delimiting, and it is why the counter here is the counter upstream is,
-//! decrementing on whichever side handles a buffer.
-//!
-//! # What is not implemented
-//!
-//! No buffer reshaping: upstream splits a chunk that is nearly a whole buffer in
-//! two so a padding boundary can land on a record boundary, and a receiver here
-//! concatenates content across frames either way. No `XUDP`, because `UDP` is not
-//! served here at all.
-
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use crate::proxy::RELAY_BUFFER;
 
-/// The buffer upstream sizes its padding against; padding never exceeds it.
 const BUFFER: usize = 2048;
-/// `[long-padding base, long-padding spread, long-padding target, short spread]`.
 const SEED: [u32; 4] = [900, 500, 900, 256];
-/// How many buffers are inspected for an inner `TLS` handshake before giving up.
 const FILTER_PACKETS: i32 = 8;
-/// Padding is over and this direction is raw from here.
 const CMD_DIRECT: u8 = 2;
-/// The `Addons.Flow` value that selects this framing.
 pub(crate) const FLOW: &str = "xtls-rprx-vision";
 
 const TLS_SERVER_HELLO: [u8; 3] = [0x16, 0x03, 0x03];
 const TLS_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
 const TLS_APPLICATION_DATA: [u8; 3] = [0x17, 0x03, 0x03];
-/// The `supported_versions` body a `TLS` 1.3 `ServerHello` carries.
 const TLS13_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
-/// `TLS_AES_128_CCM_8_SHA256`, the one 1.3 suite a raw switch is not worth it for.
 const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
-/// Smallest frame: the uuid and a header, with no payload and no padding.
 const SHORTEST_FRAME: usize = 21;
 
-/// One `VLESS` link carrying `Vision`-framed bytes over an outer session.
-///
-/// Each direction leaves the session independently, so a peer that switches one
-/// way and not the other is served correctly rather than refused.
 pub(crate) struct Link<S: Read + Write> {
-    /// The outer session: `TLS`, or `REALITY` over it.
     session: S,
-    /// The socket under the session, for a direction that has gone raw.
     raw: Option<TcpStream>,
-    /// The user id, which heads the first frame in each direction.
     uuid: [u8; 16],
-    /// Bytes read from the session but not yet framed out of them.
     have: Vec<u8>,
-    /// Consumed prefix of `have`; frames are counted, never shifted.
     hat: usize,
-    /// Bytes ready for the caller.
     out: Vec<u8>,
-    /// Consumed prefix of `out`; caller takes are counted, never shifted.
     oat: usize,
-    /// One socket-sized scratch buffer, reused for every read.
     chunk: Vec<u8>,
-    /// One frame-sized staging buffer, reused for every write.
     staging: Vec<u8>,
-    /// What the reading direction is doing.
     read: Reading,
-    /// What the writing direction is doing.
     write: Writing,
-    /// What the carried stream turned out to be.
     tls: Tls,
 }
 
-/// Where the reading direction has got to.
 struct Reading {
-    /// Whether the reading direction is still inside the padding phase.
     padding: bool,
-    /// Whether a frame is mid-flight, so its header or body is still owed.
     mid_frame: bool,
-    /// Whether the reading direction has been told to go raw.
     raw: bool,
-    /// Header bytes still owed for the frame being read.
     want_header: i32,
-    /// Content bytes still owed for the frame being read.
     want_content: usize,
-    /// Padding bytes still owed for the frame being read.
     want_padding: usize,
-    /// The command of the frame being read.
     command: u8,
 }
 
-/// Where the writing direction has got to.
 struct Writing {
-    /// Whether the writing direction is still producing padding frames.
     padding: bool,
-    /// Whether this direction has written its uuid.
     sent_uuid: bool,
-    /// Whether the writing direction has been told to go raw.
     raw: bool,
 }
 
-/// What the carried stream turned out to be, read once from its own records.
 struct Tls {
-    /// Whether the carried stream is `TLS` at all.
     present: bool,
-    /// Whether it is `TLS` 1.2 or newer.
     twelve_or_above: bool,
-    /// Whether it is `TLS` 1.3, which is what makes a raw switch worth taking.
     enable_xtls: bool,
-    /// Buffers left to inspect for an inner `TLS` handshake.
     budget: i32,
-    /// `ServerHello` bytes still to be scanned for the 1.3 marker, `0` for none.
     server_hello_left: usize,
-    /// The `ServerHello`'s cipher suite, read once the record is long enough.
     cipher: u16,
 }
 
 impl<S: Read + Write> Link<S> {
-    /// A link over `session`, with `raw` for a direction that goes direct.
-    ///
-    /// Without a `raw` socket a `direct` command is downgraded to `end`, which
-    /// keeps the peer in step rather than switching it to a socket this side
-    /// cannot write.
     pub(crate) fn new(session: S, raw: Option<TcpStream>, uuid: &[u8; 16]) -> Self {
         Self {
             session,
@@ -195,12 +114,10 @@ impl<S: Read + Write> Read for Link<S> {
 }
 
 impl<S: Read + Write> Link<S> {
-    /// Unframed bytes still waiting in `have`, past the consumed prefix.
     fn pending(&self) -> usize {
         self.have.len() - self.hat
     }
 
-    /// Drop the consumed prefix, at most once per session read.
     fn compact(&mut self) {
         if self.hat > 0 {
             self.have.drain(..self.hat);
@@ -208,7 +125,6 @@ impl<S: Read + Write> Link<S> {
         }
     }
 
-    /// Read until there is something to hand back; `false` once the peer closes.
     fn fill(&mut self) -> std::io::Result<bool> {
         loop {
             if self.read.raw {
@@ -254,11 +170,6 @@ impl<S: Read + Write> Link<S> {
         }
     }
 
-    /// Take one frame's worth of bytes out of `have`, `false` when more are due.
-    ///
-    /// The uuid is what marks the start of the phase, and it is only trusted on
-    /// a whole header's worth of bytes: a short read that guessed "unframed"
-    /// would hand padding to the payload.
     fn unpad(&mut self) -> bool {
         if !self.read.mid_frame {
             if self.pending() < SHORTEST_FRAME {
@@ -317,11 +228,6 @@ impl<S: Read + Write> Link<S> {
         true
     }
 
-    /// Hand over whatever arrived when the peer closed mid-phase.
-    ///
-    /// Only bytes from before the phase began are passed through: half a frame
-    /// is framing, and delivering it as payload is the one thing a receiver
-    /// cannot undo.
     fn flush_truncated(&mut self) {
         if !self.read.mid_frame {
             let tail = self.have.len();
@@ -330,12 +236,6 @@ impl<S: Read + Write> Link<S> {
         }
     }
 
-    /// Append one framed buffer and report the command it carries.
-    ///
-    /// Padding stops at the first inner `TLS` application record when the inner
-    /// stream is 1.3 — a raw switch pays for itself there and nowhere else — and
-    /// otherwise at the last buffer of the filter window, which is how a stream
-    /// that is not `TLS` at all leaves the phase.
     fn frame(
         uuid: &[u8; 16],
         tls: &Tls,
@@ -366,8 +266,6 @@ impl<S: Read + Write> Link<S> {
 }
 
 impl Tls {
-    /// Look at one buffer of carried bytes for an inner `TLS` handshake, which is
-    /// what decides whether a raw switch is ever worth taking.
     fn observe(&mut self, bytes: &[u8]) {
         self.budget -= 1;
         if bytes.len() >= 6 {
@@ -418,8 +316,6 @@ impl<S: Read + Write> Write for Link<S> {
             &mut self.staging,
             buf,
         );
-        // The frame that announces a raw switch still goes through the session:
-        // the peer reads it as the last thing it will ever decrypt.
         self.session.write_all(&self.staging)?;
         if command != 0 {
             self.write.padding = false;
@@ -434,7 +330,6 @@ impl<S: Read + Write> Write for Link<S> {
 }
 
 impl<S: Read + Write> Link<S> {
-    /// Write to whichever half this direction is using.
     fn write_out(&mut self, buf: &[u8]) -> std::io::Result<()> {
         match self.raw.as_mut() {
             Some(raw) if self.write.raw => raw.write_all(buf),
@@ -443,7 +338,6 @@ impl<S: Read + Write> Link<S> {
     }
 }
 
-/// Padding for one frame: enough to hide a short payload, never past a buffer.
 fn padding_len(content: usize, long: bool) -> usize {
     let drawn = if long && content < SEED[0] as usize {
         random_below(SEED[1]) + SEED[2] as usize - content
@@ -453,7 +347,6 @@ fn padding_len(content: usize, long: bool) -> usize {
     drawn.min(BUFFER.saturating_sub(SHORTEST_FRAME + content))
 }
 
-/// A uniform draw from `0..bound`, from one batched entropy refill per thread.
 fn random_below(bound: u32) -> usize {
     if bound == 0 {
         return 0;
@@ -480,10 +373,6 @@ fn random_below(bound: u32) -> usize {
     usize::try_from(word % bound).unwrap_or(0)
 }
 
-/// Whether `buf` is a whole number of `TLS` application-data records.
-///
-/// A padding boundary inside a record would hide the record's own length, so the
-/// phase may only stop where a record does.
 fn is_record_run(buf: &[u8]) -> bool {
     let mut at = 0;
     let mut head = 5;
@@ -521,7 +410,6 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// A session that replays what it is given and records what was written.
     struct Fake {
         read: Cursor<Vec<u8>>,
         written: Vec<u8>,
@@ -559,7 +447,6 @@ mod tests {
         Link::new(Fake::new(input), None, &UUID)
     }
 
-    /// One frame as a peer writes it, uuid only on the first of a direction.
     fn frame(first: bool, command: u8, content: &[u8], padding: usize) -> Vec<u8> {
         let mut out = Vec::new();
         if first {
@@ -585,8 +472,6 @@ mod tests {
         assert_eq!(out, b"firstsecondthirdraw tail");
     }
 
-    /// A frame split across reads has to be reassembled, which is the whole
-    /// reason the header bytes are counted rather than parsed per read.
     #[test]
     fn a_frame_split_across_reads_is_reassembled() {
         let mut input = frame(true, 0, b"split", 30);
@@ -597,8 +482,6 @@ mod tests {
         assert_eq!(out, b"splittail");
     }
 
-    /// The uuid is what marks the start of the phase, so a stream without one is
-    /// content from its first byte.
     #[test]
     fn a_stream_without_the_uuid_is_content_from_the_start() {
         let mut link = link(b"no framing here at all");
@@ -616,13 +499,10 @@ mod tests {
         let mut out = Vec::new();
         link.read_to_end(&mut out).expect("reads");
         assert_eq!(out, b"paddedafter the switch");
-        // No raw socket was wired, so the switch is downgraded rather than lost.
         assert!(!link.read.raw);
         assert!(!link.read.padding);
     }
 
-    /// A stream that closes mid-frame drops the partial frame rather than
-    /// delivering framing bytes as payload.
     #[test]
     fn a_truncated_frame_is_dropped_not_delivered() {
         let mut input = frame(true, 0, b"kept", 0);
@@ -633,12 +513,6 @@ mod tests {
         assert_eq!(out, b"kept");
     }
 
-    /// Bytes past the padding phase arrive while the peer is still connected.
-    ///
-    /// The padding phase ends on one segment and the raw tail on later ones;
-    /// a reader that only delivers the tail at close hangs every real stream
-    /// and passes every test that feeds it all at once, which is why this one
-    /// holds the socket open across two writes with a live peer in between.
     #[test]
     fn bytes_after_padding_arrive_without_waiting_for_close() {
         use std::net::TcpListener;
@@ -669,8 +543,6 @@ mod tests {
         writer.join().expect("joins");
     }
 
-    /// The written side has to produce exactly the frame a peer reads: uuid
-    /// once, a header, the payload, and bounded padding.
     #[test]
     fn writing_frames_the_payload_and_heads_the_first_with_the_uuid() {
         let mut link = link(&[]);
@@ -686,9 +558,6 @@ mod tests {
         assert!(pad < BUFFER);
     }
 
-    /// A stream that is not `TLS` leaves the padding phase inside the filter
-    /// window rather than at a record boundary, which is what a peer written for
-    /// an earlier receiver expects.
     #[test]
     fn a_non_tls_stream_stops_padding_inside_the_filter_window() {
         let mut link = link(&[]);
@@ -706,9 +575,6 @@ mod tests {
         assert!(link.session.written.ends_with(b"y"), "unframed from here");
     }
 
-    /// An inner `TLS` 1.3 stream switches to raw at its first application
-    /// record, which is the whole point of the framing. The handshake before it
-    /// stays padded, because a record boundary has not been reached yet.
     #[test]
     fn an_inner_tls13_stream_switches_to_raw_at_its_first_record() {
         let mut link = link(&[]);
@@ -725,10 +591,7 @@ mod tests {
         assert!(!link.write.raw, "no raw socket was wired, so no raw switch");
     }
 
-    /// A `ServerHello` long enough to read the cipher out of, carrying 1.3.
     fn server_hello() -> Vec<u8> {
-        // Offsets follow the record: type, length, version, random, id length,
-        // then the suites, the compression methods and the extensions.
         let mut payload = vec![0x02, 0x00, 0x00, 0x00];
         payload.extend_from_slice(&[0x03, 0x03]);
         payload.extend_from_slice(&[0x7fu8; 32]);
@@ -767,8 +630,6 @@ mod tests {
         assert!(!is_record_run(&[0x17, 0x03, 0x04, 0x00, 0x01, 0]));
     }
 
-    /// Padding hides a short payload, so it is bounded, and it is what keeps a
-    /// handshake record from standing out by size.
     #[test]
     fn padding_is_bounded_and_scales_with_the_payload() {
         for len in [0usize, 1, 100, 899, 900, 2000, 5000, 100_000] {
@@ -779,8 +640,6 @@ mod tests {
         assert!(padding_len(2000, true) < SEED[3] as usize);
     }
 
-    /// One budget is shared by both directions, so a buffer spent on the reading
-    /// side is a buffer the writing side no longer has.
     #[test]
     fn both_directions_spend_the_same_filter_budget() {
         let mut link = link(&[]);

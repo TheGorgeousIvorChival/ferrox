@@ -1,11 +1,4 @@
 #![allow(clippy::missing_panics_doc)]
-// poisoned-lock panics: lock PoisonError paths are never expected; documenting 14 of them would only repeat itself.
-
-//! The connection: a byte-stream façade over the send/receive workers, with
-//! the state machine, the tick thread, and the notifiers. The deterministic
-//! core — windows, RTO arithmetic and the ack scheduler — is proven by the
-//! scripted-clock oracle against the pinned Go; this shell only has to
-//! interoperate, and that proof is over real `UDP`.
 
 use std::io;
 use std::net::SocketAddr;
@@ -19,20 +12,13 @@ use super::roundtrip::RoundTripInfo;
 use super::segment::{AckSegment, CmdOnlySegment, Command, DataSegment, Segment, SegmentOption};
 use super::worker::{ReceivingWorker, SendingWorker};
 
-/// Connection state. Values mirror the upstream enumerations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// in use.
     Active,
-    /// closed locally.
     ReadyToClose,
-    /// the peer signalled close.
     PeerClosed,
-    /// draining locally.
     Terminating,
-    /// the peer is draining.
     PeerTerminating,
-    /// gone.
     Terminated,
 }
 
@@ -49,37 +35,25 @@ impl State {
     }
 }
 
-/// The one-datagram writer injected by the transport.
 type Writer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send>;
 
-/// The sink every emitted segment goes through: one reused scratch buffer
-/// (the `SimpleSegmentWriter` shape) plus the transport's one-datagram
-/// writer.
 struct OutputSink {
     buf: Vec<u8>,
     write: Writer,
 }
 
-/// Drop-guard for the carrier socket.
 type Closer = dyn FnOnce() + Send;
 
-/// Connection metadata.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnMetadata {
-    /// Local socket address.
     pub local: SocketAddr,
-    /// Remote socket address.
     pub remote: SocketAddr,
-    /// Conversation id.
     pub conversation: u16,
 }
 
-/// Errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnError {
-    /// I/O timeout on a read or write deadline.
     IoTimeout,
-    /// The connection is closed for this operation.
     Closed,
 }
 
@@ -94,9 +68,6 @@ impl std::fmt::Display for ConnError {
 
 impl std::error::Error for ConnError {}
 
-/// Generation counter over the condvar: each signal bumps the counter, so a
-/// waiter can tell whether anything happened since its own snapshot and a
-/// signal that lands between the data check and the wait is not lost.
 #[derive(Default)]
 struct Notifier {
     generation: Mutex<u64>,
@@ -108,7 +79,6 @@ impl Notifier {
         Self::default()
     }
 
-    /// Current generation; pair with [`Notifier::wait_since`].
     fn gen(&self) -> u64 {
         *self.generation.lock().unwrap()
     }
@@ -118,8 +88,6 @@ impl Notifier {
         self.condvar.notify_all();
     }
 
-    /// Wait until the generation moves past `snapshot`, or `timeout`
-    /// elapses. True if signalled.
     fn wait_since(&self, snapshot: u64, timeout: Option<Duration>) -> bool {
         let mut g = self.generation.lock().unwrap();
         loop {
@@ -142,8 +110,6 @@ impl Notifier {
     }
 }
 
-/// State shared by the workers and the connection: everything the workers
-/// touch in Go via `c.conn`.
 pub(crate) struct Ctx {
     pub meta: ConnMetadata,
     pub config: Config,
@@ -180,7 +146,6 @@ impl std::fmt::Debug for Ctx {
     }
 }
 
-/// The connection.
 pub struct Connection {
     ctx: Arc<Ctx>,
     state_begin_time: AtomicU32,
@@ -205,8 +170,6 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
-    /// Mirror of `NewConnection`: spawns the tick thread, merging the
-    /// upstream's two updater goroutines into one cadence.
     #[must_use]
     pub fn new(
         meta: ConnMetadata,
@@ -268,7 +231,6 @@ impl Connection {
         conn
     }
 
-    /// Current state.
     #[must_use]
     pub fn state(&self) -> State {
         State::from_int(self.ctx.state.load(Ordering::SeqCst))
@@ -305,13 +267,11 @@ impl Connection {
         self.since.elapsed().as_millis() as u32
     }
 
-    /// Current RTO estimate.
     #[must_use]
     pub fn round_trip_timeout(&self) -> u32 {
         self.ctx.round_trip.lock().unwrap().timeout()
     }
 
-    /// Incoming segments: one UDP payload's worth, already parsed.
     pub fn input(&self, segments: &[Segment]) {
         let current = self.elapsed();
         self.last_incoming_time.store(current, Ordering::SeqCst);
@@ -373,8 +333,6 @@ impl Connection {
 }
 
 impl Connection {
-    /// The one tick of `updateTask`, mirroring the upstream `flush` line by
-    /// line.
     pub fn flush(&self) {
         let current = self.elapsed();
         if self.state() == State::Terminated {
@@ -415,8 +373,6 @@ impl Connection {
         }
     }
 
-    /// Ping or terminate: a command-only segment carrying the mirrored
-    /// clocks.
     pub fn ping(&self, current: u32, cmd: Command) {
         let seg = CmdOnlySegment {
             conv: self.ctx.meta.conversation,
@@ -434,7 +390,6 @@ impl Connection {
         self.last_ping_time.store(current, Ordering::SeqCst);
     }
 
-    /// The close bit on any segment.
     pub fn on_peer_closed(&self) {
         match self.state() {
             State::ReadyToClose => self.set_state(State::Terminating),
@@ -443,7 +398,6 @@ impl Connection {
         }
     }
 
-    /// Close for the caller: move through the drain states.
     pub fn close(&self) {
         self.data_input.signal();
         self.data_output.signal();
@@ -455,7 +409,6 @@ impl Connection {
         }
     }
 
-    /// Destroy: signal everyone, close the carrier, release the workers.
     pub fn terminate(&self) {
         self.data_input.signal();
         self.data_output.signal();
@@ -466,7 +419,6 @@ impl Connection {
         self.receiving.lock().unwrap().release();
     }
 
-    /// Read the next payload bytes. Mimetic of the upstream `Read`.
     pub fn read(&self, b: &mut [u8]) -> Result<usize, ConnError> {
         loop {
             if self.state() == State::ReadyToClose
@@ -541,8 +493,6 @@ impl Connection {
         Ok(())
     }
 
-    /// Write application bytes: chunk into `mss` segments and queue them
-    /// for retransmit until both sides acknowledge.
     pub fn write(&self, b: &[u8]) -> Result<usize, ConnError> {
         let mut offset = 0;
         while offset < b.len() {
@@ -566,29 +516,24 @@ impl Connection {
         Ok(b.len())
     }
 
-    /// Set the read deadline.
     pub fn set_read_deadline(&self, t: Instant) {
         *self.rd.lock().unwrap() = Some(t);
     }
 
-    /// Set the write deadline.
     pub fn set_write_deadline(&self, t: Instant) {
         *self.wd.lock().unwrap() = Some(t);
     }
 
-    /// Current conversation id.
     #[must_use]
     pub fn conversation(&self) -> u16 {
         self.ctx.meta.conversation
     }
 
-    /// Local socket address.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.ctx.meta.local
     }
 
-    /// Remote socket address.
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
         self.ctx.meta.remote

@@ -1,5 +1,3 @@
-// The interop peer: runs the pinned Go KCP over a UDP socket. The Rust
-// port is held to the same contract over the same loopback pair.
 package main
 
 import (
@@ -18,8 +16,6 @@ var cfg = &kcp.Config{
     CwndMultiplier: 1, MaxSendingWindow: 2 * 1024 * 1024,
 }
 
-// feed parses datagrams into segments and feeds the connection. It also
-// records the first sender as the peer the writer will answer to.
 func feed(sock *net.UDPConn, conn *kcp.Connection, mu *sync.Mutex, peer **net.UDPAddr) {
     reader := &kcp.KCPPacketReader{}
     buf := make([]byte, 65536)

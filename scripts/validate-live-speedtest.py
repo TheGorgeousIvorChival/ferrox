@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Validate a live speedtest run: re-derived medians plus redaction.
 
 Two jobs. First, every median in `summary.json` is re-derived from the ok

@@ -1,61 +1,33 @@
-//! `gRPC` carrier over blocking `TCP`: minimal `HTTP/2` plus the `Hunk` envelope.
-//!
-//! One stream per connection; `VLESS` bytes ride inside length-delimited messages.
-
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-/// Client connection preface, magic plus the first `SETTINGS` frame's prefix.
 const MAGIC: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-/// `DATA` frame type.
 const T_DATA: u8 = 0x00;
-/// `HEADERS` frame type.
 const T_HEADERS: u8 = 0x01;
-/// `RST_STREAM` frame type.
 const T_RST: u8 = 0x03;
-/// `SETTINGS` frame type.
 const T_SETTINGS: u8 = 0x04;
-/// `PING` frame type.
 const T_PING: u8 = 0x06;
-/// `GOAWAY` frame type.
 const T_GOAWAY: u8 = 0x07;
-/// `WINDOW_UPDATE` frame type.
 const T_WINDOW: u8 = 0x08;
-/// `CONTINUATION` frame type.
 const T_CONT: u8 = 0x09;
-/// `END_STREAM` flag.
 const F_END: u8 = 0x01;
-/// `ACK` flag on `SETTINGS` and `PING`.
 const F_ACK: u8 = 0x01;
-/// `END_HEADERS` flag.
 const F_END_HEADERS: u8 = 0x04;
-/// `PADDED` flag.
 const F_PADDED: u8 = 0x08;
-/// `PRIORITY` flag on `HEADERS`.
 const F_PRIORITY: u8 = 0x20;
-/// `INITIAL_WINDOW_SIZE` setting id.
 const S_WINDOW: u16 = 0x04;
-/// `MAX_FRAME_SIZE` setting id.
 const S_MAX_FRAME: u16 = 0x05;
-/// `REFUSED_STREAM` error code.
 const E_REFUSED: u32 = 0x07;
-/// Stream window this side advertises, in bytes.
 const WINDOW: u32 = 4 * 1024 * 1024;
-/// Largest `HTTP/2` frame payload accepted.
 const FRAME_CAP: usize = 17 * 1024 * 1024;
-/// Largest header block accepted.
 const HEAD_CAP: usize = 64 * 1024;
-/// Largest `gRPC` message accepted.
 const MSG_CAP: usize = 16 * 1024 * 1024;
-/// Application bytes per `Hunk` message.
 const HUNK: usize = 16 * 1024;
-/// Largest flow-control window, per `RFC 7540` section 6.9.2.
 const WINDOW_MAX: u64 = (1 << 31) - 1;
 
-/// Huffman codes from `RFC 7541` Appendix B, as `(code, bits)` per byte.
 const HUFFMAN: [(u32, u8); 256] = [
     (0x1ff8, 13),
     (0x007f_ffd8, 23),
@@ -315,7 +287,6 @@ const HUFFMAN: [(u32, u8); 256] = [
     (0x03ff_ffee, 26),
 ];
 
-/// `RFC 7541` static header table, indexed from one.
 const STATIC: [(&str, &str); 61] = [
     (":authority", ""),
     (":method", "GET"),
@@ -380,7 +351,6 @@ const STATIC: [(&str, &str); 61] = [
     ("www-authenticate", ""),
 ];
 
-/// Append an integer with a `prefix`-bit first field carrying `first`.
 fn push_int(out: &mut Vec<u8>, prefix: u8, first: u8, value: usize) {
     let max = (1usize << prefix) - 1;
     if value < max {
@@ -396,13 +366,11 @@ fn push_int(out: &mut Vec<u8>, prefix: u8, first: u8, value: usize) {
     out.push(rest as u8);
 }
 
-/// Append a raw string with its length, never Huffman-coded on the way out.
 fn push_str(out: &mut Vec<u8>, text: &str) {
     push_int(out, 7, 0x00, text.len());
     out.extend_from_slice(text.as_bytes());
 }
 
-/// Encode headers as literals without indexing; every peer must accept them.
 fn block_encode(headers: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, value) in headers {
@@ -413,7 +381,6 @@ fn block_encode(headers: &[(&str, &str)]) -> Vec<u8> {
     out
 }
 
-/// Decode one prefixed integer, returning its value and the remaining bytes.
 fn prefixed(block: &[u8], prefix: u8) -> Option<(usize, &[u8])> {
     let max = (1usize << prefix) - 1;
     let first = *block.first()? as usize & max;
@@ -437,7 +404,6 @@ fn prefixed(block: &[u8], prefix: u8) -> Option<(usize, &[u8])> {
     }
 }
 
-/// Decode one Huffman-coded string, checking its padding is all ones.
 fn huffman_decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut acc = 0u32;
@@ -471,7 +437,6 @@ fn huffman_decode(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decode one string, Huffman-coded or raw depending on its first bit.
 fn string_decode(block: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     let huffman = block.first()? & 0x80 != 0;
     let (len, mut rest) = prefixed(block, 7)?;
@@ -487,17 +452,13 @@ fn string_decode(block: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     }
 }
 
-/// `HPACK` decoder with a 4 KiB dynamic table, enough for handshake blocks.
 #[derive(Debug, Default)]
 struct Decoder {
-    /// Newest-first entries; static entries are never stored here.
     table: VecDeque<(Vec<u8>, Vec<u8>)>,
-    /// Current table size counting 32 bytes per entry plus both lengths.
     size: usize,
 }
 
 impl Decoder {
-    /// Look up a 1-based index across the static table and the dynamic one.
     fn entry(&self, index: usize) -> Option<(Vec<u8>, Vec<u8>)> {
         if index == 0 {
             return None;
@@ -509,7 +470,6 @@ impl Decoder {
         self.table.get(index - STATIC.len() - 1).cloned()
     }
 
-    /// Name for an index, or a literal name when the index is zero.
     fn named<'a>(&self, block: &'a [u8], index: usize) -> Option<(Vec<u8>, &'a [u8])> {
         if index == 0 {
             let (name, rest) = string_decode(block)?;
@@ -521,7 +481,6 @@ impl Decoder {
         Some((self.entry(index)?.0, block))
     }
 
-    /// Insert an entry, evicting oldest-first past the 4 KiB budget.
     fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) {
         self.size += 32 + name.len() + value.len();
         self.table.push_front((name, value));
@@ -533,7 +492,6 @@ impl Decoder {
         }
     }
 
-    /// Decode one header block into name/value pairs.
     fn decode(&mut self, mut block: &[u8], out: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Option<()> {
         while !block.is_empty() {
             let first = block[0];
@@ -572,7 +530,6 @@ impl Decoder {
     }
 }
 
-/// One `HTTP/2` frame header off the wire: `(length, kind, flags, stream)`.
 fn read_head(stream: &mut TcpStream) -> Option<(usize, u8, u8, u32)> {
     let mut head = [0u8; 9];
     crate::proxy::read_exact(stream, &mut head).ok()?;
@@ -584,11 +541,6 @@ fn read_head(stream: &mut TcpStream) -> Option<(usize, u8, u8, u32)> {
     Some((len, head[3], head[4], id))
 }
 
-/// Write one frame; lengths past the peer's maximum are never constructed.
-///
-/// The nine header bytes and the body go out in one syscall where the platform
-/// allows it (see [`crate::proxy::write_all_two`]): same bytes in the same
-/// order as two writes, so the peer's `read_exact` pair cannot tell.
 fn write_frame(stream: &mut TcpStream, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
     let mut head = [0u8; 9];
     head[0..3].copy_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
@@ -598,35 +550,23 @@ fn write_frame(stream: &mut TcpStream, kind: u8, flags: u8, id: u32, body: &[u8]
     crate::proxy::write_all_two(stream, &head, body)
 }
 
-/// Remaining peer send windows in bytes.
 #[derive(Debug, Default)]
 struct SendWindow {
-    /// Connection-level window, starting at 64 KiB like every peer.
     conn: u64,
-    /// Stream-level window, replaced by the peer's `SETTINGS` when it arrives.
     stream: u64,
 }
 
-/// Socket half plus send windows shared by the relay thread and the replies.
 #[derive(Debug)]
 struct Shared {
-    /// Socket half every frame is written through, one writer at a time.
     stream: Mutex<TcpStream>,
-    /// Remaining send windows, waited on when exhausted.
     send: Mutex<SendWindow>,
-    /// Signalled on every window or settings update and on death.
     wake: Condvar,
-    /// Largest frame the peer accepts.
     max_frame: Mutex<usize>,
-    /// Last advertised stream window, for adjusting open streams.
     init: Mutex<u64>,
-    /// Whether our upload ended, so the close frame goes out once.
     ended: AtomicBool,
-    /// Whether the connection is dead, failing every waiter.
     dead: AtomicBool,
 }
 
-/// Reserve `need` send-window bytes, waiting for updates unless dead.
 fn take_window(shared: &Shared, need: u64) -> bool {
     let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
     while send.conn < need || send.stream < need {
@@ -643,50 +583,31 @@ fn take_window(shared: &Shared, need: u64) -> bool {
     true
 }
 
-/// Byte stream over one `gRPC` tunnel; `Read` yields message payload bytes.
 #[derive(Debug)]
 pub(crate) struct GrpcReader {
-    /// Socket half frames are read from.
     read: TcpStream,
-    /// Shared writer for acknowledgements and window updates.
     shared: Arc<Shared>,
-    /// Header decoder with its dynamic table.
     decoder: Decoder,
-    /// Our stream id, odd for clients and even for accepted ones.
     stream: u32,
-    /// Whether this end opened the stream, deciding header validation.
     server: bool,
-    /// Expected request path, checked once on accept.
     path: String,
-    /// Whether the opening headers were answered, starting the byte flow.
     answered: bool,
-    /// Header block accumulating across `CONTINUATION` frames.
     head: Vec<u8>,
-    /// Stream the accumulating block belongs to.
     head_id: u32,
-    /// Current message bytes, envelope first.
     msg: Vec<u8>,
-    /// Remaining message bytes once its length is known.
     need: usize,
-    /// Decoded application bytes not yet consumed.
     backlog: Vec<u8>,
-    /// Current frame payload, reused across `pump` calls.
     frame: Vec<u8>,
-    /// Whether the peer ended the stream, after which reads report `EOF`.
     eof: bool,
 }
 
-/// Message writer; cheap to clone for the relay thread.
 #[derive(Debug, Clone)]
 pub(crate) struct GrpcWriter {
-    /// Shared socket half and send windows.
     shared: Arc<Shared>,
-    /// Our stream id.
     stream: u32,
 }
 
 impl GrpcReader {
-    /// Send one frame through the shared writer.
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
@@ -694,7 +615,6 @@ impl GrpcReader {
         write_frame(&mut stream, kind, flags, id, body)
     }
 
-    /// Answer `SETTINGS`, adjusting our stream window to the newly advertised one.
     fn settings(&self, flags: u8, body: &[u8]) {
         if flags & F_ACK != 0 {
             return;
@@ -735,14 +655,12 @@ impl GrpcReader {
         self.emit(T_SETTINGS, F_ACK, 0, &[]);
     }
 
-    /// Answer a `PING` with the same payload and the `ACK` flag.
     fn ping(&self, flags: u8, body: &[u8]) {
         if flags & F_ACK == 0 && body.len() == 8 {
             self.emit(T_PING, F_ACK, 0, body);
         }
     }
 
-    /// Credit connection and stream windows for consumed bytes.
     fn replenish(&self, id: u32, len: usize) {
         if len == 0 {
             return;
@@ -754,12 +672,10 @@ impl GrpcReader {
         }
     }
 
-    /// Refuse a stream this server will not serve.
     fn refuse(&self, id: u32) {
         self.emit(T_RST, 0, id, &E_REFUSED.to_be_bytes());
     }
 
-    /// Header value by lowercase name.
     fn find<'a>(headers: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
         headers.iter().find_map(|(key, value)| {
             key.eq_ignore_ascii_case(name.as_bytes())
@@ -767,7 +683,6 @@ impl GrpcReader {
         })
     }
 
-    /// Route one complete header block by role.
     fn headers(&mut self, id: u32, flags: u8, block: &[u8]) -> Option<()> {
         let mut headers = Vec::new();
         self.decoder.decode(block, &mut headers)?;
@@ -790,7 +705,6 @@ impl GrpcReader {
         Some(())
     }
 
-    /// Validate one request and answer `200`, or refuse it and fail.
     fn serve_headers(&mut self, id: u32, flags: u8, headers: &[(Vec<u8>, Vec<u8>)]) -> Option<()> {
         if self.answered {
             if flags & F_END != 0 {
@@ -822,7 +736,6 @@ impl GrpcReader {
         Some(())
     }
 
-    /// Feed one `DATA` payload into the message parser.
     fn data(&mut self, id: u32, flags: u8, body: &[u8]) -> Option<()> {
         if id != self.stream || !self.answered {
             return Some(());
@@ -871,13 +784,9 @@ impl GrpcReader {
         Some(())
     }
 
-    /// Process one frame; a dead socket or fatal error ends the stream.
     fn pump(&mut self) -> Option<()> {
         let head = read_head(&mut self.read);
         let (len, kind, flags, id) = head?;
-        // Taken, not borrowed: the handlers below need `&mut self` and the
-        // body at once, which one object cannot lend itself. Restored at every
-        // exit, so the next frame reuses the same allocation.
         let mut frame = std::mem::take(&mut self.frame);
         frame.resize(len, 0);
         if len > 0 && crate::proxy::read_exact(&mut self.read, &mut frame).is_err() {
@@ -920,7 +829,6 @@ impl GrpcReader {
         out
     }
 
-    /// Start a header block, decoding it at once when complete.
     fn head_block(&mut self, id: u32, flags: u8, body: &[u8]) -> Option<()> {
         let mut body = body;
         if flags & F_PADDED != 0 {
@@ -947,7 +855,6 @@ impl GrpcReader {
         Some(())
     }
 
-    /// Extend the open header block, decoding it once complete.
     fn continue_block(&mut self, id: u32, flags: u8, body: &[u8]) -> Option<()> {
         if id != self.head_id || self.head.len() + body.len() > HEAD_CAP {
             return None;
@@ -961,7 +868,6 @@ impl GrpcReader {
         Some(())
     }
 
-    /// Credit our send windows from a peer update.
     fn window(&self, id: u32, body: &[u8]) {
         if body.len() != 4 {
             return;
@@ -987,7 +893,6 @@ impl GrpcReader {
 }
 
 impl Read for GrpcReader {
-    /// Fill `buf` with message payload bytes; empty means clean `EOF`.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -1010,7 +915,6 @@ impl Read for GrpcReader {
 }
 
 impl GrpcWriter {
-    /// Send application bytes as `Hunk` messages, split to the peer's frames.
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         for piece in data.chunks(HUNK) {
             if !self.message(piece, false) {
@@ -1020,7 +924,6 @@ impl GrpcWriter {
         true
     }
 
-    /// End the upload with an empty final frame, exactly once.
     pub(crate) fn close(&self) {
         if self.shared.ended.swap(true, Ordering::SeqCst) {
             return;
@@ -1028,7 +931,6 @@ impl GrpcWriter {
         self.message(&[], true);
     }
 
-    /// Send one message, splitting across frames the peer accepts.
     fn message(&self, data: &[u8], end: bool) -> bool {
         let frame = hunk_frame(data);
         let max = *self
@@ -1058,7 +960,6 @@ impl GrpcWriter {
     }
 }
 
-/// [`Write`] over the tunnel: bytes in, `Hunk` messages out.
 impl std::io::Write for GrpcWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         if self.send(data) {
@@ -1073,11 +974,7 @@ impl std::io::Write for GrpcWriter {
     }
 }
 
-/// Wrap application bytes as one `Hunk` message with its `gRPC` envelope.
 fn hunk_frame(data: &[u8]) -> Vec<u8> {
-    // One buffer, not two: the old form built the hunk in its own `Vec` and
-    // copied it behind a five-zero prefix, so every message paid an allocation
-    // and a full copy for five length bytes.
     let mut out = vec![0u8; 5];
     out.push(0x0A);
     push_varint(&mut out, data.len() as u64);
@@ -1087,7 +984,6 @@ fn hunk_frame(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Append a protobuf varint.
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         out.push(value as u8 & 0x7F | 0x80);
@@ -1096,7 +992,6 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-/// Read a protobuf varint, bounded against overflow.
 fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in (0..70).step_by(7) {
@@ -1113,9 +1008,6 @@ fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
-/// Decode a `Hunk`, keeping the last value of a repeated field like decoders do.
-/// Field 1 of one hunk message, borrowed: the old owned return copied the
-/// whole message just for the caller to copy it into the backlog again.
 fn hunk_decode(msg: &[u8]) -> Option<&[u8]> {
     let mut at = 0;
     let mut data: &[u8] = &[];
@@ -1141,7 +1033,6 @@ fn hunk_decode(msg: &[u8]) -> Option<&[u8]> {
     Some(data)
 }
 
-/// Skip one unknown protobuf field without recursing into groups.
 fn skip_field(msg: &[u8], at: &mut usize, wire: u8) -> Option<()> {
     let fixed = match wire {
         0 => {
@@ -1160,7 +1051,6 @@ fn skip_field(msg: &[u8], at: &mut usize, wire: u8) -> Option<()> {
     Some(())
 }
 
-/// Open the first tunnel on a fresh connection as a server.
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcWriter)> {
     let mut read = stream;
     let mut magic = [0u8; 24];
@@ -1225,7 +1115,6 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcW
     Some((reader, writer))
 }
 
-/// Open one tunnel on a fresh connection as a client.
 pub(crate) fn connect(
     stream: TcpStream,
     host: &str,
@@ -1283,10 +1172,6 @@ pub(crate) fn connect(
     Some((reader, GrpcWriter { shared, stream: 1 }))
 }
 
-/// This carrier's write half, as a [`crate::proxy::CarrierSink`].
-///
-/// The inner loop's call resolves to `GrpcWriter::send` at compile time; see the
-/// `ws` impl above for why that is the same code the old `relay` emitted.
 impl crate::proxy::CarrierSink for GrpcWriter {
     #[inline]
     fn send(&self, bytes: &[u8]) -> bool {
@@ -1298,12 +1183,6 @@ impl crate::proxy::CarrierSink for GrpcWriter {
     }
 }
 
-/// The two lines the old `grpc::relay` did at the end of the downlink loop:
-/// mark the shared state dead and wake anyone waiting on a send window.
-///
-/// Once per connection, exactly as before — it is what `relay_sink`'s
-/// `on_reader_done` is for, and it is a closure rather than a flag in the shared
-/// signature so that `ws`, which has nothing to do here, pays for nothing.
 pub(crate) fn mark_reader_dead(reader: &mut GrpcReader) {
     reader.shared.dead.store(true, Ordering::SeqCst);
     reader.shared.wake.notify_all();
@@ -1392,7 +1271,6 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// Read until clean `EOF`, consuming handshake acks so both ends close clean.
     fn drain(reader: &mut GrpcReader) {
         let mut buf = [0u8; 1024];
         while reader.read(&mut buf).unwrap_or(0) != 0 {}

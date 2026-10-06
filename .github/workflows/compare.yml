@@ -1,19 +1,5 @@
 name: compare
 
-# Config-driven comparison: give CI a working `vless://` link, get a table.
-#
-# The link is a credential (UUID, public key, server). It arrives as a
-# `workflow_dispatch` input, is masked before anything runs, and never reaches
-# the report — `ferrox-bench -- --config` prints only the redacted transport
-# description (`type= security= flow= support=`). A raw `echo` of the input
-# anywhere in this file is a bug; grep for it in review.
-#
-# Offline columns always run (header encode + record layer, no network).
-# Live columns run only when `live=true`: a TCP reachability check that sends
-# nothing (see `ferrox-app run`). No handshake, no credentials on the
-# wire. Upstream binaries (xray-core, sing-box, xray-rust) are built from
-# `upstream/pins.toml` so the "empty with reason" cells name the exact commit
-# they would have been measured against.
 
 on:
   workflow_dispatch:
@@ -27,12 +13,6 @@ on:
         required: false
         default: "false"
 
-# Dispatch only. The push leg used to fire on any `ferrox-app` edit and
-# wrote a report nobody read until the next change; a slice that needs the table
-# asks for it by name.
-#
-# Queued, never cancelled: a run holds the one unrecoverable input in this
-# repository (a working `vless://` link), and a cancelled one throws it away.
 concurrency:
   group: compare-${{ github.ref }}
 

@@ -1,22 +1,12 @@
-//! The wire codec: one enum instead of the Go interface's parallel
-//! `parse`/`Serialize`/`ByteSize` triple, byte-identical on the wire.
-
-/// Length of the data segment header up to and including the length field.
 pub const DATA_SEGMENT_OVERHEAD: u32 = 18;
 
-/// Maximum ack numbers per segment (the upstream's `ackNumberLimit`).
 pub const ACK_NUMBER_LIMIT: usize = 128;
 
-/// Segment purpose byte; values match the upstream wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    /// `0` — acknowledgement.
     Ack,
-    /// `1` — data.
     Data,
-    /// `2` — peer terminated.
     Terminate,
-    /// `3` — liveness.
     Ping,
 }
 
@@ -31,21 +21,17 @@ impl Command {
     }
 }
 
-/// Header flags; bit 0 closes the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentOption(pub u8);
 
 impl SegmentOption {
-    /// No flags.
     pub const NONE: Self = Self(0);
-    /// The close bit.
     pub const CLOSE: Self = Self(1);
 
     pub(crate) fn to_byte(self) -> u8 {
         self.0
     }
 
-    /// Whether the close bit is set.
     #[must_use]
     pub fn is_close(self) -> bool {
         self.0 & 1 == 1
@@ -79,36 +65,25 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// A data segment: one application chunk plus the fields its peer needs to
-/// advance its ack clock.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataSegment {
-    /// Conversation id.
     pub conv: u16,
-    /// Header flags.
     pub option: SegmentOption,
-    /// Sender's clock at flush.
     pub timestamp: u32,
-    /// Sequence number.
     pub number: u32,
-    /// First number the sender has not seen acknowledged.
     pub sending_next: u32,
-    /// Payload.
     pub payload: Vec<u8>,
     pub(crate) timeout: u32,
     pub(crate) transmit: u32,
 }
 
 impl DataSegment {
-    /// The payload.
     #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.payload
     }
 
     fn parse(conv: u16, option: SegmentOption, buf: &[u8]) -> Option<(Self, &[u8])> {
-        // Upstream requires at least 15 bytes here — deliberately not 14,
-        // so a zero-length payload cannot round-trip. See `segment.go`.
         if buf.len() < 15 {
             return None;
         }
@@ -149,27 +124,18 @@ impl DataSegment {
     }
 }
 
-/// An acknowledgement segment: the receiver's clock, its next-expected
-/// number and the list of explicitly-acknowledged numbers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AckSegment {
-    /// Conversation id.
     pub conv: u16,
-    /// Header flags.
     pub option: SegmentOption,
-    /// Last number the sender may use (`next_number + window_size`).
     pub receiving_window: u32,
-    /// Next number the receiver wants.
     pub receiving_next: u32,
-    /// Receiver's clock.
     pub timestamp: u32,
-    /// Explicitly acknowledged numbers.
     pub numbers: Vec<u32>,
     limit: usize,
 }
 
 impl AckSegment {
-    /// A fresh ack segment with capacity `limit`; upstream clamps to 1..=128.
     #[must_use]
     pub fn new(limit: usize) -> Self {
         Self {
@@ -183,25 +149,21 @@ impl AckSegment {
         }
     }
 
-    /// Upstream `PutNumber`.
     pub fn put_number(&mut self, number: u32) {
         self.numbers.push(number);
     }
 
-    /// Upstream `PutTimestamp`: the newest on the wrap-aware comparison.
     pub fn put_timestamp(&mut self, timestamp: u32) {
         if timestamp.wrapping_sub(self.timestamp) < 0x7FFF_FFFF {
             self.timestamp = timestamp;
         }
     }
 
-    /// Full at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.numbers.len() == self.limit
     }
 
-    /// Empty list.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.numbers.is_empty()
@@ -252,28 +214,17 @@ impl AckSegment {
     }
 }
 
-/// A command-only segment: ping, terminate, or any unrecognised command
-/// byte (upstream parses every unknown `cmd` as this shape when 12 payload
-/// bytes follow, and keeps the raw byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CmdOnlySegment {
-    /// Conversation id.
     pub conv: u16,
-    /// The raw command byte, preserved verbatim (upstream `Command` is a
-    /// `byte`, so every value round-trips; `u8` keeps that bit-exact).
     pub cmd: u8,
-    /// Header flags.
     pub option: SegmentOption,
-    /// Sender's first unacknowledged number.
     pub sending_next: u32,
-    /// Receiver's next expected number.
     pub receiving_next: u32,
-    /// Peer's current RTO estimate.
     pub peer_rto: u32,
 }
 
 impl CmdOnlySegment {
-    /// Empty instance.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -286,7 +237,6 @@ impl CmdOnlySegment {
         }
     }
 
-    /// The command byte as a known variant, when it names one.
     #[must_use]
     pub fn kind(&self) -> Option<Command> {
         match self.cmd {
@@ -339,19 +289,14 @@ impl Default for CmdOnlySegment {
     }
 }
 
-/// One parsed segment: data, ack, or command-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
-    /// A data chunk.
     Data(DataSegment),
-    /// An ack batch.
     Ack(AckSegment),
-    /// Ping/terminate/unknown.
     CmdOnly(CmdOnlySegment),
 }
 
 impl Segment {
-    /// Conversation id.
     #[must_use]
     pub fn conversation(&self) -> u16 {
         match self {
@@ -361,8 +306,6 @@ impl Segment {
         }
     }
 
-    /// Purpose byte, when it names a known variant (`None` for an unknown
-    /// byte, which upstream also round-trips verbatim).
     #[must_use]
     pub fn command(&self) -> Option<Command> {
         match self {
@@ -372,7 +315,6 @@ impl Segment {
         }
     }
 
-    /// Serialized length.
     #[must_use]
     pub fn byte_size(&self) -> usize {
         match self {
@@ -382,7 +324,6 @@ impl Segment {
         }
     }
 
-    /// Serialize.
     pub fn serialize(&self, out: &mut Vec<u8>) {
         match self {
             Self::Data(s) => s.serialize(out),
@@ -391,7 +332,6 @@ impl Segment {
         }
     }
 
-    /// Header flags.
     #[must_use]
     pub fn option(&self) -> SegmentOption {
         match self {
@@ -402,8 +342,6 @@ impl Segment {
     }
 }
 
-/// Parse one segment off the front of `buf`; `None` on a bad segment.
-/// Upstream maps every unknown command byte to the command-only shape.
 #[must_use]
 pub fn read_segment(buf: &[u8]) -> Option<(Segment, &[u8])> {
     if buf.len() < 4 {
@@ -491,7 +429,6 @@ mod tests {
 
     #[test]
     fn unknown_command_bytes_round_trip_verbatim() {
-        // Build the bytes manually: cmd byte 250.
         let mut raw = vec![0, 3, 250, 0];
         raw.extend_from_slice(&1u32.to_be_bytes());
         raw.extend_from_slice(&2u32.to_be_bytes());
@@ -505,8 +442,6 @@ mod tests {
 
     #[test]
     fn a_zero_length_payload_does_not_round_trip() {
-        // The upstream's 15-byte minimum means a header-only data segment
-        // fails to parse: that is the format, ported as-is.
         let mut raw = vec![0, 1, 1, 0];
         raw.extend_from_slice(&3u32.to_be_bytes());
         raw.extend_from_slice(&4u32.to_be_bytes());

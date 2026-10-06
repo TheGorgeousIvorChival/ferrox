@@ -1,25 +1,5 @@
 name: speedtest
 
-# Live speedtest: paste share-links, get end-to-end numbers per core.
-#
-# One config at a time, one core at a time, each downloading the same static
-# file through the tunnel it dials: same server, same path, same hour. The
-# report is a job summary plus artefacts, never a README table — live numbers
-# decay the moment the server or the route changes, and a standing claim
-# about someone else's server is not a measurement, it is a rumour.
-#
-# Dispatch-only, by design. A schedule would load-test third-party servers on
-# a timer without anyone asking: only test servers you have permission to
-# measure, keep the bytes modest, and read the report as the path plus the
-# server plus the core, in that order of likely dominance.
-#
-# Secrets: the links arrive as a dispatch input, one `::add-mask::` per line
-# before anything runs, and never reach the report — the renderer only ever
-# sees redacted row labels (`#n remark | type= security= flow=`), and
-# `validate-live-speedtest.py` fails the run if a credential substring
-# appears in any publishable artefact. Engine configs and downloaded bytes
-# stay on the runner and are never uploaded. A raw `echo` of the input
-# anywhere in this file is a bug; grep for it in review.
 
 on:
   workflow_dispatch:
@@ -59,8 +39,6 @@ on:
         default: "1500"
         type: string
 
-# Queued, never cancelled: every byte belongs to somebody else's server, so a
-# truncated run spent their bandwidth without producing the number it spent it on.
 concurrency:
   group: speedtest-${{ github.ref }}
 
@@ -88,8 +66,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          # Same wheel the matrix installs, cached the same way, for the same
-          # reason: it is identical on every run.
           cache: pip
           cache-dependency-path: scripts/requirements-benchmark.txt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -97,9 +73,6 @@ jobs:
           shared-key: speedtest
       - name: check the upstream pins resolve
         run: ./scripts/check-upstream-pins.sh
-      # `--only` names the five engines the `cores` input defaults to. A dispatch
-      # that overrides `cores` to a subset still gets the pins it asks for, and the
-      # twelve-pin check above is unaffected.
       - name: fetch the pinned comparator trees
         run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,zeronet,xray-rust
       - name: install the chart dependency

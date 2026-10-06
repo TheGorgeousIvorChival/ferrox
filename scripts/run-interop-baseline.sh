@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Runs the full zeronet + xray-rust suites against ferrox-app, documents every per-test result, exits 0 on test failures. Usage: run-interop-baseline.sh [all|zeronet|xray-rust]
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

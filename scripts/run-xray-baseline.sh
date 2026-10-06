@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Runs all pinned xray-core Go tests against upstream itself, reports totals, exits 0 on test failures. Usage: run-xray-baseline.sh [go-pattern]
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

@@ -1,6 +1,3 @@
-//! Interop driver for the mkcp port: speaks the same client/server
-//! contract as the pinned Go harness in `scripts/kcp-oracle/interop`.
-
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 

@@ -1,20 +1,3 @@
-//! `WebSocket` carrier over blocking `TCP`, both roles.
-//!
-//! Upgrade handshake plus binary framing; the `VLESS` bytes ride unchanged.
-//!
-//! # Early data
-//!
-//! A `?ed=N` budget on the path — [`ferrox_core::transport::EarlyData`] —
-//! spends the layer above's first write inside the handshake: it travels as
-//! unpadded base64url in `Sec-WebSocket-Protocol` and no frame is sent for it.
-//! The whole write or nothing, and the boundary is inclusive, so a write longer
-//! than `N` is not truncated but sent as a frame with early data off for the
-//! connection. Nothing is copied: the decision reads the caller's own slice and
-//! the digits are encoded from it into the request this module was building
-//! anyway, so a handshake with a budget allocates what one without it does.
-//! `Xray-core`, `xray-rust` and `sing-box` each build a second string for those
-//! digits, and two of the three copy the payload into it before encoding.
-
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -23,35 +6,18 @@ use std::sync::{Arc, Mutex};
 
 use ferrox_core::transport::early_decode;
 
-/// `RFC 6455` upgrade fingerprint, shared by every implementation on the wire.
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-/// Largest handshake block read before the upgrade is refused, not buffered.
 const HEAD_LIMIT: usize = 16 * 1024;
-/// Largest single frame payload accepted; anything bigger closes fast.
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
-/// Binary data frame opcode.
 const OP_DATA: u8 = 0x02;
-/// Subsequent fragment opcode.
 const OP_CONT: u8 = 0x00;
-/// Close opcode.
 const OP_CLOSE: u8 = 0x08;
-/// Ping opcode, answered with a pong carrying the same payload.
 const OP_PING: u8 = 0x09;
-/// Pong opcode, never answered.
 const OP_PONG: u8 = 0x0A;
-/// Normal-closure body sent with each close frame.
 const CLOSE_BODY: [u8; 2] = [0x03, 0xE8];
 
-/// Standard base64 alphabet, the encoding both handshake keys arrive in.
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Standard base64 encode with padding, for handshake keys only.
-///
-/// The RFC 6455 half, and the reason this alphabet is spelled out here even
-/// though the early-data one lives in [`ferrox_core::transport`]: a
-/// `Sec-WebSocket-Key` is standard base64 *with* padding while the bytes beside
-/// it in the same handshake are url-safe without, which is a difference worth
-/// having in two places rather than one switch.
 fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -76,7 +42,6 @@ fn b64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Expected `Sec-WebSocket-Accept` for a client key, per `RFC 6455` section 1.3.
 fn accept_key(key: &str) -> String {
     use sha1::Digest as _;
     let mut hash = sha1::Sha1::new();
@@ -85,24 +50,12 @@ fn accept_key(key: &str) -> String {
     b64_encode(&hash.finalize())
 }
 
-/// Sixteen fresh random bytes as standard base64, the client handshake key.
 fn fresh_key() -> Option<String> {
     let mut raw = [0u8; 16];
     getrandom::getrandom(&mut raw).ok()?;
     Some(b64_encode(&raw))
 }
 
-/// XOR `buf` with the 4-byte mask repeated; the mask period divides 16, so
-/// whole 16-byte chunks take one vector XOR each and only the tail stays
-/// scalar.
-///
-/// One spelling per baseline vector ISA, chosen at compile time: `SSE2` is
-/// part of `x86_64` and `NEON` part of `aarch64`, so neither needs a runtime
-/// probe. Lane-wise XOR is lane-wise XOR on each, so the bytes are identical
-/// however the machine vectorizes. This crate's `Miri` job covers only
-/// `ferrox-core`, so these intrinsics are discharged the same way the
-/// `ChaCha20` backends are: by the differential test below, at every chunk
-/// edge, rather than by interpretation.
 fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
     let wide = [
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3], mask[0], mask[1],
@@ -117,12 +70,6 @@ fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
     }
 }
 
-/// XOR one 16-byte block with the repeated mask, in a single vector op.
-///
-/// `inline(always)`: the `x86_64` build must not outline this away from whatever
-/// calls it into a context without the baseline features the body assumes —
-/// outlining would spill the block to the stack on every call. Same reason as
-/// the lane primitives in the `ChaCha20` core.
 #[allow(
     clippy::inline_always,
     reason = "load-bearing: keeps the vector op inlined at every call site"
@@ -132,9 +79,6 @@ fn xor_block(chunk: &mut [u8; 16], wide: &[u8; 16]) {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
-        // SAFETY: unaligned loads and stores need no alignment; both sides are
-        // exactly 16 bytes, read and written once, and the instructions retain
-        // nothing after they return.
         unsafe {
             let data = _mm_loadu_si128(chunk.as_ptr().cast());
             let key = _mm_loadu_si128(wide.as_ptr().cast());
@@ -144,8 +88,6 @@ fn xor_block(chunk: &mut [u8; 16], wide: &[u8; 16]) {
     #[cfg(target_arch = "aarch64")]
     {
         use core::arch::aarch64::{veorq_u8, vld1q_u8, vst1q_u8};
-        // SAFETY: `NEON` is baseline on `aarch64`, so no feature gate is
-        // needed; the loads and store each touch exactly 16 live bytes.
         unsafe {
             let data = vld1q_u8(chunk.as_ptr());
             let key = vld1q_u8(wide.as_ptr());
@@ -160,14 +102,6 @@ fn xor_block(chunk: &mut [u8; 16], wide: &[u8; 16]) {
     }
 }
 
-/// Four fresh random bytes, the mask of one client frame.
-///
-/// Batched: one `getrandom` per 512 frames, not one per frame. The bytes are
-/// still fresh `getrandom` bytes per frame, from the same source; they are just
-/// drawn 2048 at a time from a thread-local batch. A mask is sent on the wire
-/// and the peer unmasks with whatever it receives, so batching changes no byte
-/// the peer checks — it only removes the syscall. Returns `None` when the
-/// platform has no entropy, exactly as before.
 fn fresh_mask() -> Option<[u8; 4]> {
     thread_local! {
         static BATCH: RefCell<([u8; 2048], usize)> = const { RefCell::new(([0u8; 2048], 2048)) };
@@ -186,65 +120,34 @@ fn fresh_mask() -> Option<[u8; 4]> {
         .ok()?
 }
 
-/// Read until `\r\n\r\n`; `None` past the limit.
-///
-/// [`crate::proxy::read_http_head`] is the one implementation of this, and it is
-/// peeked rather than read a byte at a time: the old loop did a one-byte `read_exact`
-/// per byte — a syscall per byte, ~500 syscalls for a 500-byte header. A header
-/// arrives in one packet, so one peek sees it all and the scan for `\r\n\r\n` is
-/// over bytes already in memory. `peek` does not consume, so the exact header length
-/// is then read with no over-read — pipelined bytes after the header stay in the
-/// kernel for the next reader, exactly as the byte loop left them. Same bytes, same
-/// limit, ~250x fewer syscalls per handshake, and the same answer for the two other
-/// carriers that were still doing it a byte at a time.
 fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
     crate::proxy::read_http_head(stream, HEAD_LIMIT)
 }
 
-/// Write handle shared by the relay thread and the control replies.
 #[derive(Debug)]
 struct Shared {
-    /// Socket half every frame is written through, one writer at a time.
     stream: Mutex<TcpStream>,
-    /// Whether a close frame already went out, so it goes out once.
     closed: AtomicBool,
 }
 
-/// Byte stream over `WebSocket` messages; `Read` yields message payload bytes.
 #[derive(Debug)]
 pub(crate) struct WsReader {
-    /// Socket half frames are read from.
     read: TcpStream,
-    /// Shared writer for pong and close replies.
     shared: Arc<Shared>,
-    /// Decoded payload bytes not yet consumed.
     backlog: Vec<u8>,
-    /// Consumed prefix of `backlog`; takes are counted, never shifted.
     bat: usize,
-    /// Early-data bytes served before the first message.
     early: Vec<u8>,
-    /// Consumed prefix of `early`; takes are counted, never shifted.
     eat: usize,
-    /// Whether the peer closed cleanly, after which reads report `EOF`.
     eof: bool,
 }
 
-/// Frame writer; cheap to clone for the relay thread.
 #[derive(Debug, Clone)]
 pub(crate) struct WsWriter {
-    /// Shared socket half every frame is written through.
     shared: Arc<Shared>,
-    /// Whether frames are masked, which only clients do.
     masked: bool,
 }
 
 impl WsReader {
-    /// Decode one frame head from the socket: `(fin, opcode, length, mask)`.
-    ///
-    /// Two reads however long the head is: the two base bytes, then the
-    /// extension and mask bytes in one second read. The old spelling read
-    /// each in turn — three syscalls for every masked 16-bit frame, which is
-    /// every relay message one way.
     fn frame_head(&mut self) -> Option<(bool, u8, usize, Option<[u8; 4]>)> {
         let mut head = [0u8; 2];
         crate::proxy::read_exact(&mut self.read, &mut head).ok()?;
@@ -284,16 +187,12 @@ impl WsReader {
         Some((fin, opcode, len, mask))
     }
 
-    /// Append one data frame's payload to the backlog, unmasked in place.
     fn data_into(&mut self, len: usize, mask: Option<[u8; 4]>) -> Option<()> {
         if len == 0 {
             return Some(());
         }
         self.backlog.reserve(len);
         let base = self.backlog.len();
-        // SAFETY: `reserve` made room and the read below writes every new byte
-        // before anything reads it; on a short read the tail is truncated back
-        // and `None` returned, so uninitialized bytes are never observed.
         unsafe {
             self.backlog.set_len(base + len);
         }
@@ -307,7 +206,6 @@ impl WsReader {
         Some(())
     }
 
-    /// Decode one data message into the backlog, answering ping and close inline.
     fn message(&mut self) -> Option<usize> {
         let base = self.backlog.len();
         let mut open = false;
@@ -356,7 +254,6 @@ impl WsReader {
         }
     }
 
-    /// Answer a control frame through the shared writer, at most one close.
     fn reply(&self, opcode: u8, payload: &[u8]) {
         if opcode == OP_CLOSE && self.shared.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -369,7 +266,6 @@ impl WsReader {
 }
 
 impl Read for WsReader {
-    /// Fill `buf` with message payload bytes; empty means clean `EOF`.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -402,7 +298,6 @@ impl Read for WsReader {
 }
 
 impl WsWriter {
-    /// Send one binary message, returning `false` when the socket is gone.
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
@@ -410,11 +305,6 @@ impl WsWriter {
         write_frame(&mut stream, self.masked, OP_DATA, data)
     }
 
-    /// Send the close frame once, however the relay is ending.
-    ///
-    /// `pub(crate)` because a carried protocol ends its carrier itself: a relay
-    /// over this carrier has to close the carrier when it stops, and it is not
-    /// this module's relay.
     pub(crate) fn close(&self) {
         if self.shared.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -426,13 +316,6 @@ impl WsWriter {
     }
 }
 
-/// [`Write`] over one message per call: bytes in, one binary message out.
-///
-/// The peer reads a byte stream over messages and never looks at the boundary,
-/// so one message per `write` is a byte-identical stream however the caller
-/// sizes its writes. This stages nothing: a caller that writes three slices
-/// sends three messages carrying the same bytes in the same order, and `flush`
-/// is a no-op because there is nothing staged to flush.
 impl Write for WsWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         if self.send(data) {
@@ -447,31 +330,10 @@ impl Write for WsWriter {
     }
 }
 
-// The buffer a masked frame is staged in, one per thread that sends one.
-//
-// Masking has to happen somewhere that is not the caller's buffer, so the frame is
-// assembled in a scratch buffer and written from there — but the scratch does not have
-// to be fresh. This form allocated and freed the whole frame, head, mask and payload,
-// for every message: on a 16 KiB frame that is a 16 KiB `malloc`/`free` pair on the
-// hot path, for a buffer whose shape is the same every time. Reused, it is one
-// allocation per thread, and a thread that relays one connection holds it for exactly
-// that connection's life.
-//
-// Per thread rather than per writer, because the frame is built while the shared
-// writer lock is held and a lock is what a shared buffer would have to sit behind.
 thread_local! {
     static MASKED_FRAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Encode one frame onto the stream; clients mask, servers never do.
-///
-/// The header rides on the stack and goes out with the body in one syscall
-/// where the platform allows it (see [`crate::proxy::write_all_two`]), so an
-/// unmasked frame allocates nothing: the old form staged header plus body in
-/// one `Vec`, a full copy of every message. Masked frames still stage once —
-/// the mask has to be applied somewhere that is not the caller's buffer — and
-/// now stage into [`MASKED_FRAME`] rather than a fresh allocation per message.
-/// Same bytes either way.
 fn write_frame(stream: &mut TcpStream, masked: bool, opcode: u8, data: &[u8]) -> bool {
     let flag: u8 = if masked { 0x80 } else { 0 };
     let mut head = [0u8; 10];
@@ -507,7 +369,6 @@ fn write_frame(stream: &mut TcpStream, masked: bool, opcode: u8, data: &[u8]) ->
     })
 }
 
-/// Accept the upgrade as a server, checking the configured path exactly.
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(WsReader, WsWriter)> {
     use std::fmt::Write as _;
     let mut read = stream;
@@ -535,15 +396,6 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(WsReader, WsWrite
     split(read, early, false)
 }
 
-/// Perform the upgrade as a client, verifying the accept key before use.
-///
-/// `first` is the layer above's first write, which is what a `?ed=` budget
-/// measures and what it carries: inside the handshake when the whole of it fits
-/// in `ed`, and in one frame after the `101` when it does not. It is spent
-/// either way, so the caller writes it here and not again, and `ed` of `0`
-/// leaves the bytes on the wire exactly where they were before the setting
-/// existed. Upstream calls this from inside the first `write` with the socket
-/// still held back; passing the bytes in costs one argument and no state.
 pub(crate) fn connect(
     stream: TcpStream,
     host: &str,
@@ -567,34 +419,18 @@ pub(crate) fn connect(
     let mut behind = Vec::new();
     behind.extend_from_slice(&head[at..]);
     let (reader, writer) = split(read, behind, true)?;
-    // An empty `first` is a caller with nothing to spend, and sends no frame:
-    // the shape every carrier test that writes after connecting is in.
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
     Some((reader, writer))
 }
 
-/// The upgrade request, and whether `first` went into it.
-///
-/// One buffer, built once, written once. The early-data line is appended in
-/// place with the request's own terminator trimmed off, so the encoded digits
-/// land in the allocation the handshake was going to make anyway rather than in
-/// a second string the four of them upstream would each have built. The returned
-/// flag is what the caller spends `first` on: in here, or in a frame.
 fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (String, bool) {
     let mut request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
-    // Inclusive boundary, and no truncation: past the budget the bytes travel in
-    // a frame and early data is off for the rest of the connection.
     let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
     if early {
-        // Two bytes, not four: the last two are the blank line's own CRLF and the
-        // header above it keeps its. Taking four joins the new line onto
-        // `Sec-WebSocket-Version`, and a server reading that finds no
-        // `Sec-WebSocket-Protocol` at all — the request parses and the payload
-        // silently vanishes, which is what run 37248505865 measured.
         request.truncate(request.len() - 2);
         request.push_str("Sec-WebSocket-Protocol: ");
         ferrox_core::transport::early_encode_into(&mut request, first);
@@ -603,7 +439,6 @@ fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (Str
     (request, early)
 }
 
-/// Split one socket into its reader and writer halves around early bytes.
 fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsWriter)> {
     let Ok(write) = read.try_clone() else {
         return None;
@@ -624,11 +459,6 @@ fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsW
     Some((reader, WsWriter { shared, masked }))
 }
 
-/// This carrier's write half, as a [`crate::proxy::CarrierSink`].
-///
-/// Two forwarding methods and nothing else: `relay_sink` is generic over the
-/// writer, so the call in the inner loop resolves to `WsWriter::send` here at
-/// compile time — the same direct call `relay` made when it was its own function.
 impl crate::proxy::CarrierSink for WsWriter {
     #[inline]
     fn send(&self, bytes: &[u8]) -> bool {
@@ -657,8 +487,6 @@ mod tests {
 
     #[test]
     fn mask_chunks_match_the_byte_loop() {
-        // The naive loop stays as the checker: any chunking mistake shows up as
-        // a byte difference, and unmasking twice must restore the plaintext.
         for len in [
             0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 255, 1024, 8192,
         ] {
@@ -732,13 +560,6 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// The upgrade request a budget produces, byte for byte.
-    ///
-    /// The claim is that `?ed=` adds one line and changes nothing else: the
-    /// request without it is the request with it minus that line and its
-    /// terminator, and the line is the payload's own base64url. Nothing is
-    /// truncated at the budget — a payload that does not fit produces no line at
-    /// all rather than a shorter one, which is the whole of the boundary rule.
     #[test]
     fn early_data_adds_one_line_and_truncates_nothing() {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -773,13 +594,6 @@ mod tests {
         }
     }
 
-    /// Early data over loopback, both sides of the budget's boundary.
-    ///
-    /// The payload arrives at the server either way, and with a budget that fits
-    /// it arrives with no frame on the wire to carry it — the property the
-    /// setting buys. Two peers here are this file's own two roles, so what is
-    /// proved is the bytes and the arithmetic; the peer that decides the row is
-    /// pinned Xray-core, through `conformance.yml`.
     #[test]
     fn early_data_reaches_the_server_with_and_without_a_budget_that_fits() {
         for budget in [2048u32, 4, 3] {
@@ -808,16 +622,11 @@ mod tests {
         }
     }
 
-    /// A configured budget serves the bare path, because a request's path has no
-    /// query in it and the configured one has lost `ed`. This is the shape the
-    /// two upstream early-data oracle rows use, in both carriers.
     #[test]
     fn a_configured_budget_serves_the_bare_path() {
         for path in ["/interop-ws?ed=2048", "/interop-ws"] {
             assert_eq!(EarlyData::split(path).path, "/interop-ws", "{path}");
         }
-        // `ed=` with nothing after it is not a budget at all, and Xray's guard
-        // skips the rewrite for it, so the query stays and nothing can match it.
         assert_eq!(EarlyData::split("/interop-ws?ed=").path, "/interop-ws?ed=");
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();

@@ -1,22 +1,12 @@
-//! `XHTTP` stream-one carrier over blocking `TCP`, both roles.
-//!
-//! One `POST` with a chunked body carries the uplink and one `200` with a
-//! chunked body carries the downlink, on the same connection. The `VLESS`
-//! bytes ride unchanged inside the chunks.
-
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Largest handshake block read before the exchange is refused, not buffered.
 const HEAD_LIMIT: usize = 64 * 1024;
-/// Largest relay chunk per direction, one `POST` chunk each way.
 const CHUNK: usize = 16 * 1024;
-/// Hex digits for chunk size lines.
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-/// Whether `configured` covers `requested` without crossing a name boundary.
 fn path_covers(configured: &str, requested: &str) -> bool {
     if configured == "/" {
         return requested.starts_with('/');
@@ -27,12 +17,10 @@ fn path_covers(configured: &str, requested: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Request target without its query string.
 fn bare_path(target: &str) -> &str {
     target.split_once('?').map_or(target, |(base, _)| base)
 }
 
-/// Header value for `name`, case-insensitive, trimmed, `None` when absent.
 fn header_value(head: &[u8], name: &str) -> Option<String> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
@@ -46,7 +34,6 @@ fn header_value(head: &[u8], name: &str) -> Option<String> {
     None
 }
 
-/// Read until `\r\n\r\n`, keeping pipelined bytes; `None` past the limit.
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut head = Vec::with_capacity(512);
     let mut probe = [0u8; 512];
@@ -70,7 +57,6 @@ fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-/// Write the chunk size line for `n` bytes into `out`, returning its length.
 fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
     debug_assert!((1..=CHUNK).contains(&n));
     let width = (usize::BITS - n.leading_zeros()).div_ceil(4) as usize;
@@ -82,17 +68,6 @@ fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
     width + 2
 }
 
-/// One bounded text line into `out`, without its `CRLF`; returns content length.
-///
-/// The old spelling read a byte per syscall and allocated a `Vec` per line —
-/// eight or so syscalls plus an allocator round trip for every 16 KiB chunk.
-/// This fills up to 128 bytes with one read into the pipelined prefix the
-/// body path already serves from, then scans: same acceptance, no per-line
-/// allocation, and the excess of a bulk read stays buffered for the body.
-///
-/// Acceptance is byte-for-byte the old rule: content over 127 bytes is refused
-/// (the old loop turned its 129th content byte into `None`), and a line still
-/// arriving returns for more rather than failing while it can still fit.
 fn read_line_into(reader: &mut XhttpReader, out: &mut [u8; 130]) -> Option<usize> {
     loop {
         if let Some(end) = reader.prefix[reader.at..]
@@ -124,7 +99,6 @@ fn read_line_into(reader: &mut XhttpReader, out: &mut [u8; 130]) -> Option<usize
     }
 }
 
-/// Chunk size of one size line, ignoring any `;` extension after it.
 fn chunk_size(line: &[u8]) -> Option<usize> {
     let text = std::str::from_utf8(line).ok()?;
     let size = text.split(';').next().unwrap_or_default().trim();
@@ -134,7 +108,6 @@ fn chunk_size(line: &[u8]) -> Option<usize> {
     usize::from_str_radix(size, 16).ok()
 }
 
-/// Byte stream over one `XHTTP` stream-one exchange; `Read` yields body bytes.
 #[derive(Debug)]
 pub(crate) struct XhttpReader {
     read: TcpStream,
@@ -145,7 +118,6 @@ pub(crate) struct XhttpReader {
 }
 
 impl XhttpReader {
-    /// Up to `buf.len()` body bytes, pipelined tail first, then the socket.
     fn body(&mut self, buf: &mut [u8]) -> Option<usize> {
         if self.at < self.prefix.len() {
             let n = (self.prefix.len() - self.at).min(buf.len());
@@ -160,13 +132,11 @@ impl XhttpReader {
     }
 }
 
-/// Frame writer; cheap to clone for the relay thread.
 #[derive(Debug, Clone)]
 pub(crate) struct XhttpWriter {
     shared: Arc<Shared>,
 }
 
-/// Socket half every chunk is written through, one writer at a time.
 #[derive(Debug)]
 struct Shared {
     stream: Mutex<TcpStream>,
@@ -174,7 +144,6 @@ struct Shared {
 }
 
 impl Read for XhttpReader {
-    /// Fill `buf` with downlink body bytes; empty means the zero chunk arrived.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -233,7 +202,6 @@ impl Read for XhttpReader {
 }
 
 impl XhttpWriter {
-    /// Send bytes as one or more chunks, `false` when the socket is gone.
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
@@ -250,7 +218,6 @@ impl XhttpWriter {
         }
         true
     }
-    /// End the upload with the zero chunk, exactly once however relay ends.
     pub(crate) fn finish(&self) {
         if self.shared.finished.swap(true, Ordering::SeqCst) {
             return;
@@ -262,12 +229,6 @@ impl XhttpWriter {
     }
 }
 
-/// [`Write`] over the upload: bytes in, chunks out.
-///
-/// The download side reassembles body bytes without looking at chunk
-/// boundaries, so one chunked `write` per call is a byte-identical stream
-/// however the caller sizes its writes. `flush` is a no-op — bytes go out on
-/// `write`, and ending the upload is [`XhttpWriter::finish`], not a flush.
 impl Write for XhttpWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         if self.send(data) {
@@ -282,7 +243,6 @@ impl Write for XhttpWriter {
     }
 }
 
-/// Split one socket into its chunked reader and writer halves.
 fn split(read: TcpStream, prefix: Vec<u8>) -> Option<(XhttpReader, XhttpWriter)> {
     let Ok(write) = read.try_clone() else {
         return None;
@@ -303,7 +263,6 @@ fn split(read: TcpStream, prefix: Vec<u8>) -> Option<(XhttpReader, XhttpWriter)>
     Some((reader, writer))
 }
 
-/// Accept stream-one as a server, checking the configured path covers the target.
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
     let (head, prefix) = read_head(&mut read)?;
@@ -325,7 +284,6 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, Xhtt
     split(read, prefix)
 }
 
-/// Perform stream-one as a client, checking the `200` chunked reply first.
 pub(crate) fn connect(
     stream: TcpStream,
     host: &str,
@@ -349,13 +307,6 @@ pub(crate) fn connect(
     split(read, prefix)
 }
 
-/// This carrier's write half, as a [`crate::proxy::CarrierSink`].
-///
-/// `close` is `finish`: the zero chunk. That is why this carrier does not use
-/// [`crate::proxy::relay_sink`] but [`crate::proxy::relay_sink_drained`], which
-/// closes the sink only after the uplink thread has drained — a zero chunk that
-/// wins that race ends the peer's reader before the last reply arrives, which
-/// reads as a clean but empty stream rather than an error.
 impl crate::proxy::CarrierSink for XhttpWriter {
     #[inline]
     fn send(&self, bytes: &[u8]) -> bool {
@@ -426,8 +377,6 @@ mod tests {
             reader.read_exact(&mut ping).expect("reads ping");
             assert_eq!(&ping, b"ping");
             assert!(writer.send(b"ping"));
-            // The close chunk is read, not dropped: closing with it unread
-            // resets the connection and loses the reply still in flight.
             let mut drained = Vec::new();
             reader.read_to_end(&mut drained).expect("drains the close");
             assert_eq!(drained, [] as [u8; 0]);

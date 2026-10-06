@@ -1,14 +1,5 @@
 name: pins
 
-# Pin resolution used to be three jobs of `ci.yml`, which meant every commit
-# paid for three clones of twelve upstream repositories to answer a question that
-# only changes when `upstream/pins.toml` or a script that reads it changes.
-#
-# No `push: main` leg, for the reason `ci.yml` dropped its own: a pin cannot be
-# changed by a merge that did not go through a pull request carrying this check,
-# and the schedule below watches `main` for the failure this job is actually
-# about — an upstream object that vanished or was force-pushed, which needs no
-# change here at all.
 on:
   pull_request:
     paths:
@@ -18,8 +9,6 @@ on:
       - "scripts/run-upstream-suite.sh"
       - ".github/workflows/pins.yml"
   schedule:
-    # Weekly, so a force-push or a deleted upstream object is caught without
-    # waiting for the next pin edit.
     - cron: "23 5 * * 1"
   workflow_dispatch:
 
@@ -34,15 +23,9 @@ jobs:
   pins:
     name: every upstream pin resolves
     runs-on: ubuntu-latest
-    # Twelve shallow fetches. The default six-hour ceiling on a check that
-    # normally takes minutes only matters when a fetch hangs, and when it does it
-    # should stop.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      # Every entry is checked and an unpinned one is rejected rather than
-      # skipped: a check that tolerates the entries it exists to enforce reads
-      # as coverage while providing none.
       - name: check the upstream pins resolve
         shell: bash
         run: ./scripts/check-upstream-pins.sh

@@ -1,31 +1,3 @@
-//! Gate 10: the fused `AES-128-GCM` engine against the `aes-gcm` crate it
-//! replaces.
-//!
-//! # What this gate is
-//!
-//! `aes-128-gcm` seals two hot paths — `VMess` data frames and `shadowsocks`
-//! chunks — and both used to run the `aes-gcm` crate. The replacement is
-//! `ferrox_core::aesgcm`: the same arithmetic re-associated so four blocks
-//! share one reduction, fused with the `CTR` pass so the message is read once.
-//! That is a "before" and an "after" of the same interface, so this gate is
-//! shaped like gate 7's: **every row asserts equal ciphertext and equal tag
-//! before either side is timed**, and the ratio goes to the same 0.95x bar
-//! gates 3, 4, 7 and 8 answer to.
-//!
-//! # What the reference is
-//!
-//! The crate, built exactly as the shipped path built it: on `x86_64` it
-//! reaches `AES-NI` + `PCLMULQDQ` by its own runtime dispatch, and on `aarch64`
-//! it reaches the `ARMv8` crypto backends under the two `--cfg`s `ci.yml` and
-//! `bench.yml` set for every build. The reference is therefore the *hardware*
-//! crate on every runner this gate times: a win here is not a soft-backend
-//! artefact, it is the re-association and the fusion.
-//!
-//! The session objects are built once per row, outside the timed loop — sealing
-//! and opening are what a live connection pays per frame, and that is what is
-//! timed. Each iteration seals the buffer and opens it again, so the loop is
-//! self-sustaining and neither side re-seeds.
-
 use std::fmt::Write as _;
 
 use aes_gcm::aead::AeadInPlace as _;
@@ -36,28 +8,18 @@ use ferrox_core::aesgcm::{Aes128Gcm, Aes256Gcm};
 use crate::count;
 use crate::framing::{timed_row, Row};
 
-/// The payload lengths the gate times: a short frame, the `shadowsocks`
-/// gate's middle lengths, and `MAX_CHUNK` itself.
 fn payloads() -> Vec<usize> {
     vec![64, 256, 512, 1400, 4096, 8171, 16_383]
 }
 
-/// Byte budget per timed section, so short lengths get more iterations and a
-/// short length is not decided by a single sample — gate 3's discipline.
 const BYTE_BUDGET: u64 = 4 * 1024 * 1024;
 
-/// What one allocation window counted, for the report to print.
 pub(crate) struct Window {
-    /// The chunk length the window ran at.
     len: usize,
-    /// What it allocated while the counting flag was up.
     counts: count::Counts,
-    /// Seal+open pairs the window ran.
     iters: u64,
 }
 
-/// The reference's backend, named for the report: a ratio is only attributable
-/// once both sides of it are named.
 fn reference_backend() -> &'static str {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -69,9 +31,6 @@ fn reference_backend() -> &'static str {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // The crate's `ARMv8` backends compile only behind the two `--cfg`s
-        // `ci.yml` and `bench.yml` set for every build, then runtime-dispatch;
-        // without them this row measures its soft tables and the text says so.
         if std::arch::is_aarch64_feature_detected!("aes")
             && std::arch::is_aarch64_feature_detected!("pmull")
         {
@@ -86,7 +45,6 @@ fn reference_backend() -> &'static str {
     }
 }
 
-/// Gate 10: every row's assertions, then every row timed.
 pub(crate) fn gate_aesgcm() -> (Vec<Row>, Vec<Window>) {
     let mut rows = Vec::new();
     let mut windows = Vec::new();
@@ -100,7 +58,6 @@ pub(crate) fn gate_aesgcm() -> (Vec<Row>, Vec<Window>) {
     (rows, windows)
 }
 
-/// One length: identity, allocations, then the seconds per seal+open.
 fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
     let key: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(17).wrapping_add(5));
     let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(1));
@@ -109,7 +66,6 @@ fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
     let ours = Aes128Gcm::new(&key);
     let reference = aes_gcm::Aes128Gcm::new_from_slice(&key).expect("key");
 
-    // Identity, before any timing: the same bytes and the same tag, both ways.
     let mut sealed_ours = plain.to_vec();
     let tag_ours = ours.seal_in_place(&nonce, aad, &mut sealed_ours);
     let mut sealed_ref = plain.to_vec();
@@ -127,9 +83,6 @@ fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
     );
     assert_eq!(opened, plain, "{len}: the same bytes back");
 
-    // No allocation per frame, over the window, with the counting allocator —
-    // the claim the relay makes, at gate 9's bar of under one per chunk. The
-    // engine itself holds no buffer: this window exists to *show* that.
     check_allocs(len, plain, &ours, windows);
 
     let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 200_000);
@@ -174,8 +127,6 @@ fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
     )
 }
 
-/// One length, `AES-256-GCM`: the same identity-and-allocation check as the
-/// 128 side, against the same crate both paths replaced.
 fn check_and_time_256(len: usize, plain: &[u8], _windows: &mut Vec<Window>) -> Row {
     let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(17).wrapping_add(5));
     let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(1));
@@ -243,15 +194,11 @@ fn check_and_time_256(len: usize, plain: &[u8], _windows: &mut Vec<Window>) -> R
     )
 }
 
-/// Iterations the allocation window runs, matching the other gates' discipline.
 const ALLOC_ITERS: u64 = 64;
 
-/// No allocation per seal+open pair, in the relay's own shape: buffers staged
-/// outside the window, the engine built outside it.
 fn check_allocs(len: usize, plain: &[u8], ours: &Aes128Gcm, windows: &mut Vec<Window>) {
     let nonce = [0xabu8; 12];
     let mut buf = plain.to_vec();
-    // One warm-up pair so the buffer's growth is not charged to the window.
     let tag = ours.seal_in_place(&nonce, b"", &mut buf);
     let _ = ours.open_in_place(&nonce, b"", &mut buf, &tag);
     let ((), counts) = count::measure(|| {
@@ -276,7 +223,6 @@ fn check_allocs(len: usize, plain: &[u8], ours: &Aes128Gcm, windows: &mut Vec<Wi
     });
 }
 
-/// The `AES-128-GCM` section of the report, appended after gate 9's.
 pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "\n## Gate 10 — the fused AES-128-GCM engine\n");

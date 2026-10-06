@@ -1,37 +1,4 @@
 #!/usr/bin/env bash
-# Fails on leak-prone surface inside `ferrox-core`.
-#
-# Three things have no legitimate spelling in the core, and each one has caused
-# a real incident in one of the projects this replaces:
-#
-# 1. DNS resolution. The parser splits `None` from `NoneToPublic` *without* a
-#    resolver (the dial path re-checks), so a name that reaches a resolver from
-#    inside the core is a DNS leak around the proxy, not a convenience.
-# 2. Memory-leak primitives. `Box::leak`, `mem::forget`, `ManuallyDrop` and
-#    `into_raw` have no use in a core whose allocation gate is zero: anything
-#    reaching for them is laundering a lifetime the borrow checker refused.
-# 3. Printing and wall-clock reads. The core is a library: `println!`/`dbg!`
-#    in it is noise on every caller's stdout, and `Instant::now` in it makes a
-#    supposedly deterministic function timing-dependent. Both live in
-#    `ferrox-bench` and `ferrox-app`, never here.
-#
-#    Two named exceptions, and both are paths rather than patterns so a clock read
-#    anywhere else in the core still fails this gate:
-#
-#    - `kcp/`. `KCP` is retransmission-timed by definition -- its RTO, its
-#      four-tick update interval and its probe every N packets are all wall-clock
-#      reads, and a congestion-controlled transport that ignored the clock would
-#      not be `KCP`.
-#    - `chacha/calibrate.rs`. One `ChaCha` block is a dependency chain with
-#      nothing to overlap, so which instruction set reaches its end first is a
-#      property of the microarchitecture and `CPUID` does not report it. This
-#      module measures once and picks between two cores that run the same twenty
-#      rounds through the same generic function, so the keystream is byte-identical
-#      either way: the clock decides which correct core runs, and cannot reach the
-#      output. It is a file of its own precisely so the exception stays this
-#      narrow.
-#
-# `git grep` over tracked files only, so untracked scratch never fails the job.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

@@ -1,9 +1,3 @@
-//! `VMess` `AEAD` framing over blocking `TCP`, both roles.
-//!
-//! Request header, response header and length-masked data frames; the `TCP`
-//! and `UDP` commands exist here, anything else closes fast rather than
-//! hanging a suite. `UDP` is one sealed frame per datagram each way.
-
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -13,44 +7,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proxy::read_exact;
 
-/// Wire auth id bytes.
 const AUTH_LEN: usize = 16;
-/// `AEAD` tag bytes per sealed block.
 const TAG_LEN: usize = 16;
-/// Largest plaintext bytes per data frame, matching the oracle's framing.
 const MAX_PLAIN: usize = 8192;
-/// Frames staged into one `write`, and so one syscall.
-///
-/// Four, not one, because a `write` costs the same whether it carries one frame
-/// or eight — see [`stage_frames`]. Four is where the measured curve flattens:
-/// eight frames of 8 KB are within noise of four, and eight would double the
-/// staging buffer for nothing.
 const FRAMES_PER_WRITE: usize = 4;
-/// Plaintext read in one go, so a fast source can fill [`FRAMES_PER_WRITE`]
-/// frames and pay one syscall for all of them.
 const READ_PLAIN: usize = MAX_PLAIN * FRAMES_PER_WRITE;
-/// Option bits that change data framing.
 const OPT_STREAM: u8 = 0x01;
-/// Option bit for `SHAKE`-masked lengths.
 const OPT_MASK: u8 = 0x04;
-/// Option bit for cleartext padding after each frame.
 const OPT_PAD: u8 = 0x08;
 
-/// Data cipher negotiated in the request header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Cipher {
-    /// Negotiate, always sent as `ChaCha20-Poly1305` like the oracle client does.
     Auto,
-    /// `AES-128-GCM` data frames.
     Aes,
-    /// `ChaCha20-Poly1305` data frames.
     Chacha,
-    /// Plaintext frames with no `AEAD`.
     None,
 }
 
 impl Cipher {
-    /// Parse a config `security` word, defaulting to `Auto`.
     pub(crate) fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "aes-128-gcm" => Self::Aes,
@@ -59,7 +33,6 @@ impl Cipher {
             _ => Self::Auto,
         }
     }
-    /// Wire code actually sent, with `Auto` resolved.
     fn code(self) -> u8 {
         match self {
             Self::Auto | Self::Chacha => 4,
@@ -67,7 +40,6 @@ impl Cipher {
             Self::None => 5,
         }
     }
-    /// Cipher from a wire code, `None` on any other value.
     fn from_code(value: u8) -> Option<Self> {
         match value {
             3 => Some(Self::Aes),
@@ -78,7 +50,6 @@ impl Cipher {
     }
 }
 
-/// Seen auth ids, rejecting verbatim replays within this process.
 fn replay_seen(id: &[u8; AUTH_LEN]) -> bool {
     static SEEN: OnceLock<Mutex<HashSet<[u8; AUTH_LEN]>>> = OnceLock::new();
     let mut guard = SEEN
@@ -88,7 +59,6 @@ fn replay_seen(id: &[u8; AUTH_LEN]) -> bool {
     !guard.insert(*id)
 }
 
-/// `HMAC-SHA256` pads for a key.
 fn hmac_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
     use sha2::Digest as _;
     let mut flat = [0u8; 64];
@@ -106,20 +76,14 @@ fn hmac_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
     (inner, outer)
 }
 
-/// One `HMAC-SHA256` with restartable state.
 struct Hmac {
-    /// Inner hash with its pad already fed.
     inner: sha2::Sha256,
-    /// Outer hash with its pad already fed.
     outer: sha2::Sha256,
-    /// Fresh inner for restarts.
     fresh_inner: sha2::Sha256,
-    /// Fresh outer for restarts.
     fresh_outer: sha2::Sha256,
 }
 
 impl Hmac {
-    /// New `HMAC` under `key`.
     fn fresh(key: &[u8]) -> Self {
         use sha2::Digest as _;
         let (ipad, opad) = hmac_pads(key);
@@ -134,17 +98,14 @@ impl Hmac {
             outer,
         }
     }
-    /// Feed bytes to the inner hash.
     fn push(&mut self, data: &[u8]) {
         use sha2::Digest as _;
         self.inner.update(data);
     }
-    /// Restore the post-pad state.
     fn restart(&mut self) {
         self.inner = self.fresh_inner.clone();
         self.outer = self.fresh_outer.clone();
     }
-    /// Finalize the `HMAC`.
     fn digest(&mut self) -> [u8; 32] {
         use sha2::Digest as _;
         let mid = self.inner.clone().finalize();
@@ -154,30 +115,8 @@ impl Hmac {
     }
 }
 
-/// Nested `VMess` key schedule, one link per path element.
-///
-/// # Why this costs `2^n` hashes for `n` path elements, and why it stays
-///
-/// `digest` on a link digests below twice — once for `mid`, once for the
-/// `seal_out || mid` close — so a depth-`n` schedule evaluates `2^n` salted
-/// `HMAC`s: one path element is `H_S(opad || H_S(ipad || key))`, two are
-/// `H_S(opad_A || H_S(ipad_A || opad_B || H_S(opad_A || H_S(ipad_A || ipad_B
-/// || key))))`, and three (every request-header schedule) are eight. Upstream
-/// Go pays the same tree through the same hash-function injection, and the
-/// oracle vectors pin the outputs, so the work is the specification rather
-/// than an implementation choice.
-///
-/// No regrouping removes it: each of the `2^n` leaves hashes a distinct input
-/// (inner pads versus outer pads interleaved per layer), and `SHA-256` gives
-/// no relation between distinct inputs to factor through — collapsing any two
-/// leaves would be a collision argument, not an optimisation. What removes
-/// work instead is never doing it: the per-user schedules ([`cached_keys`])
-/// and the hardware `SHA-256` behind `sha2/asm`, which is what makes the
-/// eight-leaf schedules affordable rather than cheap.
 enum Kdf {
-    /// Bottom link keyed by the fixed salt.
     Root(Box<Hmac>),
-    /// Upper link keyed by one path element over the link below.
     Link {
         below: Box<Kdf>,
         seal_in: [u8; 64],
@@ -186,11 +125,9 @@ enum Kdf {
 }
 
 impl Kdf {
-    /// Bottom link under the fixed salt.
     fn root() -> Self {
         Self::Root(Box::new(Hmac::fresh(b"VMess AEAD KDF")))
     }
-    /// Wrap the schedule with one more path element.
     fn wrap(mut self, key: &[u8]) -> Self {
         let (seal_in, seal_out) = hmac_pads(key);
         self.push(&seal_in);
@@ -200,14 +137,12 @@ impl Kdf {
             seal_out,
         }
     }
-    /// Feed bytes through to the bottom link.
     fn push(&mut self, data: &[u8]) {
         match self {
             Self::Root(h) => h.push(data),
             Self::Link { below, .. } => below.push(data),
         }
     }
-    /// Restore every link to its post-pad state.
     fn restart(&mut self) {
         match self {
             Self::Root(h) => h.restart(),
@@ -217,7 +152,6 @@ impl Kdf {
             }
         }
     }
-    /// Finalize the whole schedule.
     fn digest(&mut self) -> [u8; 32] {
         match self {
             Self::Root(h) => h.digest(),
@@ -234,7 +168,6 @@ impl Kdf {
     }
 }
 
-/// `VMess` key schedule over `key` and `path`.
 fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
     let mut chain = Kdf::root();
     for layer in path {
@@ -244,12 +177,10 @@ fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
     chain.digest()
 }
 
-/// First sixteen bytes of the schedule.
 fn kdf16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
     kdf(key, path)[..16].try_into().unwrap()
 }
 
-/// `MD5` of two slices concatenated.
 fn md5_two(first: &[u8], second: &[u8]) -> [u8; 16] {
     let mut input = [0u8; 52];
     let head = first.len().min(input.len());
@@ -259,12 +190,10 @@ fn md5_two(first: &[u8], second: &[u8]) -> [u8; 16] {
     md5::compute(&input[..head + tail]).0
 }
 
-/// Instruction key: `MD5` of the uuid bytes plus the fixed magic.
 fn instruction_key(uuid: &[u8; 16]) -> [u8; 16] {
     md5_two(uuid, b"c48619fe-8f02-49e0-b9e9-edf763e17e21")
 }
 
-/// Thirty-two-byte `ChaCha` key from a sixteen-byte data key.
 fn chacha_key(key: &[u8; 16]) -> [u8; 32] {
     let first = md5::compute(key).0;
     let second = md5::compute(first).0;
@@ -274,13 +203,6 @@ fn chacha_key(key: &[u8; 16]) -> [u8; 32] {
     out
 }
 
-/// Entry `i` is what eight bit-steps of the reflected polynomial do to `i`.
-///
-/// Built at compile time by the same eight bit-steps the old loop ran, so the
-/// table is not a description of `CRC-32` — it *is* the old loop, folded. The
-/// reflected polynomial `0xedb8_8320` and the `!0` seed and `!` finish are the
-/// same three values, so the checksum over a given twelve bytes is the same
-/// `u32` as before, and `crc32_matches_the_bit_at_a_time_loop` is what checks it.
 const fn crc_table() -> [u32; 256] {
     let mut table = [0u32; 256];
     let mut i = 0usize;
@@ -301,17 +223,8 @@ const fn crc_table() -> [u32; 256] {
     table
 }
 
-/// The eight bit-steps, once each, as data.
 const CRC_TABLE: [u32; 256] = crc_table();
 
-/// `IEEE CRC-32`, one byte at a time through [`CRC_TABLE`].
-///
-/// The bit-at-a-time form this replaces was eight iterations of a branch and a
-/// shift per byte, and it ran twice per request — once to seal the auth id and
-/// once to check it — over twelve bytes, so ninety-six unpredictable branches for
-/// a checksum the table answers in twelve loads. The auth id is small, so this is
-/// not a throughput path; it is on the per-request path, and ninety-six branches
-/// there is a misprediction every time.
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &byte in data {
@@ -320,7 +233,6 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// `FNV-1a` over the clear request header.
 fn fnv1a(data: &[u8]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
     for &byte in data {
@@ -330,30 +242,16 @@ fn fnv1a(data: &[u8]) -> u32 {
     hash
 }
 
-/// Fill a buffer with portable randomness, false when the platform has none.
 fn random_into(buf: &mut [u8]) -> bool {
     getrandom::getrandom(buf).is_ok()
 }
 
-/// Batched padding randomness: one `getrandom` per ~64 frames, not one per frame.
-///
-/// A frame carries up to 63 random trailing bytes nobody reads, and they were a
-/// fresh `getrandom` syscall each time — a syscall for ~32 average bytes, per
-/// frame, on the hot path. The bytes are still `getrandom` bytes, from the same
-/// source, still fresh per frame; they are just drawn 2048 at a time and sliced.
-/// The receiver discards padding without reading it, and the oracle does too,
-/// so batching changes no wire byte the peer checks — it only removes the
-/// syscall. `take` returns `None` when the platform has no entropy, which is
-/// what `random_into`'s `false` meant and what `write_frame` already reports.
 pub(crate) struct PadSource {
-    /// 2048 fresh bytes, sliced `at..` per frame.
     buf: [u8; 2048],
-    /// Next unused offset into `buf`.
     at: usize,
 }
 
 impl PadSource {
-    /// Fresh batch: one syscall per connection, not one per frame.
     pub(crate) fn fresh() -> Option<Self> {
         let mut buf = [0u8; 2048];
         if !random_into(&mut buf) {
@@ -362,11 +260,6 @@ impl PadSource {
         Some(Self { buf, at: 0 })
     }
 
-    /// `n` fresh random bytes, refilling the batch when fewer than `n` remain.
-    ///
-    /// `n` is at most 63 (the largest padding a frame carries), so the refill
-    /// runs at most once per 32 frames and amortizes to ~0.03 syscalls per
-    /// frame. Returns `None` when the refill finds no entropy.
     fn take(&mut self, n: usize) -> Option<&[u8]> {
         debug_assert!(n <= 64, "padding is at most 63 bytes");
         if self.at + n > self.buf.len() {
@@ -381,22 +274,12 @@ impl PadSource {
     }
 }
 
-/// Current unix seconds, zero when the clock is before the epoch.
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// The auth id's `AES-128-ECB` key schedule, built once and kept.
-///
-/// `aes::Aes128::new_from_slice` expands the key: ten rounds of S-box lookups and
-/// a round-key copy per block it can ever touch. Deriving it where the auth id was
-/// sealed meant expanding the key per auth id, and deriving the key bytes at all
-/// meant an `HMAC-SHA256` schedule per auth id — for a key that depends on the user
-/// and nothing else. An auth id is made once per connection on the client and
-/// checked once per connection on the server, so that was a key expansion and a
-/// full `KDF` chain on both sides of every dial.
 #[derive(Clone)]
 struct AuthKey(aes::Aes128);
 
@@ -407,21 +290,18 @@ impl std::fmt::Debug for AuthKey {
 }
 
 impl AuthKey {
-    /// The key an auth id is sealed under: `KDF16` of the instruction key.
     fn new(instruction: &[u8; 16]) -> Self {
         use aes::cipher::KeyInit as _;
         let bytes = kdf16(instruction, &[b"AES Auth ID Encryption"]);
         Self(aes::Aes128::new_from_slice(&bytes).expect("sixteen bytes is a key"))
     }
 
-    /// Seal one block in place.
     fn seal(&self, block: &mut [u8; 16]) {
         use aes::cipher::BlockEncrypt as _;
         let cell = aes::cipher::generic_array::GenericArray::from_mut_slice(block.as_mut_slice());
         self.0.encrypt_block(cell);
     }
 
-    /// Open one block in place.
     fn open(&self, block: &mut [u8; 16]) {
         use aes::cipher::BlockDecrypt as _;
         let cell = aes::cipher::generic_array::GenericArray::from_mut_slice(block.as_mut_slice());
@@ -429,28 +309,10 @@ impl AuthKey {
     }
 }
 
-/// Cached per-user keys: instruction plus expanded auth-id schedule.
 type CachedUserKeys = ([u8; 16], AuthKey);
 
-/// Per-UUID table of [`CachedUserKeys`], bounded at 64 users (see [`cached_keys`]).
 type UserKeyCache = std::collections::HashMap<[u8; 16], CachedUserKeys>;
 
-/// The instruction key plus the auth-id key schedule for one user, cached.
-///
-/// Both derive from the user's UUID and nothing else: `instruction_key` is one
-/// `MD5`, and `AuthKey::new` is one `KDF` (four `SHA256`) plus one `AES-128`
-/// key expansion. They were recomputed per connection on both roles — per dial
-/// on the client (`request_bytes`), per accept on the server (`accept_request`)
-/// — for bytes that never change while the user does. A server with one user
-/// handling 10k connections recomputed the same two values 10k times.
-///
-/// The cache is keyed by UUID and holds at most 64 users; beyond that it is
-/// cleared rather than grown, so a peer that sends a fresh UUID per dial pays
-/// recompute instead of this process paying unbounded memory. Clearing is
-/// always correct — it only discards work that is redone — and legitimate
-/// deployments (one or a few users) never reach it. The `Mutex` is per lookup,
-/// ~0.1µs for a clone of 32 bytes, against ~5µs of `MD5` + `KDF` + expansion
-/// it replaces.
 fn cached_keys(uuid: &[u8; 16]) -> CachedUserKeys {
     static CACHE: OnceLock<Mutex<UserKeyCache>> = OnceLock::new();
     let mut guard = CACHE
@@ -470,7 +332,6 @@ fn cached_keys(uuid: &[u8; 16]) -> CachedUserKeys {
     entry
 }
 
-/// Seal a header block under `AES-128-GCM`.
 fn seal_header(key: &[u8; 16], nonce: &[u8; 12], plain: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     use aes_gcm::aead::AeadInPlace as _;
     use aes_gcm::KeyInit as _;
@@ -483,7 +344,6 @@ fn seal_header(key: &[u8; 16], nonce: &[u8; 12], plain: &[u8], aad: &[u8]) -> Op
     Some(body)
 }
 
-/// Open a header block sealed the same way.
 fn open_header(key: &[u8; 16], nonce: &[u8; 12], sealed: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     use aes_gcm::aead::AeadInPlace as _;
     use aes_gcm::KeyInit as _;
@@ -504,7 +364,6 @@ fn open_header(key: &[u8; 16], nonce: &[u8; 12], sealed: &[u8], aad: &[u8]) -> O
     Some(body)
 }
 
-/// Response key and iv from the data key and iv.
 fn response_material(data_iv: &[u8; 16], data_key: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
     use sha2::Digest as _;
     let iv: [u8; 16] = sha2::Sha256::digest(data_iv)[..16].try_into().unwrap();
@@ -512,7 +371,6 @@ fn response_material(data_iv: &[u8; 16], data_key: &[u8; 16]) -> ([u8; 16], [u8;
     (key, iv)
 }
 
-/// Sealed response prefix the server sends right after the request.
 fn response_prefix(response_key: &[u8; 16], response_iv: &[u8; 16], auth: u8) -> Option<Vec<u8>> {
     let len_key = kdf16(response_key, &[b"AEAD Resp Header Len Key"]);
     let len_full = kdf(response_iv, &[b"AEAD Resp Header Len IV"]);
@@ -525,7 +383,6 @@ fn response_prefix(response_key: &[u8; 16], response_iv: &[u8; 16], auth: u8) ->
     Some(out)
 }
 
-/// Fresh auth id for one request.
 fn make_auth_id(key: &AuthKey) -> Option<[u8; 16]> {
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&now_secs().to_be_bytes());
@@ -538,7 +395,6 @@ fn make_auth_id(key: &AuthKey) -> Option<[u8; 16]> {
     Some(plain)
 }
 
-/// Whether an auth id decrypts, checksums and sits inside the time window.
 fn valid_auth_id(key: &AuthKey, auth_id: &[u8; 16]) -> bool {
     let mut plain = *auth_id;
     key.open(&mut plain);
@@ -548,16 +404,12 @@ fn valid_auth_id(key: &AuthKey, auth_id: &[u8; 16]) -> bool {
     u64::from_be_bytes(plain[..8].try_into().unwrap()).abs_diff(now_secs()) <= 120
 }
 
-/// Length-masking `SHAKE128` stream, one per direction when negotiated.
 struct Shake {
-    /// Expanding reader seeded with that direction's iv.
     reader: sha3::Shake128Reader,
-    /// Whether trailing padding lengths are drawn.
     padding: bool,
 }
 
 impl Shake {
-    /// Seed the stream with a direction iv.
     fn fresh(iv: &[u8; 16], padding: bool) -> Self {
         use sha3::digest::{ExtendableOutput as _, Update as _};
         let mut shake = sha3::Shake128::default();
@@ -567,17 +419,11 @@ impl Shake {
             padding,
         }
     }
-    /// Next two-byte draw.
     fn draw(&mut self) -> u16 {
         let mut buf = [0u8; 2];
         sha3::digest::XofReader::read(&mut self.reader, &mut buf);
         u16::from_be_bytes(buf)
     }
-    /// Padding length first, then the caller draws the mask.
-    ///
-    /// Test oracle only: the hot paths take both draws from
-    /// [`Shake::pad_and_mask`] or [`Shake::draws`] in one squeeze, and this
-    /// stays as the two-call spelling those are proved against.
     #[cfg(test)]
     fn pad_len(&mut self) -> u16 {
         if self.padding {
@@ -586,14 +432,6 @@ impl Shake {
             0
         }
     }
-    /// Padding length and mask draw from a single four-byte squeeze.
-    ///
-    /// The `XOF` output is a byte stream, so one four-byte read is the same
-    /// four bytes as two two-byte reads in order: the first two are the pad
-    /// draw `pad_len` would take and the next two the mask draw `draw` would
-    /// take. Same stream position afterwards, one call instead of two. When
-    /// padding is off the pad draw takes no bytes, so this takes two —
-    /// exactly what the two calls would have taken.
     fn pad_and_mask(&mut self, wire: u16) -> (usize, u16) {
         if self.padding {
             let mut buf = [0u8; 4];
@@ -605,13 +443,6 @@ impl Shake {
             (0, self.draw() ^ wire)
         }
     }
-    /// Raw pad and mask draws from a single squeeze, before the total is known.
-    ///
-    /// [`Shake::pad_and_mask`] takes the wire the mask is xored with, but the
-    /// write path computes that wire *from* the padding — the total is the
-    /// sealed length plus the padding — so it needs both draws first. Same
-    /// bytes in the same order as the two calls, one squeeze instead of two;
-    /// when padding is off the first half takes no bytes and is zero.
     fn draws(&mut self) -> (u16, u16) {
         if self.padding {
             let mut buf = [0u8; 4];
@@ -626,29 +457,16 @@ impl Shake {
     }
 }
 
-/// One direction's data cipher plus its counter and optional masker.
 pub(crate) struct Flow {
-    /// Negotiated cipher for this direction.
     cipher: Cipher,
-    /// `AES` cipher when negotiated.
     aes: Option<ferrox_core::aesgcm::Aes128Gcm>,
-    /// `ChaCha20-Poly1305` key when negotiated.
-    ///
-    /// The key, not a cipher object: [`ferrox_core::aead`] takes the key and
-    /// the nonce per frame and derives the `Poly1305` key itself, which is what
-    /// `RFC 8439` section 2.6 asks for and what the crate did too. Holding an
-    /// object here would mean holding state this path never reads.
     chacha: Option<[u8; 32]>,
-    /// Direction iv, seeding nonces and masking.
     iv: [u8; 16],
-    /// Frames sealed or opened so far.
     counter: u16,
-    /// Masking stream when the peer negotiated it.
     shake: Option<Shake>,
 }
 
 impl Flow {
-    /// Build a direction from the negotiated cipher, key, iv and options.
     fn fresh(
         cipher: Cipher,
         key: &[u8; 16],
@@ -664,7 +482,6 @@ impl Flow {
         };
         let (aes, chacha) = match actual {
             Cipher::Aes => (Some(ferrox_core::aesgcm::Aes128Gcm::new(key)), None),
-            // `chacha_key` cannot fail: it is two `MD5`s into a `[u8; 32]`.
             Cipher::Chacha => (None, Some(chacha_key(key))),
             Cipher::None => (None, None),
             Cipher::Auto => return None,
@@ -679,30 +496,23 @@ impl Flow {
             shake,
         })
     }
-    /// Nonce for the current counter.
     fn nonce(&self) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         nonce[2..].copy_from_slice(&self.iv[2..12]);
         nonce
     }
-    /// Seal one plaintext slice onto `out`.
     fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) -> bool {
         let at = out.len();
         out.extend_from_slice(plain);
         let sealed = match (&self.aes, &self.chacha) {
             (Some(aes), None) => {
-                // Sealed in place: `out[at..]` already holds the plaintext, and
-                // the fused engine turns it into the ciphertext where it sits.
                 let nonce = self.nonce();
                 let tag = aes.seal_in_place(&nonce, b"", &mut out[at..]);
                 out.extend_from_slice(&tag);
                 true
             }
             (None, Some(key)) => {
-                // Sealed in place: `out[at..]` already holds the plaintext, and
-                // `C = P XOR keystream` means it does not have to be handed over
-                // twice to be turned into the ciphertext that goes out.
                 let nonce = self.nonce();
                 let tag = ferrox_core::aead::chacha20_poly1305_seal_in_place(
                     key,
@@ -727,7 +537,6 @@ impl Flow {
         self.counter += 1;
         true
     }
-    /// Open one sealed chunk in place, returning its plaintext length.
     fn open_chunk(&mut self, chunk: &mut [u8]) -> Option<usize> {
         let plain_len = match (&self.aes, &self.chacha) {
             (Some(aes), None) => {
@@ -737,9 +546,6 @@ impl Flow {
                 let nonce = self.nonce();
                 let split = chunk.len() - TAG_LEN;
                 let (body, tag) = chunk.split_at_mut(split);
-                // `split` is `chunk.len() - TAG_LEN`, so `tag` is exactly
-                // sixteen bytes; `try_into` is the check that says so rather
-                // than an assertion.
                 let tag: &[u8; TAG_LEN] = <&[u8; TAG_LEN]>::try_from(&*tag).ok()?;
                 aes.open_in_place(&nonce, b"", body, tag)?;
                 split
@@ -751,13 +557,8 @@ impl Flow {
                 let nonce = self.nonce();
                 let split = chunk.len() - TAG_LEN;
                 let (body, tag) = chunk.split_at_mut(split);
-                // `split` is `chunk.len() - TAG_LEN`, so `tag` is exactly
-                // sixteen bytes; `try_into` is the check that says so rather
-                // than an assertion.
                 let tag: &[u8; TAG_LEN] = <&[u8; TAG_LEN]>::try_from(&*tag).ok()?;
-                ferrox_core::aead::chacha20_poly1305_decrypt_in_place(
-                    key, &nonce, b"", body, tag,
-                )?;
+                ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, &nonce, b"", body, tag)?;
                 split
             }
             (None, None) => chunk.len(),
@@ -771,7 +572,6 @@ impl Flow {
     }
 }
 
-/// Encode port plus address in the order the header carries them.
 fn encode_target(out: &mut Vec<u8>, target: &SocketAddr) {
     out.extend_from_slice(&target.port().to_be_bytes());
     match target.ip() {
@@ -786,7 +586,6 @@ fn encode_target(out: &mut Vec<u8>, target: &SocketAddr) {
     }
 }
 
-/// Decode the same encoding, resolving domain names where they appear.
 fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
     if *cursor + 3 > header.len() {
         return None;
@@ -828,22 +627,16 @@ fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
     }
 }
 
-/// Request bytes plus the session keys they were sealed under.
 type RequestParts = (Vec<u8>, [u8; 16], [u8; 16], u8);
 
-/// Build a client request and its session keys, for one command.
 fn request_bytes(
     uuid: &[u8; 16],
     cipher: Cipher,
     target: &SocketAddr,
     cmd: u8,
 ) -> Option<RequestParts> {
-    // Cached per user: the instruction is one `MD5` and the auth key one `KDF`
-    // plus one `AES` expansion, all of the UUID and nothing else.
     let (instruction, auth_key) = cached_keys(uuid);
     let auth_id = make_auth_id(&auth_key)?;
-    // One entropy call for every fixed field: six calls here used to mean six
-    // syscalls per dial, all for bytes one call already returns uniformly.
     let mut rand = [0u8; 16 + 16 + 1 + 8 + 1];
     if !random_into(&mut rand) {
         return None;
@@ -868,8 +661,6 @@ fn request_bytes(
     clear.push(cmd);
     encode_target(&mut clear, target);
     if pad_len > 0 {
-        // Stack, not heap: the old per-request `Vec` allocated to hold bytes
-        // nobody reads, then zeroed them just to overwrite them with random.
         let mut pad = [0u8; 15];
         if !random_into(&mut pad[..pad_len]) {
             return None;
@@ -907,7 +698,6 @@ fn request_bytes(
     Some((request, data_key, data_iv, auth[0]))
 }
 
-/// Read one sealed length plus its padding draws.
 fn read_wire_len(stream: &mut dyn Read, shake: Option<&mut Shake>) -> Option<(usize, usize)> {
     let mut prefix = [0u8; 2];
     read_exact(stream, &mut prefix).ok()?;
@@ -921,27 +711,6 @@ fn read_wire_len(stream: &mut dyn Read, shake: Option<&mut Shake>) -> Option<(us
     }
 }
 
-/// Write one data frame carrying `plain`, in a single write.
-///
-/// `staging` is the caller's buffer, reused across frames: this used to build a
-/// fresh `Vec` per frame, so every 8 KB frame cost one allocation on the way out
-/// as well as on the way in. The `AEAD` interface encrypts *in place*, so the
-/// plaintext still has to be laid down in a buffer the cipher owns — that copy is
-/// the interface's, not this function's — but it is now a copy into a warm buffer
-/// rather than a copy into a cold one.
-///
-/// The wire length rides in front of the sealed body in the same buffer, and the
-/// padding rides behind it, so the three `write_all` calls this used to make —
-/// length, body, padding — are one `write_all` of one contiguous buffer. Three
-/// syscalls per frame on a socket, where each is ~1µs and an 8 KB seal is ~4µs;
-/// for 100-byte frames the syscalls were 95% of the frame. The bytes are the
-/// same three slices concatenated, so a peer that read them as three reads sees
-/// the same stream; on a message-framed carrier the single write plus the flush
-/// below is still one message per frame, exactly as before.
-///
-/// `pad` is the caller's batched randomness (see [`PadSource`]): the padding
-/// bytes are still fresh `getrandom` bytes per frame, just drawn from a batch
-/// rather than a syscall each.
 pub(crate) fn write_frame(
     stream: &mut dyn Write,
     send: &mut Flow,
@@ -956,22 +725,9 @@ pub(crate) fn write_frame(
     write_frames(stream, staging)
 }
 
-/// Append one data frame carrying `plain` to `staging`, which must be empty.
-///
-/// Split from the `write` so that several frames can be staged and sent in one
-/// call — see [`stage_frames`]. The frame is `len` (2 bytes), sealed body, tag,
-/// padding, laid out in one buffer: the same bytes in the same order as the
-/// three separate `write_all`s this replaced.
 fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut PadSource) -> bool {
-    // `at` is where this frame starts and `body` where its ciphertext starts. The
-    // two bytes between them hold the length, which is not known until the padding
-    // has been drawn and is written into them afterwards — at *this frame's* two
-    // bytes, so a second frame in the same buffer does not overwrite the first's.
     let at = staging.len();
     let body = at + 2;
-    // Two placeholder bytes for the wire length. `seal_onto` appends after them
-    // (`at = out.len()`), so they are never encrypted — they are the length
-    // prefix, not the body.
     staging.extend_from_slice(&[0u8; 2]);
     if !send.seal_onto(plain, staging) {
         staging.truncate(at);
@@ -1006,27 +762,6 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
     true
 }
 
-/// Stage up to [`FRAMES_PER_WRITE`] frames from `plain` and send them in one
-/// `write`.
-///
-/// # Why several frames go out together
-///
-/// The `write` above costs the same whether it carries one frame or eight — on
-/// this machine ~2.2 µs on a socket with a reader on the other end, measured at
-/// every length from 2 bytes to 8 KB — so what a frame pays is per *frame* rather
-/// than per byte. Four frames of 8 KB in one call measured 12269 ns a frame
-/// against 14836 written one at a time, and four frames of 1500 B measured 3504
-/// against 4904.
-///
-/// The byte stream is what makes this safe: a frame is `len || sealed || pad` and
-/// the reader is a byte reader, so `[frame][frame]` in one `write` and in two are
-/// the same bytes in the same order. Nothing on the wire changes and nothing can
-/// tell, which is the property the length-masked framing already relies on. It is
-/// the same reason [`write_frame`] could stop writing three times.
-///
-/// The batch is flushed as soon as the plaintext runs out, so a connection
-/// carrying a byte at a time still writes a frame per byte: only a source that
-/// arrives faster than the seal does gets more than one frame per syscall.
 fn stage_frames(
     stream: &mut dyn Write,
     send: &mut Flow,
@@ -1035,9 +770,6 @@ fn stage_frames(
     pad: &mut PadSource,
 ) -> bool {
     staging.clear();
-    // An empty run still carries one frame: `write_frame` sends an empty frame for
-    // the close signal, and a batch that dropped it would make the two paths
-    // disagree about what "no plaintext" means.
     if plain.is_empty() {
         if !stage_frame(send, plain, staging, pad) {
             return false;
@@ -1061,11 +793,6 @@ fn stage_frames(
     write_frames(stream, staging)
 }
 
-/// Send everything staged, in one `write` and one `flush`.
-///
-/// The flush is what makes the carrier's message boundary the batch boundary on a
-/// message-framed carrier, which is what the peer's reader expects: it reads a
-/// byte stream out of the messages and never looks at the boundary.
 fn write_frames(stream: &mut dyn Write, staging: &[u8]) -> bool {
     if stream.write_all(staging).is_err() {
         return false;
@@ -1073,26 +800,6 @@ fn write_frames(stream: &mut dyn Write, staging: &[u8]) -> bool {
     stream.flush().is_ok()
 }
 
-/// Read one data frame into `scratch`, returning its plaintext length.
-///
-/// This is the hot read of the protocol and it used to do three things per frame
-/// that no frame needed. It allocated a zeroed buffer of the frame's length — a
-/// full-length memset of bytes that the very next `read_exact` overwrites
-/// wholesale, so on an 8 KB frame eight kilobytes were written twice. It then
-/// decrypted in place into that buffer and *allocated a second buffer and copied
-/// the plaintext out of it*, so the plaintext was moved once for no reason. And a
-/// padding-only frame allocated a third, to hold bytes it was about to discard.
-///
-/// `scratch` is the caller's, reused: after the first frame at a given length
-/// there is no allocation and no memset. The resize is the only memset left and it
-/// runs only when a frame is longer than every frame before it.
-///
-/// The return is a *borrow of `scratch`*, which is the part that matters: a
-/// function that returns `&'a [u8]` tied to `&'a mut Vec<u8>` cannot also have
-/// copied the plaintext somewhere, because there is nowhere to return it from. The
-/// copy that used to be here was not caught by a test asserting on buffer
-/// identity — it was caught by changing the return type, which is what a claim
-/// worth making should look like.
 pub(crate) fn read_frame<'a>(
     stream: &mut dyn Read,
     recv: &mut Flow,
@@ -1100,7 +807,6 @@ pub(crate) fn read_frame<'a>(
 ) -> Option<&'a [u8]> {
     let (total, padding) = read_wire_len(stream, recv.shake.as_mut())?;
     if total <= padding {
-        // Padding with no payload: read it to stay in step and keep none of it.
         let mut discard = [0u8; 64];
         let mut left = total;
         while left > 0 {
@@ -1128,19 +834,10 @@ pub(crate) fn read_frame<'a>(
     Some(&scratch[..len])
 }
 
-/// Client session: both directions plus the response keys to consume.
 pub(crate) type ClientSession = (Flow, Flow, [u8; 16], [u8; 16], u8);
 
-/// Request bytes plus the session they were sealed under, for dialing.
 pub(crate) type ClientRequest = (Vec<u8>, Flow, Flow, [u8; 16], [u8; 16], u8);
 
-/// Request bytes plus the session they were sealed under, for dialing.
-///
-/// [`client_handshake`] writes the request to the socket itself; a carried
-/// dial has no socket yet, only the carrier halves, so this returns the
-/// request to send through the carrier and the session around it. The caller
-/// answers with [`read_response`] through the carrier's reader before the
-/// relay starts, exactly as [`client_handshake`]'s caller does on the socket.
 pub(crate) fn client_request(
     id: &[u8; 16],
     cipher: Cipher,
@@ -1159,7 +856,6 @@ pub(crate) fn client_request(
     Some((request, send, recv, response_key, response_iv, auth))
 }
 
-/// Dial a `VMess` server for a target, returning the two directions.
 pub(crate) fn client_handshake(
     uplink: &mut TcpStream,
     id: &[u8; 16],
@@ -1174,7 +870,6 @@ pub(crate) fn client_handshake(
     Some((send, recv, response_key, response_iv, auth))
 }
 
-/// Read and check the server's response header on a client stream.
 pub(crate) fn read_response(
     stream: &mut dyn Read,
     response_key: &[u8; 16],
@@ -1211,7 +906,6 @@ pub(crate) fn read_response(
     clear_body.len() == 4 && clear_body[0] == auth
 }
 
-/// Read and open one sealed request header, returning its clear bytes.
 fn read_open_header(
     stream: &mut dyn Read,
     instruction: &[u8; 16],
@@ -1245,7 +939,6 @@ fn read_open_header(
     let head_nonce: [u8; 12] = head_full[..12].try_into().unwrap();
     open_header(&head_key, &head_nonce, &sealed_head, auth_id)
 }
-/// Decode clear header bytes into its target, flows, response prefix and command.
 fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)> {
     if header.len() < 38 || header[0] != 1 || header[34] & OPT_STREAM == 0 {
         return None;
@@ -1277,15 +970,12 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
     let send = Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)?;
     Some((target, send, recv, prefix, cmd))
 }
-/// Read and check one request, returning its target, both directions and command.
 fn accept_request(
     stream: &mut dyn Read,
     id: &[u8; 16],
 ) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)> {
     let mut auth_id = [0u8; AUTH_LEN];
     read_exact(stream, &mut auth_id).ok()?;
-    // Cached per user, as on the client: the same UUID maps to the same
-    // instruction and the same expanded key, every connection.
     let (instruction, auth_key) = cached_keys(id);
     if !valid_auth_id(&auth_key, &auth_id) || replay_seen(&auth_id) {
         return None;
@@ -1294,27 +984,12 @@ fn accept_request(
     decode_header(&header)
 }
 
-/// A [`Write`] sink that turns each flush into one `WebSocket` binary message.
-///
-/// `VMess` frames are written as several `write_all` calls — length, body,
-/// padding — and the `ws` carrier is message-framed rather than byte-framed, so
-/// without this each of those calls would become its own message and a single
-/// frame would arrive as three. Buffering until `flush` makes the carrier's
-/// message boundary the frame boundary, which is what the peer's reader expects:
-/// it reads a byte stream out of the messages and never looks at the boundary.
-///
-/// `pub(crate)` because the carried dial builds its sink where the
-/// carrier is known, one module over.
 pub(crate) struct WsSink {
-    /// Carrier the message goes out through.
     writer: crate::ws::WsWriter,
-    /// Bytes written since the last flush, one message's worth.
     staged: Vec<u8>,
 }
 
 impl WsSink {
-    /// One message per relay read: a read stages at most [`FRAMES_PER_WRITE`]
-    /// frames, so the message boundary stays the batch boundary.
     pub(crate) fn carried(writer: crate::ws::WsWriter) -> Self {
         Self {
             writer,
@@ -1343,20 +1018,6 @@ impl std::io::Write for WsSink {
     }
 }
 
-/// Relay sealed both ways where the sealed side is a carrier rather than a
-/// socket.
-///
-/// The frame logic is [`pump_relay`]'s, unchanged: `read_frame` and
-/// `write_frame` take `dyn Read` and `dyn Write`, so the carrier substitutes for
-/// the socket and nothing above them can tell which it was. What differs is only
-/// the plumbing — a carrier has a reader half and a writer half rather than one
-/// object that clones four ways, and closing it is a close frame (or a zero
-/// chunk, or a shutdown) instead of a `shutdown`.
-///
-/// `writer` is the whole write side, moved into the uplink thread that owns it.
-/// `close` runs at both ends because either direction can end first, so it must
-/// be idempotent — every carrier's close is — and shared, because the thread
-/// that did not take `writer` still has to be able to end the carrier.
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &TcpStream,
     mut reader: R,
@@ -1381,9 +1042,6 @@ pub(crate) fn pump_relay_carried<R, W>(
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
         let mut buf = vec![0u8; READ_PLAIN];
-        // Every frame of one read — `FRAMES_PER_WRITE` of them, each a `MAX_PLAIN`
-        // body plus its two-byte wire prefix, tag and up to 63 bytes of padding.
-        // Nothing here grows per frame.
         let batched = READ_PLAIN + FRAMES_PER_WRITE * (TAG_LEN + 2 + 64);
         let mut staging = Vec::with_capacity(batched);
         let Some(mut pad) = PadSource::fresh() else {
@@ -1430,12 +1088,6 @@ pub(crate) fn pump_relay_carried<R, W>(
     let _ = done.join();
 }
 
-/// Accept one `VMess` connection inside a `ws` carrier, dial and relay.
-///
-/// The header is a hundred bytes or so of sealed material behind an eight-byte
-/// auth id, so it is read to the byte and never to the packet: the carrier's
-/// reader is a byte stream over messages, and a short read here is a hang wearing
-/// a successful handshake.
 pub(crate) fn serve_ws(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
@@ -1452,14 +1104,11 @@ pub(crate) fn serve_ws(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bo
     if !writer.send(&prefix) {
         return;
     }
-    // One batch per message: the sink's staging is what makes the message
-    // boundary the batch boundary, exactly as before this pump took a sink.
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
     pump_relay_carried(&uplink, reader, WsSink::carried(writer), &close, send, recv);
 }
 
-/// Accept one `VMess` connection inside a `gRPC` tunnel, dial and relay.
 pub(crate) fn serve_grpc(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
         return;
@@ -1481,14 +1130,6 @@ pub(crate) fn serve_grpc(stream: TcpStream, path: &str, id: &[u8; 16], freedom: 
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-/// Accept one `VMess` connection inside an `XHTTP` carrier, dial and relay.
-///
-/// The chunked bodies are a byte stream, so this is [`serve_ws`]'s shape with
-/// the upload writer in place of the message sink: no per-message staging,
-/// because there are no messages. The download is buffered for the same reason the raw path is —
-/// the two-byte wire prefix and the body it names should come from one syscall
-/// when they arrive together, not one syscall for two bytes and another for
-/// the body.
 pub(crate) fn serve_xhttp(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
@@ -1512,11 +1153,6 @@ pub(crate) fn serve_xhttp(stream: TcpStream, path: &str, id: &[u8; 16], freedom:
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-/// Accept one `VMess` connection behind the `HTTP` camouflage, dial and relay.
-///
-/// Past the `GET` and the `200` this is raw bytes both ways, so the write side
-/// is the socket itself and the close is a shutdown — [`pump_relay`]'s shape
-/// over the carrier's reader.
 pub(crate) fn serve_httpheader(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
@@ -1546,7 +1182,6 @@ pub(crate) fn serve_httpheader(stream: TcpStream, path: &str, id: &[u8; 16], fre
     pump_relay_carried(&uplink, reader, write, &close, send, recv);
 }
 
-/// Accept one `VMess` connection past the `HTTPUpgrade` `101`, dial and relay.
 pub(crate) fn serve_httpupgrade(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path) else {
         return;
@@ -1576,7 +1211,6 @@ pub(crate) fn serve_httpupgrade(stream: TcpStream, path: &str, id: &[u8; 16], fr
     pump_relay_carried(&uplink, reader, write, &close, send, recv);
 }
 
-/// Accept one `VMess` connection, dial its target and relay sealed both ways.
 pub(crate) fn serve(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
     let Some((target, send, recv, prefix, cmd)) = accept_request(&mut stream, id) else {
         return;
@@ -1599,13 +1233,6 @@ pub(crate) fn serve(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
     pump_relay(&uplink, &stream, send, recv, None);
 }
 
-/// Serve one `VMess` `UDP` flow over raw `TCP`: dial the target, answer the
-/// response prefix, then pump sealed datagram frames both ways.
-///
-/// One sealed frame per datagram each way, which is the packet-mode framing
-/// every peer writes: the length mask delimits frames, so no extra prefix is
-/// needed and none is added. The target is fixed by the header, so like the
-/// `VLESS` pump there is nothing to re-dial.
 pub(crate) fn serve_vmess_udp(
     stream: TcpStream,
     target: &SocketAddr,
@@ -1631,10 +1258,8 @@ pub(crate) fn serve_vmess_udp(
     crate::proxy::pump_vmess_udp(&stream, &udp, send, recv);
 }
 
-/// Response keys the client still has to consume, read on first reply.
 pub(crate) type PendingResponse = ([u8; 16], [u8; 16], u8);
 
-/// Relay plaintext one side against sealed frames the other, both ways to close.
 pub(crate) fn pump_relay(
     plain: &TcpStream,
     sealed: &TcpStream,
@@ -1661,11 +1286,6 @@ pub(crate) fn pump_relay(
     let mut send = send;
     let done = thread::spawn(move || {
         let mut buf = vec![0u8; READ_PLAIN];
-        // Both of these outlive the loop on purpose: the staging buffer holds every
-        // frame of one read — `FRAMES_PER_WRITE` of them, each a `MAX_PLAIN` body
-        // plus its two-byte wire prefix, tag and up to 63 bytes of padding — and one
-        // batch of padding randomness is enough for every frame this connection
-        // sends. Nothing here grows per frame.
         let mut staging = Vec::with_capacity(READ_PLAIN + FRAMES_PER_WRITE * (TAG_LEN + 2 + 64));
         let Some(mut pad) = PadSource::fresh() else {
             return;
@@ -1699,13 +1319,6 @@ pub(crate) fn pump_relay(
         let _ = sealed_write.shutdown(Shutdown::Both);
     });
     let mut recv = recv;
-    // Buffered so the two-byte wire prefix and the body it names come from one
-    // syscall when they arrive together — which they do, because `write_frame`
-    // sends them as one write. Unbuffered, every frame paid a syscall for two
-    // bytes and another for the body; for 100-byte frames that was 95% of the
-    // read path. The buffer adds a copy (into `scratch` via the buffer), but a
-    // 16 KB copy is ~0.8µs and the syscall it removes is ~1µs — and one syscall
-    // now serves ~160 hundred-byte frames instead of half of one.
     let mut sealed_reader = std::io::BufReader::with_capacity(16 * 1024, sealed_read);
     if let Some((response_key, response_iv, auth)) = pending {
         if !read_response(&mut sealed_reader, &response_key, &response_iv, auth) {
@@ -1715,8 +1328,6 @@ pub(crate) fn pump_relay(
             return;
         }
     }
-    // One buffer for every frame this connection receives, decrypted where it
-    // lands and written straight out from there.
     let mut scratch = Vec::with_capacity(MAX_PLAIN + TAG_LEN + 64);
     while let Some(chunk) = read_frame(&mut sealed_reader, &mut recv, &mut scratch) {
         if chunk.is_empty() || plain_write.write_all(chunk).is_err() {
@@ -1792,17 +1403,8 @@ mod tests {
         assert_eq!(writer.join().expect("joins"), b"ping");
     }
 
-    /// `VMess` inside the `ws` carrier, both roles, end to end.
-    ///
-    /// This is the row that could not be carried before: the framing was written
-    /// against `&mut TcpStream` at every level, so a `ws` listener had no path
-    /// into it. The request is a sealed header, not a fixed-size prologue, so the
-    /// carrier's reader has to hand it over to the byte — a short read here is a
-    /// hang wearing a successful handshake, which is exactly what the raw-`TCP`
-    /// oracle reported when it pointed this binary at a `ws` listener.
     #[test]
     fn vmess_carries_over_the_ws_carrier_both_ways() {
-        // An echo server to be the tunnel target.
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds echo");
         let echo_port = echo.local_addr().expect("echo addr").port();
         thread::spawn(move || {
@@ -1826,8 +1428,6 @@ mod tests {
             serve_ws(stream, &server_path, &server_id, true);
         });
 
-        // Client side: the same handshake the socket path builds, sent as ws
-        // messages instead of written to the socket.
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
@@ -1872,14 +1472,6 @@ mod tests {
         assert_eq!(back, b"ping", "the echo came back through the carrier");
     }
 
-    /// `VMess` over one byte-stream carrier, both roles, end to end.
-    ///
-    /// `serve` accepts one carrier connection and serves `VMess` on it;
-    /// `connect` dials the same carrier back as boxed halves, so this one
-    /// function covers every carrier whose reader is a byte stream. The
-    /// handshake and one sealed frame go through the carrier exactly as they
-    /// go through the socket: the same [`request_bytes`], the same
-    /// [`read_response`], the same sealed `ping` and its echo.
     fn vmess_over_byte_carrier(
         path: &str,
         serve: impl FnOnce(TcpStream, [u8; 16]) + Send + 'static,
@@ -2035,10 +1627,6 @@ mod tests {
         assert_eq!(back, b"ping");
     }
 
-    /// The table and the loop it replaced have to agree, and agreeing with each
-    /// other is not enough: both would be wrong together if the polynomial were
-    /// mistyped once. So every one of the 256 entries is reached, several lengths
-    /// are compared against the loop, and the published check value is asserted.
     #[test]
     fn crc32_is_the_bit_at_a_time_loop_folded() {
         fn bit_at_a_time(data: &[u8]) -> u32 {
@@ -2065,25 +1653,9 @@ mod tests {
                 .collect();
             assert_eq!(crc32(&data), bit_at_a_time(&data), "length {len}");
         }
-        // The published `CRC-32` check value: the table is this polynomial, not
-        // merely the one the old loop happened to implement.
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
 
-    /// Coalescing frames into one `write` must not change one byte on the wire.
-    ///
-    /// This is the whole claim [`stage_frames`] rests on: a frame is
-    /// `len || sealed || padding`, the reader is a byte reader, so four frames
-    /// written in one call and written one call each are the same bytes in the same
-    /// order. So this compares the two frame by frame, over the shapes the batching
-    /// actually sees: one frame, several, exactly [`FRAMES_PER_WRITE`], and a short
-    /// body that is one frame with a partial one behind it.
-    ///
-    /// The padding is random by construction, so the two streams cannot be equal as
-    /// bytes and are not meant to be. What has to match is every frame's length
-    /// prefix, its sealed body, and its padding *length*; both directions draw from
-    /// the same `SHAKE` stream over the same iv and the same frame counter, so a
-    /// third stream over the same seed walks both without reading a padding byte.
     #[test]
     fn a_batch_on_the_wire_is_the_frames_written_one_at_a_time() {
         let options = OPT_STREAM | OPT_MASK | OPT_PAD;
@@ -2103,10 +1675,6 @@ mod tests {
                 .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
                 .collect();
 
-            // A run is a byte stream, so the frames are whole `MAX_PLAIN` bodies
-            // with a short last one, at most `FRAMES_PER_WRITE` of them. `apart` is
-            // that run framed one `stage_frame` call at a time, which is the only
-            // thing the two paths are allowed to disagree about.
             let chunks: Vec<&[u8]> = body.chunks(MAX_PLAIN).take(FRAMES_PER_WRITE).collect();
             let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
             let mut staging = Vec::new();
@@ -2163,14 +1731,6 @@ mod tests {
         }
     }
 
-    /// Neither frame path may allocate, and neither may hand back a copy.
-    ///
-    /// Both buffers are the caller's, pre-sized the way `pump_relay` sizes them,
-    /// and both keep the same address and the same capacity for every frame of a
-    /// run. A frame that allocated would move one of them; a frame that copied the
-    /// plaintext out would move the other, because the length returned would not
-    /// be the length of the caller's own bytes. This is the deterministic half of
-    /// the claim: it is the same on every machine, where a duration is not.
     #[test]
     fn frames_reuse_the_callers_buffers() {
         let cipher = Cipher::Chacha;
@@ -2179,9 +1739,6 @@ mod tests {
         let options = OPT_STREAM | OPT_MASK | OPT_PAD;
         let mut send = Flow::fresh(cipher, &key, &iv, options, &iv).expect("sends");
         let mut recv = Flow::fresh(cipher, &key, &iv, options, &iv).expect("recvs");
-        // Ascending, and every length below the pre-sized capacity, so no frame
-        // asks the buffer to grow — a grow is a reallocation by another name and
-        // this test is about the frames, not about `Vec`.
         let lens = [1usize, 4, 63, 64, 65, 512, 1500, 4096];
         let payloads: Vec<Vec<u8>> = lens
             .iter()
@@ -2201,9 +1758,6 @@ mod tests {
             let cap = scratch.capacity();
             let mut got = Vec::new();
             for want in &lens {
-                // Read the addresses *before* the call: while `chunk` is alive the
-                // borrow checker will not let this test look at `scratch` at all,
-                // which is the design working, not the test working around it.
                 let was_at = scratch.as_ptr() as usize;
                 let had = scratch.capacity();
                 let chunk = read_frame(&mut stream, &mut recv, &mut scratch).expect("reads");
@@ -2221,9 +1775,6 @@ mod tests {
         });
 
         let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        // Wire prefix plus padding ride in the same buffer now, so the
-        // capacity covers them: without the `+ 2 + 64` a full-size frame would
-        // grow the buffer it was meant to reuse.
         let mut staging = Vec::with_capacity(MAX_PLAIN + TAG_LEN + 2 + 64);
         let mut pad = PadSource::fresh().expect("entropy");
         let addr = staging.as_ptr() as usize;
@@ -2651,8 +2202,6 @@ mod tests {
         assert!(decode_header(&bad).is_none());
         let mut udp = header.clone();
         udp[37] = 2;
-        // The checksum covers the command byte, so the mutation must be
-        // re-sealed: flipping cmd to 2 without recomputing fails the check.
         let cut = udp.len() - 4;
         let sum = fnv1a(&udp[..cut]);
         udp[cut..].copy_from_slice(&sum.to_be_bytes());
@@ -2757,36 +2306,15 @@ mod tests {
         assert_eq!(refused, 3);
     }
 
-    /// The `ChaCha20-Poly1305` data path, against the crate it replaced.
-    ///
-    /// The rest of these tests round-trip a `Flow` against another `Flow`, which
-    /// is a real test of the framing and of the counter, and cannot tell whether
-    /// the bytes on the wire are the bytes `VMess` peers expect. This one does:
-    /// the same frame sealed here, and sealed by `chacha20poly1305` under the
-    /// same key and nonce, have to be the same sixteen bytes plus the same tag.
-    ///
-    /// The key expansion and the nonce construction are the two places `VMess`
-    /// is specific — `MD5` twice into a 32-byte key, and the frame counter in
-    /// the first two bytes big-endian — so both are used from the same
-    /// functions the shipped path uses rather than retyped here.
     #[test]
     fn the_chacha_data_frames_are_the_crate_it_replaced() {
         use chacha20poly1305::aead::AeadInPlace;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _, Nonce};
 
         let data_key = [0x3cu8; 16];
-        // Distinct bytes, so a slice that starts one byte early or one byte late
-        // is a different nonce rather than the same one.
         let data_iv: [u8; 16] = std::array::from_fn(|i| 0x10u8.wrapping_add(i as u8));
         let options = OPT_STREAM | OPT_MASK;
 
-        // The two `VMess`-specific inputs, pinned rather than recomputed.
-        //
-        // Recomputing them here from `chacha_key` and from `Flow::nonce` would
-        // make this a test of the `AEAD` alone: a frame counter in the wrong
-        // byte order, or an `iv` slice off by one, would change both sides at
-        // once and the comparison would still pass. These are the bytes, so a
-        // change to either function has to be a change to this list too.
         let want_key: [u8; 32] = [
             0x8c, 0xad, 0xb9, 0xb0, 0x5f, 0xd7, 0x0f, 0x16, 0xab, 0x6b, 0xea, 0xd8, 0x48, 0x90,
             0x14, 0x5d, 0xf7, 0xa8, 0xe4, 0xab, 0xb4, 0x63, 0x92, 0x9f, 0x06, 0x32, 0x00, 0xed,
@@ -2803,18 +2331,11 @@ mod tests {
                 .map(|i| (i as u8).wrapping_mul(61).wrapping_add(5))
                 .collect();
 
-            // Several frames off *one* flow, not one frame per flow: the frame
-            // counter is part of the nonce, so a test that only ever seals
-            // counter zero cannot tell a big-endian counter from a little-endian
-            // one, or a counter that fails to advance from one that does not.
             let mut flow = Flow::fresh(Cipher::Chacha, &data_key, &data_iv, options, &data_iv)
                 .expect("a chacha flow");
             let cipher = ChaCha20Poly1305::new_from_slice(&want_key).expect("crate key");
 
             for frame in 0..3u8 {
-                // The nonce this frame uses, read *before* sealing: `seal_onto`
-                // advances the counter, and the frame on the wire is the one with
-                // the counter it had going in.
                 let nonce = flow.nonce();
                 let mut want_nonce = [0u8; 12];
                 want_nonce[..2].copy_from_slice(&(frame as u16).to_be_bytes());
@@ -2823,7 +2344,6 @@ mod tests {
                 let mut ours = Vec::new();
                 assert!(flow.seal_onto(&plain, &mut ours), "seals frame {len}");
 
-                // What the crate puts on the wire for the same frame.
                 let mut want = plain.clone();
                 let want_tag = cipher
                     .encrypt_in_place_detached(Nonce::from_slice(&want_nonce), b"", &mut want)
@@ -2834,8 +2354,6 @@ mod tests {
                     "length {len} frame {frame} is the crate's bytes"
                 );
 
-                // And it opens back to the plaintext, which is what the other
-                // direction does with it.
                 let mut recv = Flow::fresh(Cipher::Chacha, &data_key, &data_iv, options, &data_iv)
                     .expect("a chacha flow");
                 for _ in 0..frame {

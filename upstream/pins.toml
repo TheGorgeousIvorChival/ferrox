@@ -1,34 +1,3 @@
-# Upstream implementations this project compares against, pinned by commit.
-#
-# Pinned rather than tracked, because a comparison against "latest" is not a
-# comparison: the number in the report has to name the thing it was measured
-# against. `scripts/check-upstream-pins.sh` fails if a pin no longer resolves,
-# so a typo or a force-push upstream is caught here instead of quietly making
-# every downstream comparison meaningless.
-#
-# Every source MUST carry a `rev`. An unpinned source cannot be compared
-# against, and the checker rejects one rather than skipping it: a pin check
-# that quietly tolerates the entries it should be enforcing is worse than no
-# pin check, because it reads as coverage.
-#
-# Refresh with `scripts/update-pins.sh`, which opens a PR rather than pushing,
-# so a version bump is visible as its own change.
-#
-# Each source carries `test_enabled`: whether its test suite runs against
-# Ferrox binaries in CI yet (see `docs/conformance.md`). Suites are NEVER
-# copied here — sing-box is GPL-3.0, Xray-core/xray-rust are MPL-2.0, PattNG is
-# GPL-3.0, Aether is AGPL-3.0 — they run unmodified from the pinned commit. A suite flips to
-# `test_enabled = true` only when its transport rung is implemented and its
-# differential proof is green; until then CI creates the job, skips it, and
-# prints the reason, so the gap is named rather than silent.
-#
-# Each source also carries `ferrox_binary`: the Ferrox binary its suite
-# executes once wired (empty until one is), and `seam`: the environment variable
-# at the pinned commit through which that binary is injected. `run-upstream-suite.sh`
-# fails an enabled entry with no binary, and refuses to call a suite that cannot
-# read the seam a run against one — a binary that is built and never executed
-# proves nothing, which is the failure this pair of fields exists to make visible.
-
 [sources.xray-core]
 repo          = "https://github.com/XTLS/Xray-core"
 rev           = "b26a91de4f3294e26a0ad0a970b81a386a41f789"
@@ -37,14 +6,11 @@ path          = "common/crypto"
 test_enabled  = false
 suite         = "go test -count=1 -timeout 8m ./proxy/vless/..."
 ferrox_binary = ""
-note          = "vmess and shadowsocks record layer; the four-block refill this workspace removes. Suite runs upstream's own VLESS tests at this pin (guards the reference behavior rung 1 claims to match); our header differential is vless::tests in cargo test. Disabled: in-process Go with no seam at this rev (0 os/exec in proxy/vless), so no Ferrox binary can be injected. Full test list is xray-baseline.yml, informational and never red on test failures"
+note          = "Xray-core at this pin. Disabled: in-process Go suite with no seam, so no Ferrox binary can be injected; full list runs in xray-baseline.yml"
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
 rev           = "c992297988288565a24a6d36e2cf4d77cb835fcd"
-# sing-box's default branch is `testing`, not `main`. `main` does not resolve, so
-# a pin that named it would sit behind nothing and the checker's staleness note
-# would never fire.
 default_branch = "testing"
 path          = "protocol/shadowsocks"
 test_enabled  = false
@@ -78,7 +44,7 @@ test_enabled  = true
 suite         = "git init -q Xray-core && git -C Xray-core fetch --quiet --depth 1 https://github.com/XTLS/Xray-core 5ca6f4b7d4dc20a881d4330e498892697627ec0c && git -C Xray-core checkout --quiet FETCH_HEAD && cargo test -p xray-core-rs --test local_xray_interop_tests -- --ignored --exact --test-threads=1 rust_socks_client_reaches_echo_server_through_local_xray_vless_tcp rust_round_robin_balancer_uses_each_local_xray_vless_member rust_two_hop_proxy_chain_reaches_echo_through_local_xray_vless_servers rust_socks_client_reaches_echo_server_through_local_xray_vless_ws rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade rust_socks_client_reaches_echo_server_through_local_xray_vless_ws_early_data rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade_early_data"
 ferrox_binary = "ferrox-app"
 seam           = "XRAY_VLESS_FULL_BINARY"
-note          = "mobile-first Rust VLESS/REALITY/Vision core; names the plain-TCP VLESS server trio plus the `ws`, `httpupgrade` and `?ed=`-early-data rows against ferrox-app, checked by conformance.yml; the `tls` row is named by this slice and its verdict is conformance.yml's, not this file's. `--exact` is load-bearing: libtest filters by substring, so naming `..._vless_ws` without it also runs `..._vless_ws_tls` and `..._vless_ws_early_data` (measured in run 37126222488, 4 rows that failed because they were never named). Those five were the whole of the 23 `#[ignore]`d tests in `local_xray_interop_tests` that passed unmodified against this binary at this rev (5 passed, 18 failed, run 37125321800, where all 23 were named so every row's verdict is measured); the `?ed=` pair joins them with the `EarlyData` rung, and the other sixteen are named with their failure in docs/conformance.md and are owned by P7, P15, P16, P17 and P18. Suite fetches the Xray-core checkout the tests assert on (5ca6f4b7d, pinned by the test file itself) because the harness clones only the suite's own repo"
+note          = "Rust VLESS core; 7 interop tests run against ferrox-app via XRAY_VLESS_FULL_BINARY, checked by conformance.yml; the other 16 stay out until their transports land. Suite fetches the Xray-core checkout the tests assert on because the harness clones only this repo"
 
 [sources.pattng]
 repo          = "https://github.com/patterniha/PattNG"
@@ -91,8 +57,6 @@ note          = "v2rayNG fork for Iranians: cipherSuites + unsafe fingerprints, 
 
 [sources.zeronet]
 repo          = "https://github.com/TheGorgeousIvorChival/ZeroNet"
-# Fork first; the official repo is the fallback when the fork is unreachable
-# (see scripts/fetch-upstream.sh). The pin must resolve in whichever answers.
 fallback_repo = "https://github.com/zeghostwriter/ZeroNet"
 rev           = "97a99734e95029c8bf90ab0cdc578d0561a57724"
 default_branch = "main"
@@ -101,7 +65,7 @@ test_enabled  = true
 suite         = "cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 vless_over_raw_tcp_matches_the_oracle trojan_over_raw_tcp_matches_the_oracle shadowsocks_over_raw_tcp_matches_the_oracle vless_over_websocket_matches_the_oracle vless_over_http_upgrade_matches_the_oracle vless_over_grpc_matches_the_oracle vmess_over_raw_tcp_matches_the_oracle trojan_over_websocket_matches_the_oracle"
 ferrox_binary = "ferrox-app"
 seam           = "ZRAY_XRAY_BINARY"
-note          = "MIT-licensed Zray core + TUI + Android app; ferrox-app builds the same app surface on ferrox-core. Enabled as the raw-TCP VLESS, trojan, shadowsocks and vmess plus VLESS-over-websocket, httpupgrade and grpc plus trojan-over-websocket subset, every row measured green in the run its note names; the vmess-over-websocket oracle test needs a rung this binary closes on, and stays disabled by name in docs/conformance.md"
+note          = "MIT Zray core; 8 oracle tests run against ferrox-app via ZRAY_XRAY_BINARY, checked by conformance.yml"
 
 [sources.mqvpn]
 repo          = "https://github.com/mp0rta/mqvpn"
