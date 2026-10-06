@@ -17,6 +17,10 @@ A suite flips to `true` only when:
 
 Ten entries are disabled and two (`zeronet`, `xray-rust`) are enabled. `xray-core` stays disabled because its suite runs upstream code only with no Ferrox binary wired yet, and `run-upstream-suite.sh` fails an enabled entry with none rather than printing PASS.
 
+## The xray-core baseline (informational, never a gate)
+
+`xray-baseline.yml` runs all of the pinned `xray-core`'s own Go tests against upstream itself and publishes the pass/fail totals plus the full log. Test failures never fail it; only infra failures go red. It is the behavior list the drop-in refactor works through, not conformance.
+
 ## What each suite is missing, measured
 
 Reading the fetched trees at each pin for a point where an external binary could be injected — an environment variable naming a binary, which is the only shape a suite can be pointed at without editing it — gives:

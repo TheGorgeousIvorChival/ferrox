@@ -37,7 +37,7 @@ path          = "common/crypto"
 test_enabled  = false
 suite         = "go test -count=1 -timeout 8m ./proxy/vless/..."
 ferrox_binary = ""
-note          = "vmess and shadowsocks record layer; the four-block refill this workspace removes. Suite runs upstream's own VLESS tests at this pin (guards the reference behavior rung 1 claims to match); our header differential is vless::tests in cargo test. Disabled: in-process Go with no seam at this rev (0 os/exec in proxy/vless), so no Ferrox binary can be injected"
+note          = "vmess and shadowsocks record layer; the four-block refill this workspace removes. Suite runs upstream's own VLESS tests at this pin (guards the reference behavior rung 1 claims to match); our header differential is vless::tests in cargo test. Disabled: in-process Go with no seam at this rev (0 os/exec in proxy/vless), so no Ferrox binary can be injected. Full test list is xray-baseline.yml, informational and never red on test failures"
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
