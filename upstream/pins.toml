@@ -1,0 +1,149 @@
+# Upstream implementations this project compares against, pinned by commit.
+#
+# Pinned rather than tracked, because a comparison against "latest" is not a
+# comparison: the number in the report has to name the thing it was measured
+# against. `scripts/check-upstream-pins.sh` fails if a pin no longer resolves,
+# so a typo or a force-push upstream is caught here instead of quietly making
+# every downstream comparison meaningless.
+#
+# Every source MUST carry a `rev`. An unpinned source cannot be compared
+# against, and the checker rejects one rather than skipping it: a pin check
+# that quietly tolerates the entries it should be enforcing is worse than no
+# pin check, because it reads as coverage.
+#
+# Refresh with `scripts/update-pins.sh`, which opens a PR rather than pushing,
+# so a version bump is visible as its own change.
+#
+# Each source carries `test_enabled`: whether its test suite runs against
+# Ferrox binaries in CI yet (see `docs/conformance.md`). Suites are NEVER
+# copied here — sing-box is GPL-3.0, Xray-core/xray-rust are MPL-2.0, PattNG is
+# GPL-3.0, Aether is AGPL-3.0 — they run unmodified from the pinned commit. A suite flips to
+# `test_enabled = true` only when its transport rung is implemented and its
+# differential proof is green; until then CI creates the job, skips it, and
+# prints the reason, so the gap is named rather than silent.
+#
+# Each source also carries `ferrox_binary`: the Ferrox binary its suite
+# executes once wired (empty until one is), and `seam`: the environment variable
+# at the pinned commit through which that binary is injected. `run-upstream-suite.sh`
+# fails an enabled entry with no binary, and refuses to call a suite that cannot
+# read the seam a run against one — a binary that is built and never executed
+# proves nothing, which is the failure this pair of fields exists to make visible.
+
+[sources.xray-core]
+repo          = "https://github.com/XTLS/Xray-core"
+rev           = "b26a91de4f3294e26a0ad0a970b81a386a41f789"
+default_branch = "main"
+path          = "common/crypto"
+test_enabled  = false
+suite         = "go test -count=1 -timeout 8m ./proxy/vless/..."
+ferrox_binary = ""
+note          = "vmess and shadowsocks record layer; the four-block refill this workspace removes. Suite runs upstream's own VLESS tests at this pin (guards the reference behavior rung 1 claims to match); our header differential is vless::tests in cargo test. Disabled: in-process Go with no seam at this rev (0 os/exec in proxy/vless), so no Ferrox binary can be injected"
+
+[sources.sing-box]
+repo          = "https://github.com/SagerNet/sing-box"
+rev           = "c992297988288565a24a6d36e2cf4d77cb835fcd"
+# sing-box's default branch is `testing`, not `main`. `main` does not resolve, so
+# a pin that named it would sit behind nothing and the checker's staleness note
+# would never fire.
+default_branch = "testing"
+path          = "protocol/shadowsocks"
+test_enabled  = false
+ferrox_binary = ""
+note          = "the chacha20poly1305 usage whose one-shot interface forces a refill per call; the cipher itself is the out-of-tree module sagernet/sing-shadowsocks2 (no chacha20poly1305 string in this tree), so path names the in-tree caller"
+
+[sources.amneziawg-go]
+repo          = "https://github.com/amnezia-vpn/amneziawg-go"
+rev           = "b5928efb6ca19f0153958460c3d141f04abc5c2e"
+default_branch = "master"
+path          = "device"
+test_enabled  = false
+ferrox_binary = ""
+note          = "hand-rolled ChaCha20 in the WireGuard data path"
+
+[sources.amnezia-client]
+repo          = "https://github.com/amnezia-vpn/amnezia-client"
+rev           = "94b51df24790bf52427afe82d81c87a95460bdfd"
+default_branch = "dev"
+path          = "common/crypto"
+test_enabled  = false
+ferrox_binary = ""
+note          = "the C++ Amnezia core; the second implementation of the same wire format"
+
+[sources.xray-rust]
+repo          = "https://github.com/aimalygin/xray-rust"
+rev           = "7a4fb2dd382b8041d6d997b0185397045c8da463"
+default_branch = "main"
+path          = "crates"
+test_enabled  = true
+suite         = "git init -q Xray-core && git -C Xray-core fetch --quiet --depth 1 https://github.com/XTLS/Xray-core 5ca6f4b7d4dc20a881d4330e498892697627ec0c && git -C Xray-core checkout --quiet FETCH_HEAD && cargo test -p xray-core-rs --test local_xray_interop_tests -- --ignored --exact --test-threads=1 rust_socks_client_reaches_echo_server_through_local_xray_vless_tcp rust_round_robin_balancer_uses_each_local_xray_vless_member rust_two_hop_proxy_chain_reaches_echo_through_local_xray_vless_servers rust_socks_client_reaches_echo_server_through_local_xray_vless_ws rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade rust_socks_client_reaches_echo_server_through_local_xray_vless_ws_early_data rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade_early_data"
+ferrox_binary = "ferrox-app"
+seam           = "XRAY_VLESS_FULL_BINARY"
+note          = "mobile-first Rust VLESS/REALITY/Vision core; names the plain-TCP VLESS server trio plus the `ws`, `httpupgrade` and `?ed=`-early-data rows against ferrox-app, checked by conformance.yml; the `tls` row is named by this slice and its verdict is conformance.yml's, not this file's. `--exact` is load-bearing: libtest filters by substring, so naming `..._vless_ws` without it also runs `..._vless_ws_tls` and `..._vless_ws_early_data` (measured in run 37126222488, 4 rows that failed because they were never named). Those five were the whole of the 23 `#[ignore]`d tests in `local_xray_interop_tests` that passed unmodified against this binary at this rev (5 passed, 18 failed, run 37125321800, where all 23 were named so every row's verdict is measured); the `?ed=` pair joins them with the `EarlyData` rung, and the other sixteen are named with their failure in docs/conformance.md and are owned by P7, P15, P16, P17 and P18. Suite fetches the Xray-core checkout the tests assert on (5ca6f4b7d, pinned by the test file itself) because the harness clones only the suite's own repo"
+
+[sources.pattng]
+repo          = "https://github.com/patterniha/PattNG"
+rev           = "ad6f747ca50cec4b2427c9c0b5d0465f0eff5932"
+default_branch = "my-releases"
+path          = "V2rayNG"
+test_enabled  = false
+ferrox_binary = ""
+note          = "v2rayNG fork for Iranians: cipherSuites + unsafe fingerprints, aether core, plaintext VLESS/TROJAN to public (the superset rows)"
+
+[sources.zeronet]
+repo          = "https://github.com/TheGorgeousIvorChival/ZeroNet"
+# Fork first; the official repo is the fallback when the fork is unreachable
+# (see scripts/fetch-upstream.sh). The pin must resolve in whichever answers.
+fallback_repo = "https://github.com/zeghostwriter/ZeroNet"
+rev           = "97a99734e95029c8bf90ab0cdc578d0561a57724"
+default_branch = "main"
+path          = "crates"
+test_enabled  = true
+suite         = "cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 vless_over_raw_tcp_matches_the_oracle trojan_over_raw_tcp_matches_the_oracle shadowsocks_over_raw_tcp_matches_the_oracle vless_over_websocket_matches_the_oracle vless_over_http_upgrade_matches_the_oracle vless_over_grpc_matches_the_oracle vmess_over_raw_tcp_matches_the_oracle trojan_over_websocket_matches_the_oracle"
+ferrox_binary = "ferrox-app"
+seam           = "ZRAY_XRAY_BINARY"
+note          = "MIT-licensed Zray core + TUI + Android app; ferrox-app builds the same app surface on ferrox-core. Enabled as the raw-TCP VLESS, trojan, shadowsocks and vmess plus VLESS-over-websocket, httpupgrade and grpc plus trojan-over-websocket subset, every row measured green in the run its note names; the vmess-over-websocket oracle test needs a rung this binary closes on, and stays disabled by name in docs/conformance.md"
+
+[sources.mqvpn]
+repo          = "https://github.com/mp0rta/mqvpn"
+rev           = "b11a2f69b0864d9df199ac653e2d7767c6b679d3"
+default_branch = "main"
+path          = "src"
+test_enabled  = false
+ferrox_binary = ""
+note          = "MASQUE CONNECT-IP (RFC 9484) over Multipath QUIC; WLB/minrtt/backup_fec schedulers, hybrid TCP lane, reorder + reinjection; Apache-2.0"
+
+[sources.aether]
+repo          = "https://github.com/CluvexStudio/Aether"
+rev           = "21e7150ac2225caa01cbb96ac572b5c0cc1e1dc2"
+default_branch = "main"
+path          = "aether"
+test_enabled  = false
+ferrox_binary = ""
+note          = "open-source Rust WARP core (AGPL-3.0): MASQUE over HTTP/3 and HTTP/2, WireGuard, nested gool/mim, Tor x3, upstream chaining; the source PattNG vendors as libaether.so"
+
+[sources.zeptun]
+repo          = "https://github.com/Noisemux/zeptun"
+rev           = "5620e57cdbf1a4464567a404adbff7cffd9b4bb9"
+default_branch = "main"
+path          = "src"
+test_enabled  = false
+ferrox_binary = ""
+note          = "Zig tun2socks engine (MIT): TUN to TCP/UDP/ICMP via SOCKS5/direct/passthrough, fake-IP DNS, offloads, io_uring/epoll/kqueue/IOCP"
+
+[sources.slipstream]
+repo          = "https://github.com/EndPositive/slipstream"
+rev           = "397850b16e70a52513269134b2c7b9aa13a56745"
+default_branch = "main"
+path          = "src"
+test_enabled  = false
+ferrox_binary = ""
+note          = "DNS covert channel over QUIC multipath (picoquic); TCP-over-DNS via base32/TXT, multi-resolver parallel + direct port-53 mode; Apache-2.0"
+
+[sources.quiche]
+repo          = "https://github.com/cloudflare/quiche"
+rev           = "3fc9bc1c5d47757df20f80f78aa8efa912897d34"
+default_branch = "master"
+path          = "quiche"
+test_enabled  = false
+ferrox_binary = ""
+note          = "Cloudflare QUIC + HTTP/3 stack (BSD-2.0); the default QUIC for MASQUE/H3 rungs — never a preference, always the measured choice"

@@ -1,0 +1,281 @@
+name: parity
+
+# The claim this workflow makes is the one gates 1-4 cannot make: not "the record
+# layer is not slower than a same-language reference" but "the engine is not slower
+# than the pinned Go core, as a process, moving the same bytes".
+#
+# It is a separate workflow from bench.yml for two reasons. Gate 5 needs binaries
+# built from upstream pins, so it needs Go on the runner and minutes of build time,
+# and folding that into the microbenchmark job would make the fast, sharp gate wait
+# on the slow, blunt one. A regression in either is then reported as itself.
+on:
+  workflow_dispatch:
+    inputs:
+      splice_pipe_bytes:
+        description: "override the relay's splice pipe capacity, in bytes (blank = the compiled-in default)"
+        required: false
+        type: string
+      repeats:
+        description: "paired repeats per engine"
+        required: false
+        type: string
+      connections:
+        description: "concurrent flows per engine"
+        required: false
+        type: string
+      traffic:
+        description: "upload | download | full-duplex"
+        required: false
+        type: string
+      iterations:
+        description: "payload iterations per flow"
+        required: false
+        type: string
+  schedule:
+    # Daily, at 05:23 UTC — an hour after `bench.yml` and an hour before
+    # `benchmark-matrix.yml`, so the three never measure each other's load as a
+    # regression. Gate 5 builds Xray-core, sing-box, ZeroNet and xray-rust from
+    # their pins on every leg, which is why it cannot share an hour with the
+    # other two even though each of them is individually cheap.
+    - cron: "23 5 * * *"
+  # No `push` trigger, for the same reason bench.yml has none: gate 5 is four
+  # runners and minutes of transfer per leg, and a merge is not a request for
+  # one. The daily cron is the standing evidence; a slice that changes the relay
+  # dispatches this and waits.
+
+# Queued, never cancelled. Gate 5's claim is a *ratio*, and cancelling one of four
+# legs leaves a three-row table that still reads like a comparison. The group
+# queues because `cancel-in-progress` defaults to false, which is also what keeps
+# two gate-5 runs off the same runner and measuring each other's load as noise.
+concurrency:
+  group: parity-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The same cfgs as ci.yml and bench.yml, and for the reason bench.yml states:
+  # "the flags a build carries do not depend on which workflow is running, which is
+  # what keeps a future gate that does reach AES from measuring something CI would
+  # not ship". This workflow is that future gate — it builds and measures
+  # `ferrox-app`, which links `aes` and `aes-gcm` — and it was the one job
+  # that did not have them, so on `aarch64` it measured a soft-AES binary that no
+  # runner ever ships.
+  #
+  # It does not move today's gate-5 numbers and is not claimed to: the workload is a
+  # `SOCKS` inbound to a `freedom` outbound, so no AES is on the data path. What it
+  # buys is that the binary under test is the shipped one, which is the property the
+  # other three workflows already had.
+  RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  # The pin check and the four comparator trees, once per run.
+  #
+  # Both used to run inside every one of the four legs. The pin check cannot vary
+  # by leg — either all twelve pins resolve or one does not — and the fetch is
+  # twelve network round trips that do not vary by leg either. That was four
+  # checks and sixteen clones to establish two facts.
+  #
+  # So one job does both and publishes the trees; the four legs restore them. The
+  # pin guarantee is not weakened: `fetch-upstream.sh` refuses to finish unless
+  # every checkout is at its exact rev, so an artifact that exists *is* the pin
+  # check, and `needs` below means a broken pin stops the measurement instead of
+  # racing it four times.
+  fetch:
+    name: check the pins and fetch the comparators
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-upstream-pins.sh
+      # `--only` names the four engines gate 5 measures. The other eight pins are
+      # not on the data path of a `SOCKS`-to-`freedom` relay, and a depth-1 clone
+      # of each is a minute of wall time for nothing. `check-upstream-pins.sh`
+      # above still verifies all twelve.
+      - run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,zeronet,xray-rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parity-upstream
+          path: upstream/
+          retention-days: 1
+          # `.git` is load-bearing: `lib-engines.sh:37` is
+          # `[[ -d upstream/$name/.git ]]` followed by `git rev-parse HEAD`, so an
+          # artifact without hidden files makes every leg fail with a message
+          # telling it to re-run a fetch that already succeeded. `upload-artifact`
+          # omits hidden files unless told otherwise.
+          include-hidden-files: true
+          if-no-files-found: error
+
+  parity:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: fetch
+    # Sixty minutes, which is the ceiling this job already had and is about four
+    # times the worst full leg: four upstream engines built from source, then the
+    # transfer. The ceiling is stated rather than inherited because a daily
+    # schedule multiplies whatever it wastes by seven.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One native runner per ISA, the same four bench.yml measures. A process
+          # number is a number about a CPU: a throughput ratio measured on Neoverse
+          # and not on Firestorm is a ratio measured on one machine.
+          #
+          # Linux is where a Go engine's copy path and a Rust one differ most — Go
+          # reaches for `splice` between sockets and Rust reaches for it only
+          # where both ends are files — so a Linux row is not a confirmation of the
+          # macOS one, it is a different measurement. Both are here for that reason.
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macos aarch64
+            os: macos-15
+          - name: windows x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The comparator is built from its pin, so the pin's history has to be
+          # here. `fetch-depth: 0` is what makes the checkout the pinned commit
+          # rather than a merge of it.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # One key across the four legs, so the first leg to finish warms the
+          # registry and crate sources for the other three. Compiled artefacts
+          # stay per-runner — four different targets — so this buys the download
+          # half of a cold build.
+          shared-key: parity
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          # `setup-go` caches the module and build caches by default, keyed on
+          # `go.sum`. `fetch-upstream.sh` checks the comparators out at a pinned
+          # commit and their module files never change between runs, so this is
+          # what keeps `go build` of Xray-core and sing-box off the network.
+          cache-dependency-path: upstream/pins.toml
+      # `quiche` builds `BoringSSL`: `cmake`, `perl` and a C compiler ship with
+      # all three Unix runners, `nasm` does not ship with `windows-latest`.
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress || echo "nasm already installed"
+      # `bash` on every step that runs one of this repository's scripts, for one
+      # reason: the default `shell:` on `windows-latest` is PowerShell, which
+      # cannot execute a `#!/usr/bin/env bash` script and does not parse a
+      # `{ ... } >> "$GITHUB_STEP_SUMMARY"` group. Read the `windows x86_64` log of
+      # any run before this and every one of those steps shows a command, no
+      # output, and a zero exit -- so the pins were never checked, the comparator
+      # checkouts were never fetched, the machine was never recorded, and the
+      # comparison itself did nothing, all reported as a pass.
+      #
+      # The fetch is not cosmetic next to the comparison step either:
+      # `run-parity.sh` refuses to guess a comparator and stops with
+      # `upstream/<name> is missing; run scripts/fetch-upstream.sh`, so naming the
+      # shell on the comparison step alone turns a false green into a red one.
+      - uses: actions/download-artifact@v4
+        with:
+          name: parity-upstream
+          path: upstream
+      - name: build the engine under test
+        run: cargo build --locked --release -p ferrox-app -p ferrox-bench
+      - name: record the machine
+        shell: bash
+        run: |
+          echo "### machine" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            uname -a || ver
+            rustc -vV
+            nproc 2>/dev/null || echo "logical CPUs: unavailable"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Five gates in order. Identity and the deterministic counts run first
+      # because they are machine-independent and a wrong engine must not get to be
+      # a fast one. Gate 5 runs last and is the only one that can fail on another
+      # project's code.
+      - name: identity, counts, timings, framing, then the process comparison
+        # `bash`, named, and not decoration. Without it this step runs under
+        # PowerShell on `windows-latest`, which cannot execute a `#!/usr/bin/env
+        # bash` script: the step exits 0 having done nothing, no report is written,
+        # the artifact upload finds no files and is only a *warning*, and the job
+        # is green. That is what happened on every `windows x86_64` run — a runner
+        # this repository names in its coverage table, measuring nothing, reported
+        # as a pass. `shell: bash` is what GitHub already uses for every other step
+        # on that image (`C:\Program Files\Git\bin\bash.EXE`).
+        shell: bash
+        # `SPLICE_PIPE` reaches the engine through the environment, because the
+        # constant it overrides is one a measurement has to be able to move: the
+        # relay's pipe capacity is the only structural difference left between this
+        # relay and the Go cores' on Linux, and a difference you cannot re-run with
+        # a different value is a belief. Blank leaves the compiled-in default.
+        # `CONNECTIONS` is here because the relay's *shape* is the open question, not
+        # just its constants: two OS threads per connection against Go's
+        # netpoller-parked goroutines is a difference that one flow cannot see and
+        # sixteen can. `TRAFFIC` because the upload direction puts the relay's read
+        # side on the client socket, where Nagle and the harness's own chunking
+        # apply, and nothing measured so far has looked at it.
+        env:
+          SPLICE_PIPE: ${{ inputs.splice_pipe_bytes }}
+          REPEATS: ${{ inputs.repeats }}
+          CONNECTIONS: ${{ inputs.connections }}
+          TRAFFIC: ${{ inputs.traffic }}
+          # With `connections` raised, `iterations` has to come down: the harness's
+          # 120 s cap is per run and covers every flow in it, so sixteen flows of
+          # 8 GiB is 128 GiB a repeat and sits right on that cap. Lowering this is the
+          # other half of raising that.
+          ITERATIONS: ${{ inputs.iterations }}
+        run: ./scripts/run-parity.sh
+      - name: publish the table
+        if: always()
+        # `bash` for the same reason as the step above, and this one was already
+        # wrong before that step was named: it is `cat`, `2>/dev/null`, `||` and a
+        # `{ ... } >> "$GITHUB_STEP_SUMMARY"` group, none of which PowerShell parses,
+        # and `$GITHUB_STEP_SUMMARY` is not how PowerShell spells an environment
+        # variable -- so on `windows-latest` it appended to a file with that literal
+        # name in the working directory. Naming the shell is what lets the
+        # `::error::` below reach a Windows run at all.
+        shell: bash
+        run: |
+          if [ ! -s target/bench-report.md ]; then
+            echo "::error::no report at target/bench-report.md, so this run measured nothing"
+          fi
+          {
+            echo
+            echo '```'
+            cat target/bench-report.md 2>/dev/null || echo "no report"
+            echo '```'
+            echo
+            echo "Every run's \`request.json\` and \`result.json\` are under \`target/parity/\`, in"
+            echo "the schema the pinned xray-rust harness reads and writes, so the same"
+            echo "files can be handed to it unmodified."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the raw runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # The raw files are the evidence; a summary table that cannot be traced
+          # back to the requests and results it was computed from is a claim.
+          # `bench-report.md` goes with them because gate 5's verdict is a
+          # *ratio*, and a ratio is unreadable without the absolutes it came from:
+          # the same tree measured 1.05x and 0.66x on `linux x86_64` twenty minutes
+          # apart, with ferrox at 3408 -> 1901 MiB/s, zeronet at 2464 -> 1559 and
+          # xray-core at 3247 -> 2960. Every engine moved, so the run was the
+          # variable, and only the medians table says so.
+          name: parity-${{ matrix.name }}-${{ github.run_id }}
+          path: |
+            target/parity/**/*.json
+            target/parity/**/stdout.log
+            target/parity/**/stderr.log
+            target/bench-report.md
+          retention-days: 30
+          # `error`, not `warn`. "No files were found" is the signature of a run that
+          # measured nothing and reported success, which is exactly the defect the
+          # `shell: bash` above exists to fix; a warning let it stay invisible for
+          # the life of the workflow. An empty run must be red.
+          if-no-files-found: error

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Exact operation counts for named functions: callgrind instructions plus a
+# syscall summary. Linux-only (valgrind, strace); fails fast when valgrind is
+# absent rather than printing numbers from a different instrument.
+#
+# Instruction counts are deterministic: the same binary and input retire the
+# same count on every machine, unlike wall time. That is what makes an exact
+# count gateable where a duration is only comparable. Syscall counts ride
+# along as information, never as a gate: allocator and loader paths may vary
+# them while the function under test stays identical.
+#
+# Usage:
+#   ./scripts/count-ops.sh report <test-filter> <symbol>...
+#       print Ir per symbol plus the syscall table, exit 0.
+#   ./scripts/count-ops.sh check <test-filter> <expect-file>
+#       fail listing every symbol whose Ir differs; the expect file holds
+#       `symbol ir` lines, one per function, `#` comments allowed. Symbols
+#       must be unique substrings: `base64_encode` would also match
+#       `base64_encode_block`, so gate the longer name or neither.
+# The test filter names one exact unit test, e.g. quic::tests::pem_wraps.
+set -euo pipefail
+
+mode="${1:?usage: count-ops.sh report|check ...}"
+command -v valgrind >/dev/null || { echo "count-ops: valgrind not installed" >&2; exit 2; }
+
+outdir="$(mktemp -d)"
+trap 'rm -rf "$outdir"' EXIT
+
+bin="$(cargo test --release --bin ferrox-app --no-run --locked --message-format=json \
+    | python3 -c 'import json,sys
+for line in sys.stdin:
+    try: m = json.loads(line)
+    except ValueError: continue
+    if m.get("reason") == "compiler-artifact" and m.get("executable"):
+        print(m["executable"]); break')"
+[ -n "$bin" ] || { echo "count-ops: no test binary built" >&2; exit 2; }
+
+# Sum retired instructions for every cost line under a matching `fn=` record.
+# The raw callgrind format is stable: `positions: line` plus `events: Ir`
+# makes each cost line `<line> <ir> [...]`, and only `fn=` lines name
+# functions, so a substring match on the short name needs no demangler.
+ir_of() {
+    local filter="$1" symbol="$2" data="$outdir/callgrind.out"
+    rm -f "$data" "$data".*
+    local status=0
+    valgrind --tool=callgrind --callgrind-out-file="$data" \
+        --compress-strings=no --compress-pos=no \
+        "$bin" --exact "$filter" --nocapture >"$outdir/valgrind.out" 2>"$outdir/valgrind.err" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "count-ops: valgrind exited $status for $filter" >&2
+        tail -n 15 "$outdir/valgrind.err" >&2
+        return 2
+    fi
+    local produced
+    produced="$(ls "$data" "$data".* 2>/dev/null | head -n 1)"
+    if [ -z "${produced:-}" ]; then
+        echo "count-ops: no callgrind output for $filter (valgrind exit $status)" >&2
+        tail -n 15 "$outdir/valgrind.err" >&2
+        return 2
+    fi
+    local total
+    total="$(python3 - "$produced" "$symbol" <<'EOF'
+import sys
+total, active = 0, False
+with open(sys.argv[1], errors="ignore") as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith("fn="):
+            active = sys.argv[2] in line
+        elif active:
+            fields = line.split()
+            if len(fields) >= 2 and fields[0].isdigit() and fields[1].lstrip("-").isdigit():
+                total += int(fields[1])
+print(total)
+EOF
+)"
+    [ "${total:-0}" != "0" ] || {
+        echo "count-ops: symbol not found: $symbol" >&2
+        echo "count-ops: positions/events header and quic fn records:" >&2
+        grep -E "^(positions|events):" "$produced" >&2 || true
+        grep "^fn=.*quic" "$produced" | head -n 10 >&2 || true
+        return 2
+    }
+    echo "$total"
+}
+
+syscalls_of() {
+    local filter="$1"
+    if ! command -v strace >/dev/null; then
+        echo "count-ops: strace not installed, skipping syscall table" >&2
+        return 0
+    fi
+    strace -c -f -o "$outdir/strace.out" "$bin" --exact "$filter" --nocapture >/dev/null 2>&1 || true
+    sed -n '/^%/,$p' "$outdir/strace.out" | head -n 25
+}
+
+if [ "$mode" = "report" ]; then
+    filter="$2"
+    shift 2
+    for symbol in "$@"; do
+        echo "$symbol Ir=$(ir_of "$filter" "$symbol")"
+    done
+    syscalls_of "$filter"
+    exit 0
+fi
+
+if [ "$mode" = "check" ]; then
+    filter="$2"
+    expect="$3"
+    failed=0
+    while read -r symbol want _; do
+        case "$symbol" in ''|'#'*) continue ;; esac
+        got="$(ir_of "$filter" "$symbol")"
+        if [ "$got" != "$want" ]; then
+            echo "count-ops: $symbol Ir=$got, expected $want" >&2
+            failed=1
+        else
+            echo "count-ops: $symbol Ir=$got ok"
+        fi
+    done < "$expect"
+    syscalls_of "$filter"
+    exit "$failed"
+fi
+
+echo "count-ops: unknown mode $mode" >&2
+exit 2

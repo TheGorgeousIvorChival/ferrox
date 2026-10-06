@@ -1,0 +1,68 @@
+name: conformance
+
+# Upstream suites run AGAINST Ferrox binaries, never copied here.
+#
+# sing-box is GPL-3.0, Xray-core/xray-rust are MPL-2.0, PattNG is GPL-3.0:
+# vendoring their tests would make this work's licence undecidable. Each
+# source in `upstream/pins.toml` carries `test_enabled` and, when enabled, a
+# `suite` command; `scripts/run-upstream-suite.sh` clones the pin and runs it.
+# Disabled suites are skipped with the rung reason printed, so the gap is
+# named rather than silent. See `docs/conformance.md`.
+#
+# A suite flips to enabled only with its rung's differential proof green.
+
+on:
+  pull_request:
+    # Only the crates a suite can exercise. No `push: main` leg at all: the
+    # weekly cron is the coverage, and a second run per merge proved the same
+    # suite against a tree nobody was going to un-merge.
+    paths:
+      - "crates/ferrox-app/**/*.rs"
+      - "crates/ferrox-core/**/*.rs"
+      - "upstream/pins.toml"
+      - "scripts/run-upstream-suite.sh"
+      - ".github/workflows/conformance.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 1"
+
+# Cancelled for pull requests and queued for the weekly run: two pushes to one
+# pull request prove the same suite twice, while a weekly run truncated by
+# whatever landed that afternoon is a week with no upstream comparison in it.
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  suites:
+    name: upstream suites (enabled only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: conformance
+      # `check-fixture-safety.sh` is not run here because `ci.yml`'s `test` job
+      # already runs it on every runner that touches `crates/**`, and this
+      # workflow's `paths` filter is a subset of that one's. Two runs of the same
+      # grep over the same files is one run.
+      - name: ferrox's own differential (always runs)
+        run: cargo test --locked --workspace
+      # The pin check used to run here too, once per suite run. `pins.yml` runs it
+      # on the same weekly cron against the same `upstream/pins.toml`, and
+      # `run-upstream-suite.sh` refuses a checkout that is not at its pin — so this
+      # step could only ever repeat `pins.yml`'s verdict.
+      - name: upstream suites by test_enabled bit
+        run: ./scripts/run-upstream-suite.sh

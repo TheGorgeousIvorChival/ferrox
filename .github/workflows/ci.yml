@@ -1,0 +1,186 @@
+name: ci
+
+# The only workflow a pull request runs, and the only one `main` runs on a timer
+# instead of on a push.
+#
+# Four jobs, and a change that cannot break them starts none of them: the `paths`
+# filter below skips every documentation-only change, which is the most common
+# change in this repository.
+#
+# Everything a laptop can check is `./scripts/check.sh`. Run that first; this
+# workflow exists to prove it on runners whose architecture is named, not to be
+# the place the lint is discovered.
+
+# Rust sources only. A Markdown edit outside `crates/` cannot break a compile, so
+# it starts nothing here, and `prompts.md` has its own one-runner workflow
+# because it is the one Markdown file with a build attached to it.
+#
+# No `push: main` leg, and that is the difference between this gate costing a
+# merge queue and this gate costing one check. Four runners per push meant every
+# commit to `main` — including the ones `safety.yml` and `benchmark-matrix.yml`
+# *push automatically* — paid for a full three-OS build it had already been
+# proven by, at the moment those bots' own artefacts were being written. The
+# pull request is where a break is cheap; `main` gets the same four jobs from the
+# schedule below, and a nightly run of a tree nobody is waiting on is the
+# measurement worth paying for.
+on:
+  schedule:
+    # Nightly. Late enough that the day's merges are in the tree it checks, and on
+    # an hour of its own so it does not sit under `bench.yml`/`parity.yml`/
+    # `benchmark-matrix.yml` and read a shared runner's load as a slow build.
+    - cron: "37 6 * * *"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/*.rs"
+      - "crates/**/*.toml"
+      - "scripts/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+# One run per ref; a newer commit always wins. A gate over a superseded tree is
+# not evidence, and cancelling it hands the live commit a runner now.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental on purpose. `CARGO_INCREMENTAL=0` is for the benchmark jobs, where
+  # a reused `target/` is a measurement problem; here it only makes the runner
+  # rebuild everything from scratch on a cache miss.
+  CARGO_INCREMENTAL: "1"
+  # aarch64 hardware crypto: `aes` and `polyval` compile their ARMv8-Crypto
+  # backends behind these two cfgs and then runtime-dispatch, so the differential
+  # tests run where the bytes are produced. x86_64 consults neither.
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  lint:
+    name: lint, docs and gates
+    runs-on: ubuntu-latest
+    # A lint over four crates does not take an hour. Without a ceiling, one hung
+    # `cargo metadata` (the dependency-policy gate reads the graph, and that read
+    # can block on a registry lock) holds a runner until the six-hour default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Shared with the `test` job's ubuntu leg. Both build the same workspace
+          # with the same `RUSTFLAGS`, so the lint's artefacts are a valid warm
+          # start for the tests — and `clippy --all-targets` already compiles the
+          # test binaries the tests then link. Keyed by `CARGO_INCREMENTAL` and
+          # `RUSTFLAGS`, which are identical across the two jobs, so the shared key
+          # cannot hand one job a cache built with the other's flags.
+          shared-key: ci
+      # One runner for all of it: the lint policy lives in `[workspace.lints]`
+      # (`clippy::pedantic`, `undocumented_unsafe_blocks`), `clippy::perf` and
+      # `clippy::suspicious` ride along as warnings, and the three scripts are
+      # grep-speed. Merging the four old jobs into one checkout saved three
+      # toolchain installs and three cache restores per change.
+      - run: cargo fmt --all -- --check
+      - name: lint the workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::perf -W clippy::suspicious
+      # `--no-deps` builds this workspace's docs and nothing else, so this is the
+      # only place the dependency graph's documentation is compiled — which is
+      # the point: `RUSTDOCFLAGS: -D warnings` is meant to catch a broken intra-doc
+      # link in *this* crate, and `-D warnings` on `cargo doc` without `--no-deps`
+      # would fail the build on a warning in somebody else's crate instead.
+      - run: cargo doc --workspace --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # The gates are independent: four are greps and the fifth reads the dependency
+      # graph through `cargo metadata`, which is the only one that can block on a
+      # registry lock. Run together, this step costs the slowest gate rather than
+      # the sum of five, and every exit code is collected rather than discarded
+      # by the first failure — so one broken thing does not hide four.
+      #
+      # The list is written once into `GATES` and read twice, because a gate named
+      # in the launch loop but not in the collect loop would have its exit code
+      # thrown away and its output never printed, and that is exactly the shape of
+      # bug that reads as a pass.
+      - name: the gates that do not need a toolchain
+        env:
+          GATES: check-leak-surface check-comments check-fixture-safety check-dependency-policy check-windows-binary-paths
+        run: |
+          for gate in $GATES; do
+            ( "./scripts/$gate.sh" > "/tmp/$gate.log" 2>&1; echo $? > "/tmp/$gate.rc" ) &
+          done
+          wait
+          status=0
+          for gate in $GATES; do
+            cat "/tmp/$gate.log"
+            rc="$(cat "/tmp/$gate.rc")"
+            if [ "$rc" != 0 ]; then
+              echo "::error::$gate.sh exited $rc"
+              status=$rc
+            fi
+          done
+          exit "$status"
+
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    # A full workspace test, including `quiche`'s `BoringSSL` C build and the
+    # loopback network tests, is tens of minutes. The default ceiling is six
+    # hours, which is how a deadlocked relay test used to look like a busy
+    # afternoon rather than a failure.
+    timeout-minutes: 60
+    strategy:
+      # `true` on purpose: the first red stops the other two rather than letting
+      # them finish for a verdict nobody will read until the fix lands. The
+      # architecture asymmetry that matters (`chacha/avx2.rs` only compiling on
+      # x86_64) is caught by whichever runner gets there first.
+      fail-fast: true
+      matrix:
+        include:
+          # One job per OS this project claims anything about. The TLS stack is
+          # rustls everywhere, so there is no per-backend matrix to multiply.
+          # Architecture asymmetry: `chacha/avx2.rs` only compiles on x86_64, so an
+          # unnecessary `unsafe` around the safe `xor_groups` fails linux/windows
+          # via `RUSTFLAGS=-D warnings` (`unused_unsafe`) while macos stays green.
+          # `neon::xor_group` calls the same function without `unsafe`.
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: macos aarch64
+            os: macos-latest
+          - name: windows x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # One shared key across all three runners' caches. `rust-cache` otherwise
+      # keys on the job and each runner separately fills its own `target/` on a
+      # miss; sharing lets the first runner to finish warm the registry and the
+      # crate sources for the other two, which is the part of a cold build that
+      # is downloading rather than compiling. The compiled artefacts still do
+      # not cross runners — they cannot, the triples differ — so this saves
+      # network time and nothing else.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+      # `quiche` builds `BoringSSL`: `cmake`, `perl` and a C compiler ship with
+      # all three runners, `nasm` does not ship with `windows-latest`.
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        # Idempotent, and skips the download when the image already has it. The
+        # unconditional `choco install` paid a full package resolve — and a
+        # `--noop` fallback when `nasm` was already present — on every run.
+        run: choco install nasm -y --no-progress || echo "nasm already installed"
+      - run: cargo test --workspace --locked
+
+  # There is deliberately no `upstream` job here. There was one, named
+  # "upstream comparison is current", whose only step was the same
+  # `cargo test --workspace --locked` the `test` job above already runs on the
+  # same three runners: six runners per commit to execute one command twice, under
+  # a name that claimed a check it never performed. Pin resolution is `pins.yml`
+  # and the upstream suites themselves are `conformance.yml`; a job that touches
+  # neither is not upstream coverage however it is labelled.

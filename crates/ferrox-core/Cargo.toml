@@ -1,0 +1,64 @@
+[package]
+name = "ferrox-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Compiles the reference implementation from the `chacha20` crate, which the
+# differential tests and the benchmark gate compare against. Never enabled in a
+# shipped build: if the shipped path could call it, "bit-identical" would be a
+# statement about comparing the reference against itself.
+bench-reference = []
+
+[dependencies]
+# AEAD that opens the `REALITY` `ClientHello`'s `session_id`, in `tls::reality`.
+aes-gcm = "0.10"
+# `HKDF-SHA256` for the same handshake's auth key, and `HMAC-SHA512` for the
+# certificate proof it answers with.
+hkdf = "0.12"
+# The reference implementation the tests and benchmarks compare against. Never
+# used by the shipped path: if it were, "bit-identical" would be circular.
+chacha20 = "0.9"
+# `MD5` for the `shadowsocks` master key (`EVP_BytesToKey`), once per session.
+md5 = "0.7"
+# Already linked by `rustls`, so naming it directly adds no crate to the graph;
+# it is here only to derive the `Ed25519` key the `REALITY` certificate signs with.
+ring = "0.17"
+rustls = { workspace = true, features = ["std", "ring"] }
+# `sha2` plain, deliberately, and this is the one crate in the workspace where the
+# `asm` backend has to stay off. `sha2-asm` reaches `sha256_compress` through an
+# `extern "C"` declaration, which is FFI Miri cannot interpret, so enabling it here
+# makes `cargo miri test -p ferrox-core` fail on the first `REALITY` handshake
+# test with `unsupported operation: can't call foreign function 'sha256_compress'`
+# — which is what the 2026-10-04 safety run reported, 4 hours into interpreting
+# `tls::reality::tests::a_short_id_is_zero_padded_to_eight_bytes`.
+#
+# Nothing is measured by giving it up. This crate's only use of `sha2` is
+# `hkdf::Hkdf::<sha2::Sha256>` in `tls::reality`, over 32 bytes, once per handshake;
+# no gate times it. And no shipped build loses the hardware backend either, because
+# Cargo unifies features across the graph: `ferrox-app` enables `asm` from its
+# own target table, so every binary that links the core still gets it. Only the
+# `ferrox-core`-alone build — which is what the Miri job compiles — is soft.
+sha2 = "0.10"
+# `SHA1` for `shadowsocks`' `HKDF-SHA1` session key, once per session. Plain,
+# no `asm`: `sha1-asm` reaches its compression through `extern "C"`, which Miri
+# cannot interpret, and the same reasoning as `sha2` above applies one size down
+# -- this runs once per direction over 16-32 bytes and no gate times it.
+sha1 = "0.10"
+x25519-dalek = "2"
+
+[dev-dependencies]
+# The `AEAD` this crate replaces, used *only* by the differential test in
+# `aead.rs` that decides whether the replacement is allowed in. A dev-dependency
+# is not linked into a shipped build, which is the whole point: if the shipped
+# path could reach the reference, "bit-identical" would be a statement about
+# comparing this crate against itself.
+chacha20poly1305 = "0.10"
+
+poly1305 = "0.8"

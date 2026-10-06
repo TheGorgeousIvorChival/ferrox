@@ -1,0 +1,158 @@
+name: bench
+
+# The claim this project makes is not "fastest", it is "not slower than the
+# reference, checked continuously". A benchmark that runs once decays: a new
+# CPU, a new upstream release, a changed input distribution. This workflow runs
+# on a schedule and on demand, and fails if any single length regresses, so the
+# number in the README is never older than the last run.
+
+# Dispatch or daily. Never on a push.
+#
+# A push trigger here is four runners of timing to answer "did anything get
+# slower", on every merge, whether or not anyone is waiting for that answer. The
+# daily cron keeps the number honest on its own cadence; a slice whose gates
+# name a gate dispatches this by hand and waits for it.
+#
+# Daily rather than weekly, because this is the cheapest of the three timing
+# workflows: four runners, no Go toolchain, no upstream trees, and a report at
+# the end. A week is a long time for a regression to sit in `main` unremarked,
+# and the two heavier workflows that also publish a date have their own crons on
+# other hours, so a day here costs one runner-day rather than three contended
+# ones.
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 04:17 UTC. Off the hour on purpose: the half-hour marks are the
+    # busiest on shared infrastructure, and the three daily timing crons
+    # (`bench`, `parity`, `benchmark-matrix`) are separated by hours so they
+    # never read each other's load as a regression.
+    - cron: "17 4 * * *"
+
+# Queued, never cancelled: the report is written at the end of the run, so a
+# cancelled run leaves a gap rather than a stale number, and a gap is
+# indistinguishable from one that found nothing.
+concurrency:
+  group: bench-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The same cfgs as ci.yml, and no longer inert here: gate 10's reference is
+  # the `aes-gcm` crate, which compiles its ARMv8-Crypto backends only behind
+  # these two cfgs and then runtime-dispatches, so on the two aarch64 runners
+  # these flags are what the reference's hardware path is built with. Every
+  # other gate measures `ferrox-core` -- this repository's own ChaCha20,
+  # Poly1305 and AES-128-GCM -- which consults neither cfg. The flags a build
+  # carries do not depend on which workflow is running, which is what keeps a
+  # gate that reaches AES from measuring something CI would not ship.
+  RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  # One pin check per run instead of one per runner.
+  #
+  # A number measured against a pin that does not resolve is not a comparison,
+  # so this runs before anything is measured. It was four identical twelve-pin
+  # checks on four runners, and the answer does not vary by runner: either all
+  # twelve resolve or one does not, and the first leg to learn which had already
+  # made the other three redundant. Now it is one runner's work, and `needs`
+  # below means a broken pin stops the measurement instead of racing it four
+  # times.
+  pins:
+    name: upstream pins resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-upstream-pins.sh
+
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: pins
+    # The gates are a compile plus a sweep that re-measures any short length at
+    # 4x before it can fail. The default six-hour ceiling turns one wedged timer
+    # into a whole day of runner time; an hour and a half is several times the
+    # worst run this tree has produced.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One native runner per ISA this project claims anything about. A
+          # width chosen on Neoverse and not measured on Firestorm is a width
+          # chosen on one machine.
+          #
+          # There is deliberately no per-row `reference` key. The reference is
+          # the same crate everywhere, but the *backend it compiles to* is not:
+          # the `chacha20` crate only uses its NEON path behind a cfg nothing
+          # sets, so an aarch64 runner silently measures against a scalar core.
+          # The binary reports the backend it actually ran, so the label cannot
+          # drift away from the thing being compared against.
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macos aarch64
+            os: macos-15
+          - name: windows x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # One key for the four runners, so the first to finish warms the
+          # registry and crate sources for the rest. The compiled artefacts stay
+          # per-runner — four different targets, four different compilers — so
+          # this buys the download half of a cold build and nothing more.
+          shared-key: bench
+      # `quiche` builds `BoringSSL`: `cmake`, `perl` and a C compiler ship with
+      # all three runners, `nasm` does not ship with `windows-latest`.
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress || echo "nasm already installed"
+      - name: record the machine
+        shell: bash
+        run: |
+          {
+            echo '### machine'
+            echo '```'
+            uname -a || ver
+            rustc -vV
+            # The CPU's crypto features decide which engine the AES-GCM rows
+            # measured, so they are part of the machine's name: a ratio without
+            # them cannot be re-read later.
+            grep -m1 -o -E 'vaes|vpclmulqdq|avx512f|avx2|aes|pclmulqdq|pmull' /proc/cpuinfo 2>/dev/null | sort -u || sysctl -a 2>/dev/null | grep -E 'machdep.cpu.(features|leaf7_features)' || echo 'no cpuinfo'
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Three gates, in order: identity, then the deterministic properties, then
+      # timing. The first two are exact and machine-independent; only the third
+      # can be noisy, and a length under the bar is re-measured before it fails.
+      - name: identity, then deterministic properties, then timings
+        run: cargo run --locked --release -p ferrox-bench
+      - name: publish the table
+        if: always()
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/bench-report.md 2>/dev/null || echo "no report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The report as a file, not only as this run's step summary. A step summary
+      # is read once and gone, and a regression audit needs the *whole* table, not
+      # only the rows the assert named: "256B=0.53x" says a length lost and
+      # "256B=0.53x while 255B=1.02x and 257B=0.91x" says which shape lost. The
+      # panic points at `target/bench-report.md` and until this step existed, that
+      # path was on a runner that had already been torn down.
+      - name: upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-${{ matrix.name }}-${{ github.run_id }}
+          path: target/bench-report.md
+          retention-days: 30
+          if-no-files-found: warn
