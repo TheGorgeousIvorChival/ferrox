@@ -35,7 +35,11 @@ env:
 jobs:
   foxy-live:
     name: Foxy lane live (auth, pass, catalogue, carriers)
-    runs-on: ubuntu-24.04
+    # Not the pinned 24.04 the artifact jobs use: this job builds nothing, and
+    # 24.04's trust store predates the Let's Encrypt intermediate the account
+    # host is issued from, which is a measurement of the runner rather than of
+    # the lane.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       # The account lives under either spelling: FOXY_EMAIL/FOXY_PASS name what
