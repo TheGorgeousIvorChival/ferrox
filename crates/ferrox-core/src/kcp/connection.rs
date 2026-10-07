@@ -194,7 +194,7 @@ impl Connection {
         closer: Box<dyn FnOnce() + Send>,
         config: Config,
     ) -> Arc<Self> {
-        let mss = config.mtu - super::segment::DATA_SEGMENT_OVERHEAD;
+        let mss = config.payload_size();
         let ctx = Arc::new(Ctx {
             meta,
             config,
@@ -217,7 +217,7 @@ impl Connection {
             rd: Mutex::new(None),
             wd: Mutex::new(None),
             mss,
-            receiving: Mutex::new(ReceivingWorker::new(config, mss, Arc::clone(&ctx))),
+            receiving: Mutex::new(ReceivingWorker::new(config, Arc::clone(&ctx))),
             sending: Mutex::new(SendingWorker::new(config, Arc::clone(&ctx))),
             closer: Mutex::new(Some(closer)),
             terminated: AtomicBool::new(false),

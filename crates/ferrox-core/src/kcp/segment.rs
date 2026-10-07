@@ -422,6 +422,20 @@ mod tests {
     }
 
     #[test]
+    fn an_ack_segment_holds_no_more_than_the_limit_the_reference_allows() {
+        let mut seg = AckSegment::new(0);
+        seg.put_number(1);
+        assert!(seg.is_full());
+        let mut seg = AckSegment::new(1 << 20);
+        for n in 0..ACK_NUMBER_LIMIT as u32 {
+            seg.put_number(n);
+        }
+        assert!(seg.is_full());
+        seg.put_number(999);
+        assert_eq!(seg.numbers.len(), ACK_NUMBER_LIMIT + 1);
+    }
+
+    #[test]
     fn a_data_segment_round_trips_at_every_length_and_offset() {
         for len in 1..=64usize {
             for tail_len in 0..=8usize {
