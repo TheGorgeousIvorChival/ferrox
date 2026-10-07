@@ -81,11 +81,17 @@ for entry in $engine_list; do
     fi
   fi
   [[ -x "$path" ]] || {
+    echo "::warning::$label built at $path but it is not executable; ls:" >&2
+    ls -la "$path" "$(dirname "$path")" >&2 || true
     skipped+=("$label ($path is not executable)")
     continue
   }
   built+=("$label=$path")
 done
+{
+  echo "engines built: ${built[*]:-<none>}" >&2
+  echo "engines skipped: ${skipped[*]:-<none>}" >&2
+} || true
 ordered=()
 for want in xray-core ferrox zeronet sing-box xray-rust; do
   for have in ${built[@]+"${built[@]}"}; do

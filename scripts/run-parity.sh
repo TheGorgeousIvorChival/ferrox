@@ -136,7 +136,12 @@ for entry in $engine_list; do
       continue
     fi
   fi
-  [[ -x "$path" ]] || { skipped+=("$label ($path is not executable)"); continue; }
+  [[ -x "$path" ]] || {
+    echo "::warning::$label built at $path but it is not executable; ls:" >&2
+    ls -la "$path" "$(dirname "$path")" >&2 || true
+    skipped+=("$label ($path is not executable)")
+    continue
+  }
 
   engines+=("$label=$path")
   engine_args+=(--engine "$label=$path")
