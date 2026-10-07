@@ -134,14 +134,18 @@ sing_repo="$(pin_field sing-box 2)"
 sdir="$(mktemp -d)"
 if git clone --quiet --no-checkout "$sing_repo" "$sdir" 2>/dev/null && git -C "$sdir" checkout --quiet "$sing_rev" 2>/dev/null && [[ "$(git -C "$sdir" rev-parse HEAD)" == "$sing_rev" ]]; then
   proto_tests="$(find "$sdir/protocol/shadowsocks" "$sdir/protocol/vless" -name '*_test.go' 2>/dev/null | wc -l | tr -d ' ')"
-  env_files="$(git -C "$sdir" grep -lI -e 'os.Getenv' -- test/ 2>/dev/null | wc -l | tr -d ' ')"
+  env_files="$(git -C "$sdir" grep -lI -e 'os.Getenv' -- test/ 2>/dev/null | tr '\n' ' ')"
+  images="$(git -C "$sdir" grep -hI -e 'Image.*= ".*:latest"' -- test/clash_test.go 2>/dev/null | tr '\n' ' ')"
+  vless_tests="$(find "$sdir/test" -maxdepth 1 -name 'vless*' 2>/dev/null | wc -l | tr -d ' ')"
   {
-    echo "Checked at the pin: $proto_tests _test.go files under protocol/shadowsocks and protocol/vless, and $env_files test files reading the environment (openconnect interop flag, DOCKER_HOST) — none injects an external proxy binary, so this suite can only run sing-box against itself. Running it here would measure upstream, not this workspace, and is left out rather than faked."
+    echo "Checked at the pin: $proto_tests _test.go files under protocol/shadowsocks and protocol/vless; test/ reads the environment in 2 files only ($env_files), neither naming a proxy binary (openconnect interop flag, DOCKER_HOST); the cross-implementation peers are hardcoded docker images ($images); vless test files: $vless_tests."
+    echo
+    echo "No seam: every peer is built in-process or pulled by image name, so no Ferrox binary can be injected without editing their tests, which never happens here. Unblocked by an upstream env override for the peer image, not by a rung here."
     echo
   } >>"$report"
 else
   {
-    echo "Pin did not resolve for a live check; verdict carried from docs/conformance.md: no seam, in-process Go tests only."
+    echo "Pin did not resolve for a live check; verdict carried from the last green run: no seam, in-process Go tests only."
     echo
   } >>"$report"
 fi
