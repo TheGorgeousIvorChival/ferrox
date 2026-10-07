@@ -49,7 +49,7 @@ pub fn authority(host: &str, port: u16) -> String {
 /// HTTP/1.1 CONNECT, the one carrier the account's edge is certain to speak.
 #[must_use]
 pub fn connect_request(target: &str, bearer: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(96 + bearer.len());
+    let mut out = Vec::with_capacity(59 + 2 * target.len() + bearer.len());
     out.extend_from_slice(b"CONNECT ");
     out.extend_from_slice(target.as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
