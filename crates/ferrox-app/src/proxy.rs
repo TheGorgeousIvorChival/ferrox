@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -588,6 +588,18 @@ fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> 
     }
 }
 
+fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {
+    let address = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ferrox_core::addr::Addr::V4(ip.octets()),
+        std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
+    };
+    ferrox_core::mux::Target {
+        network: ferrox_core::mux::Network::Udp,
+        port: addr.port(),
+        addr: address,
+    }
+}
+
 fn write_mux_frame(
     shared: &Arc<Mutex<TcpStream>>,
     staging: &mut Vec<u8>,
@@ -627,6 +639,17 @@ fn write_mux_keep(
 
 type MuxTable = Arc<Mutex<HashMap<u16, Arc<Mutex<TcpStream>>>>>;
 
+struct UdpMux {
+    socket: Arc<UdpSocket>,
+    dest: SocketAddr,
+    id: Arc<AtomicU16>,
+    done: Arc<AtomicBool>,
+}
+
+type UdpTable = HashMap<u16, Arc<UdpMux>>;
+
+type UdpGlobal = HashMap<[u8; ferrox_core::mux::GLOBAL_ID], u16>;
+
 fn remove_mux_session(
     table: &MuxTable,
     id: u16,
@@ -645,6 +668,8 @@ fn serve_vless_mux(stream: TcpStream) {
     };
     let shared = Arc::new(Mutex::new(stream));
     let table: MuxTable = Arc::new(Mutex::new(HashMap::new()));
+    let mut udp: UdpTable = HashMap::new();
+    let mut global: UdpGlobal = HashMap::new();
     let mut handles: Vec<std::sync::mpsc::Receiver<()>> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     let mut at = 0;
@@ -663,13 +688,21 @@ fn serve_vless_mux(stream: TcpStream) {
             match ferrox_core::mux::decode(&buf[at..], ferrox_core::mux::NewTail::Forward) {
                 Err(ferrox_core::mux::Error::Short { .. }) => break,
                 Err(_) => {
-                    teardown_mux(&table, &handles);
+                    teardown_mux(&table, &udp, &handles);
                     return;
                 }
                 Ok((frame, used)) => {
                     at += used;
                     progressed = true;
-                    handle_mux_frame(frame, &table, &shared, &mut staging, &mut handles);
+                    handle_mux_frame(
+                        frame,
+                        &table,
+                        &mut udp,
+                        &mut global,
+                        &shared,
+                        &mut staging,
+                        &mut handles,
+                    );
                 }
             }
         }
@@ -680,16 +713,19 @@ fn serve_vless_mux(stream: TcpStream) {
             }
         }
     }
-    teardown_mux(&table, &handles);
+    teardown_mux(&table, &udp, &handles);
 }
 
-fn teardown_mux(table: &MuxTable, handles: &[std::sync::mpsc::Receiver<()>]) {
+fn teardown_mux(table: &MuxTable, udp: &UdpTable, handles: &[std::sync::mpsc::Receiver<()>]) {
     if let Ok(table) = table.lock() {
         for half in table.values() {
             if let Ok(half) = half.lock() {
                 let _ = half.shutdown(Shutdown::Both);
             }
         }
+    }
+    for session in udp.values() {
+        session.done.store(true, Ordering::Relaxed);
     }
     for done in handles {
         join(done);
@@ -699,6 +735,8 @@ fn teardown_mux(table: &MuxTable, handles: &[std::sync::mpsc::Receiver<()>]) {
 fn handle_mux_frame(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
+    udp: &mut UdpTable,
+    global: &mut UdpGlobal,
     shared: &Arc<Mutex<TcpStream>>,
     staging: &mut Vec<u8>,
     handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
@@ -707,70 +745,26 @@ fn handle_mux_frame(
     match frame.status {
         Status::New => {
             if frame.target.is_some_and(|t| t.network == Network::Udp) {
-                return send_mux_end(shared, staging, frame.id);
+                handle_mux_udp_new(frame, udp, global, shared, staging, handles);
+            } else {
+                handle_mux_tcp_new(frame, table, shared, staging, handles);
             }
-            let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
-                return send_mux_end(shared, staging, frame.id);
-            };
-            let live = match table.lock() {
-                Ok(table) => table.len(),
-                Err(_) => return,
-            };
-            if live >= ferrox_core::mux::DEFAULT_CAP {
-                return send_mux_end(shared, staging, frame.id);
-            }
-            let Some(uplink) = dial_or_report(&target) else {
-                return send_mux_end(shared, staging, frame.id);
-            };
-            let Ok(read_half) = uplink.try_clone() else {
-                return send_mux_end(shared, staging, frame.id);
-            };
-            let write_half = Arc::new(Mutex::new(uplink));
-            let duplicate = match table.lock() {
-                Ok(mut table) => table.insert(frame.id, Arc::clone(&write_half)).is_some(),
-                Err(_) => return,
-            };
-            if duplicate {
-                return send_mux_end(shared, staging, frame.id);
-            }
-            if let Some(data) = frame.data {
-                if write_half
-                    .lock()
-                    .is_ok_and(|mut half| half.write_all(data).is_err())
-                {
-                    remove_mux_session(table, frame.id, shared, staging);
-                    return;
-                }
-            }
-            let task_table = Arc::clone(table);
-            let task_shared = Arc::clone(shared);
-            let task_id = frame.id;
-            let task = move || {
-                let mut read_half = read_half;
-                let mut chunk = [0u8; 8192];
-                let mut scratch = Vec::with_capacity(8192);
-                loop {
-                    match read_half.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if !write_mux_keep(&task_shared, &mut scratch, task_id, &chunk[..n]) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
-            };
-            handles.push(RelayPool::global().run(task));
-            handles.retain(|done| done.try_recv().is_err());
         }
         Status::Keep => {
-            if frame.target.is_some() {
-                return;
-            }
             let Some(data) = frame.data else {
                 return;
             };
+            if let Some(session) = udp.get(&frame.id).cloned() {
+                let dest = frame
+                    .target
+                    .and_then(|t| mux_target_addr(&t))
+                    .unwrap_or(session.dest);
+                let _ = session.socket.send_to(data, dest);
+                return;
+            }
+            if frame.target.is_some() {
+                return;
+            }
             let half = match table.lock() {
                 Ok(table) => table.get(&frame.id).cloned(),
                 Err(_) => return,
@@ -782,6 +776,10 @@ fn handle_mux_frame(
             }
         }
         Status::End => {
+            if let Some(session) = udp.remove(&frame.id) {
+                session.done.store(true, Ordering::Relaxed);
+                global.retain(|_, id| *id != frame.id);
+            }
             if let Ok(mut table) = table.lock() {
                 if let Some(half) = table.remove(&frame.id) {
                     if let Ok(half) = half.lock() {
@@ -792,6 +790,162 @@ fn handle_mux_frame(
         }
         Status::KeepAlive => {}
     }
+}
+
+fn handle_mux_tcp_new(
+    frame: ferrox_core::mux::Incoming<'_>,
+    table: &MuxTable,
+    shared: &Arc<Mutex<TcpStream>>,
+    staging: &mut Vec<u8>,
+    handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
+) {
+    let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
+        return send_mux_end(shared, staging, frame.id);
+    };
+    let live = match table.lock() {
+        Ok(table) => table.len(),
+        Err(_) => return,
+    };
+    if live >= ferrox_core::mux::DEFAULT_CAP {
+        return send_mux_end(shared, staging, frame.id);
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return send_mux_end(shared, staging, frame.id);
+    };
+    let Ok(read_half) = uplink.try_clone() else {
+        return send_mux_end(shared, staging, frame.id);
+    };
+    let write_half = Arc::new(Mutex::new(uplink));
+    let duplicate = match table.lock() {
+        Ok(mut table) => table.insert(frame.id, Arc::clone(&write_half)).is_some(),
+        Err(_) => return,
+    };
+    if duplicate {
+        return send_mux_end(shared, staging, frame.id);
+    }
+    if let Some(data) = frame.data {
+        if write_half
+            .lock()
+            .is_ok_and(|mut half| half.write_all(data).is_err())
+        {
+            remove_mux_session(table, frame.id, shared, staging);
+            return;
+        }
+    }
+    let task_table = Arc::clone(table);
+    let task_shared = Arc::clone(shared);
+    let task_id = frame.id;
+    let task = move || {
+        let mut read_half = read_half;
+        let mut chunk = [0u8; 8192];
+        let mut scratch = Vec::with_capacity(8192);
+        loop {
+            match read_half.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if !write_mux_keep(&task_shared, &mut scratch, task_id, &chunk[..n]) {
+                        break;
+                    }
+                }
+            }
+        }
+        remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
+    };
+    handles.push(RelayPool::global().run(task));
+    handles.retain(|done| done.try_recv().is_err());
+}
+
+fn handle_mux_udp_new(
+    frame: ferrox_core::mux::Incoming<'_>,
+    udp: &mut UdpTable,
+    global: &mut UdpGlobal,
+    shared: &Arc<Mutex<TcpStream>>,
+    staging: &mut Vec<u8>,
+    handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
+) {
+    let Some(dest) = frame.target.and_then(|t| mux_target_addr(&t)) else {
+        return send_mux_end(shared, staging, frame.id);
+    };
+    let empty = [0u8; ferrox_core::mux::GLOBAL_ID];
+    let identity = frame.global_id.filter(|identity| *identity != empty);
+    let reused = identity
+        .and_then(|identity| global.get(&identity).copied())
+        .and_then(|id| udp.remove(&id).map(|session| (id, session)));
+    let session = if let Some((old, session)) = reused {
+        if old != frame.id {
+            send_mux_end(shared, staging, old);
+        }
+        session.id.store(frame.id, Ordering::Relaxed);
+        session
+    } else {
+        if udp.len() >= ferrox_core::mux::DEFAULT_CAP {
+            return send_mux_end(shared, staging, frame.id);
+        }
+        let bound = if dest.is_ipv6() {
+            UdpSocket::bind("[::]:0")
+        } else {
+            UdpSocket::bind("0.0.0.0:0")
+        };
+        let Ok(socket) = bound else {
+            return send_mux_end(shared, staging, frame.id);
+        };
+        let session = Arc::new(UdpMux {
+            socket: Arc::new(socket),
+            dest,
+            id: Arc::new(AtomicU16::new(frame.id)),
+            done: Arc::new(AtomicBool::new(false)),
+        });
+        let Some(reader) = spawn_mux_udp_reader(&session.socket, shared, &session) else {
+            return send_mux_end(shared, staging, frame.id);
+        };
+        handles.push(reader);
+        session
+    };
+    if let Some(identity) = identity {
+        global.insert(identity, frame.id);
+    }
+    udp.insert(frame.id, Arc::clone(&session));
+    if let Some(data) = frame.data {
+        let _ = session.socket.send_to(data, dest);
+    }
+}
+
+fn spawn_mux_udp_reader(
+    socket: &UdpSocket,
+    shared: &Arc<Mutex<TcpStream>>,
+    session: &Arc<UdpMux>,
+) -> Option<std::sync::mpsc::Receiver<()>> {
+    let read = socket.try_clone().ok()?;
+    read.set_read_timeout(Some(RELAY_POLL)).ok()?;
+    let shared = Arc::clone(shared);
+    let id = Arc::clone(&session.id);
+    let done = Arc::clone(&session.done);
+    Some(RelayPool::global().run(move || {
+        let mut buf = vec![0u8; UDP_BUF];
+        let mut staging = Vec::with_capacity(8192);
+        loop {
+            match read.recv_from(&mut buf) {
+                Ok((n, source)) => {
+                    let keep = ferrox_core::mux::Outgoing {
+                        id: id.load(Ordering::Relaxed),
+                        status: ferrox_core::mux::Status::Keep,
+                        options: ferrox_core::mux::DATA,
+                        target: Some(mux_target_of(source)),
+                        global_id: None,
+                    };
+                    if !write_mux_frame(&shared, &mut staging, keep, Some(&buf[..n])) {
+                        return;
+                    }
+                }
+                Err(error) if is_timeout(&error) => {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }))
 }
 
 fn serve_vless_tls_inbound(
@@ -1328,6 +1482,15 @@ pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u
     header
 }
 
+pub(crate) fn vless_mux_header(id: &[u8; 16]) -> Vec<u8> {
+    let mut header = Vec::with_capacity(19);
+    header.push(0);
+    header.extend_from_slice(id);
+    header.push(0);
+    header.push(3);
+    header
+}
+
 fn dial_vless(client: &TcpStream, mut uplink: TcpStream, vless: &VlessOut, target: &SocketAddr) {
     let header = vless_header(&vless.id, 1, target);
     match &vless.carrier {
@@ -1790,24 +1953,25 @@ fn mux_dial_uplink(client: &TcpStream, uplink: &mut TcpStream, id: u16) {
     let _ = uplink.shutdown(Shutdown::Both);
 }
 
-fn dial_vless_mux(
-    client: &TcpStream,
-    mut uplink: TcpStream,
-    vless: &VlessOut,
-    target: &SocketAddr,
-) {
+fn request_vless_mux(mut uplink: TcpStream, vless: &VlessOut) -> Option<TcpStream> {
     if !matches!(vless.carrier, Carrier::Raw) {
-        return;
+        return None;
     }
-    if uplink
-        .write_all(&vless_header(&vless.id, 3, target))
-        .is_err()
-    {
+    uplink.write_all(&vless_mux_header(&vless.id)).ok()?;
+    read_vless_response(&mut uplink)?;
+    Some(uplink)
+}
+
+fn open_vless_mux(vless: &VlessOut) -> Option<TcpStream> {
+    let endpoint = format!("{}:{}", vless.address, vless.port);
+    let server = endpoint.to_socket_addrs().ok()?.next()?;
+    request_vless_mux(dial_or_report(&server)?, vless)
+}
+
+fn dial_vless_mux(client: &TcpStream, uplink: TcpStream, vless: &VlessOut, target: &SocketAddr) {
+    let Some(mut uplink) = request_vless_mux(uplink, vless) else {
         return;
-    }
-    if read_vless_response(&mut uplink).is_none() {
-        return;
-    }
+    };
     let mut ids = ferrox_core::mux::Ids::new(1);
     let Ok(id) = ids.take() else {
         return;
@@ -2666,6 +2830,9 @@ fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
 }
 
 fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
+    if vless.mux {
+        return serve_socks_udp_vless_xudp(relay, vless);
+    }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<UdpUplink> = None;
     let mut buf = vec![0u8; UDP_BUF];
@@ -2701,6 +2868,126 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
         let _ = old.write.shutdown(Shutdown::Both);
         join(&old.done);
     }
+}
+
+fn xudp_identity(source: SocketAddr) -> [u8; ferrox_core::mux::GLOBAL_ID] {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    match source.ip() {
+        std::net::IpAddr::V4(ip) => mix(&ip.octets()),
+        std::net::IpAddr::V6(ip) => mix(&ip.octets()),
+    }
+    mix(&source.port().to_be_bytes());
+    hash.to_be_bytes()
+}
+
+fn spawn_xudp_reader(
+    read: TcpStream,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<std::sync::mpsc::Receiver<()>> {
+    let reply = relay.try_clone().ok()?;
+    Some(RelayPool::global().run(move || {
+        let mut read = read;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut at = 0;
+        let mut probe = [0u8; 8192];
+        let mut packet = Vec::with_capacity(UDP_BUF);
+        loop {
+            if at >= buf.len() {
+                buf.clear();
+                at = 0;
+            } else if at > 0 {
+                buf.drain(..at);
+                at = 0;
+            }
+            let mut progressed = false;
+            loop {
+                match ferrox_core::mux::decode(&buf[at..], ferrox_core::mux::NewTail::Forward) {
+                    Err(ferrox_core::mux::Error::Short { .. }) => break,
+                    Err(_) => return,
+                    Ok((frame, used)) => {
+                        at += used;
+                        progressed = true;
+                        let Some(data) = frame.data else { continue };
+                        let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
+                            continue;
+                        };
+                        let Some(dest) = source.lock().ok().and_then(|slot| *slot) else {
+                            continue;
+                        };
+                        packet.clear();
+                        packet.extend_from_slice(&[0, 0, 0]);
+                        push_socks_addr(&mut packet, &target);
+                        packet.extend_from_slice(data);
+                        let _ = reply.send_to(&packet, dest);
+                    }
+                }
+            }
+            if !progressed {
+                match read.read(&mut probe) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&probe[..n]),
+                }
+            }
+        }
+    }))
+}
+
+fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
+    let Some(mut write) = open_vless_mux(vless) else {
+        return;
+    };
+    let Ok(read) = write.try_clone() else {
+        return;
+    };
+    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let Some(done) = spawn_xudp_reader(read, relay, Arc::clone(&source)) else {
+        return;
+    };
+    let mut buf = vec![0u8; UDP_BUF];
+    let mut staging = Vec::with_capacity(UDP_BUF + 64);
+    let mut identity: Option<[u8; ferrox_core::mux::GLOBAL_ID]> = None;
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if let Ok(mut slot) = source.lock() {
+            *slot = Some(src);
+        }
+        let first = identity.is_none();
+        let identity = identity.get_or_insert_with(|| xudp_identity(src));
+        let frame = ferrox_core::mux::Outgoing {
+            id: 0,
+            status: if first {
+                ferrox_core::mux::Status::New
+            } else {
+                ferrox_core::mux::Status::Keep
+            },
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_target_of(dest)),
+            global_id: if first { Some(*identity) } else { None },
+        };
+        staging.resize(frame.frame_len(payload.len()), 0);
+        let written = frame.encode_into(Some(payload), &mut staging);
+        if write.write_all(&staging[..written]).is_err() {
+            break;
+        }
+    }
+    let end = ferrox_core::mux::Outgoing::bare(0, ferrox_core::mux::Status::End, 0);
+    staging.resize(end.frame_len(0), 0);
+    let written = end.encode_into(None, &mut staging);
+    let _ = write.write_all(&staging[..written]);
+    let _ = write.shutdown(Shutdown::Both);
+    join(&done);
 }
 
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
@@ -3503,6 +3790,9 @@ fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
     Some(())
 }
 
+const MUX_TARGET: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 666);
+
 fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], String, u8, SocketAddr)> {
     let mut head = [0u8; 18];
     read_exact(stream, &mut head).ok()?;
@@ -3520,6 +3810,9 @@ fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], String, u8, Socket
     }
     let mut cmd = [0u8; 1];
     read_exact(stream, &mut cmd).ok()?;
+    if cmd[0] == 3 {
+        return Some((id, flow, cmd[0], MUX_TARGET));
+    }
     let mut port = [0u8; 2];
     read_exact(stream, &mut port).ok()?;
     let target = read_addr(stream, u16::from_be_bytes(port))?;
@@ -6025,7 +6318,9 @@ mod tests {
         stream.write_all(&buf[..n]).expect("writes");
     }
 
-    fn mux_test_recv(stream: &mut TcpStream) -> (u16, ferrox_core::mux::Status, Vec<u8>) {
+    fn mux_test_recv_frame(
+        stream: &mut TcpStream,
+    ) -> (u16, ferrox_core::mux::Status, Option<SocketAddr>, Vec<u8>) {
         let mut raw = [0u8; 2];
         stream.read_exact(&mut raw).expect("reads");
         let meta_len = usize::from(u16::from_be_bytes(raw));
@@ -6044,7 +6339,17 @@ mod tests {
         }
         let (frame, _) =
             ferrox_core::mux::decode(&whole, ferrox_core::mux::NewTail::Forward).expect("decodes");
-        (frame.id, frame.status, frame.data.unwrap_or(&[]).to_vec())
+        (
+            frame.id,
+            frame.status,
+            frame.target.and_then(|t| mux_target_addr(&t)),
+            frame.data.unwrap_or(&[]).to_vec(),
+        )
+    }
+
+    fn mux_test_recv(stream: &mut TcpStream) -> (u16, ferrox_core::mux::Status, Vec<u8>) {
+        let (id, status, _, data) = mux_test_recv_frame(stream);
+        (id, status, data)
     }
 
     fn mux_test_target(port: u16) -> ferrox_core::mux::Target<'static> {
@@ -6060,14 +6365,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
-        let mut header = vec![0u8];
-        header.extend_from_slice(id);
-        header.push(0);
-        header.push(3);
-        header.extend_from_slice(&0u16.to_be_bytes());
-        header.push(1);
-        header.extend_from_slice(&[127, 0, 0, 1]);
-        stream.write_all(&header).expect("requests");
+        stream.write_all(&vless_mux_header(id)).expect("requests");
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).expect("replies");
         assert_eq!(response, [0, 0]);
@@ -6085,6 +6383,193 @@ mod tests {
                 Ok(_) => {}
             }
         }
+    }
+
+    fn mux_test_udp_echo() -> u16 {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
+    fn mux_test_udp_target(port: u16) -> ferrox_core::mux::Target<'static> {
+        ferrox_core::mux::Target {
+            network: ferrox_core::mux::Network::Udp,
+            port,
+            addr: ferrox_core::addr::Addr::V4([127, 0, 0, 1]),
+        }
+    }
+
+    #[test]
+    fn mux_udp_relays_datagrams_and_reuses_a_global_id() {
+        let echo_port = mux_test_udp_echo();
+        let id = [0x5au8; 16];
+        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &id, true);
+        });
+        let mut client = mux_test_connect(&id, tunnel_port);
+        let identity = [9u8; ferrox_core::mux::GLOBAL_ID];
+        let new = ferrox_core::mux::Outgoing {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_test_udp_target(echo_port)),
+            global_id: Some(identity),
+        };
+        mux_test_send(&mut client, new, Some(b"ping"));
+        let (got, status, source, data) = mux_test_recv_frame(&mut client);
+        assert_eq!(got, 7);
+        assert_eq!(status, ferrox_core::mux::Status::Keep);
+        assert_eq!(source.expect("source").port(), echo_port);
+        assert_eq!(data, b"ping");
+        let keep = ferrox_core::mux::Outgoing {
+            id: 7,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_test_udp_target(echo_port)),
+            global_id: None,
+        };
+        mux_test_send(&mut client, keep, Some(b"pong"));
+        let (_, _, _, data) = mux_test_recv_frame(&mut client);
+        assert_eq!(data, b"pong");
+        let again = ferrox_core::mux::Outgoing {
+            id: 8,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_test_udp_target(echo_port)),
+            global_id: Some(identity),
+        };
+        mux_test_send(&mut client, again, Some(b"ping"));
+        let (closed, status, _, _) = mux_test_recv_frame(&mut client);
+        assert_eq!((closed, status), (7, ferrox_core::mux::Status::End));
+        let (got, status, _, data) = mux_test_recv_frame(&mut client);
+        assert_eq!(got, 8);
+        assert_eq!(status, ferrox_core::mux::Status::Keep);
+        assert_eq!(data, b"ping");
+    }
+
+    #[test]
+    fn xudp_frames_match_the_upstream_layout() {
+        let target = mux_target_of("203.0.113.7:5000".parse().expect("addr"));
+        let new = ferrox_core::mux::Outgoing {
+            id: 0,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(target),
+            global_id: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+        let mut frame = vec![0u8; new.frame_len(4)];
+        let written = new.encode_into(Some(b"ping"), &mut frame);
+        assert_eq!(
+            &frame[..written],
+            &[
+                0x00, 0x14, 0x00, 0x00, 0x01, 0x01, 0x02, 0x13, 0x88, 0x01, 203, 0, 113, 7, 1, 2,
+                3, 4, 5, 6, 7, 8, 0x00, 0x04, b'p', b'i', b'n', b'g'
+            ][..]
+        );
+        let keep = ferrox_core::mux::Outgoing {
+            id: 0,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: Some(target),
+            global_id: None,
+        };
+        let mut frame = vec![0u8; keep.frame_len(4)];
+        let written = keep.encode_into(Some(b"pong"), &mut frame);
+        assert_eq!(
+            &frame[..written],
+            &[
+                0x00, 0x0c, 0x00, 0x00, 0x02, 0x01, 0x02, 0x13, 0x88, 0x01, 203, 0, 113, 7, 0x00,
+                0x04, b'p', b'o', b'n', b'g'
+            ][..]
+        );
+    }
+
+    #[test]
+    fn socks_associate_reaches_two_udp_targets_over_one_mux_connection() {
+        let first = mux_test_udp_echo();
+        let second = mux_test_udp_echo();
+        let id = [0x5au8; 16];
+        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        let opens = Arc::new(AtomicU64::new(0));
+        let opened = Arc::clone(&opens);
+        thread::spawn(move || {
+            for stream in tunnel.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                opened.fetch_add(1, Ordering::Relaxed);
+                thread::spawn(move || serve_vless_raw(stream, &id, true));
+            }
+        });
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            id,
+            carrier: Carrier::Raw,
+            host: "127.0.0.1".to_owned(),
+            mux: true,
+            quic_roots: None,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        for (port, word) in [(first, b"ping".as_slice()), (second, b"pong".as_slice())] {
+            let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let mut datagram = vec![0u8, 0, 0];
+            push_socks_addr(&mut datagram, &target);
+            datagram.extend_from_slice(word);
+            udp.send_to(&datagram, relay).expect("sends");
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = udp.recv_from(&mut back).expect("echoes");
+            let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+            assert_eq!(source.port(), target.port());
+            assert_eq!(source.ip().to_canonical(), target.ip().to_canonical());
+            assert_eq!(payload, word);
+        }
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            1,
+            "one carrier connection carries every target"
+        );
     }
 
     #[test]
@@ -6149,7 +6634,7 @@ mod tests {
     }
 
     #[test]
-    fn mux_serve_refuses_udp_unknown_and_malformed() {
+    fn mux_serve_refuses_unknown_and_malformed() {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let echo_port = mux_test_echo();
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -6159,21 +6644,6 @@ mod tests {
             serve_vless_raw(stream, &id, true);
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
-        let udp = ferrox_core::mux::Outgoing {
-            id: 3,
-            status: ferrox_core::mux::Status::New,
-            options: 0,
-            target: Some(ferrox_core::mux::Target {
-                network: ferrox_core::mux::Network::Udp,
-                port: 53,
-                addr: ferrox_core::addr::Addr::V4([127, 0, 0, 1]),
-            }),
-            global_id: None,
-        };
-        mux_test_send(&mut stream, udp, None);
-        let (got_id, got_status, _) = mux_test_recv(&mut stream);
-        assert_eq!(got_id, 3);
-        assert_eq!(got_status, ferrox_core::mux::Status::End);
         let stray = ferrox_core::mux::Outgoing::bare(77, ferrox_core::mux::Status::Keep, 0);
         mux_test_send(&mut stream, stray, None);
         let live = ferrox_core::mux::Outgoing {

@@ -660,6 +660,26 @@ Two streams already share one handshake through `dial_pooled`, proved by the soc
 Then earn the gate the hard way: three consecutive green `ci.yml` runs with no change to either file between them. A socket test that passes twice and fails the third is testing the scheduler, and the fix is in the test's determinism, not in its budget.
 ```
 
+## P31 · Put the security layer outside the carrier, where both references put it
+
+**When to use:** When a `security: tls` or `security: reality` row over a stream carrier is next to carry, and a real Xray peer cannot complete the handshake: this tree serves the carrier first and runs the TLS session inside it, where both references run TLS first and build the carrier on top.
+**Status:** todo
+**Leverage:** 5
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with the `ws_tls`, `httpupgrade_tls` and `grpc_tls` rows executed against `ferrox-app`
+**Touches:** crates/ferrox-app/src/proxy.rs, crates/ferrox-app/src/ws.rs, crates/ferrox-app/src/httpupgrade.rs, crates/ferrox-app/src/grpc.rs, crates/ferrox-app/src/xhttp.rs
+**Random weight:** 4
+
+```text
+The ordering is the whole bug and it is why the TLS rows are the ones that stay red. In `upstream/xray-core/transport/internet/websocket/hub.go` the listener is wrapped with `tls.NewListener` before the HTTP server sees a byte, and in `transport/internet/tcp/hub.go` each accepted connection is wrapped with `tls.Server` before the header authenticator runs; the dial side does the same, `internet.DialSystem` then the security conn then the transport dialer. This tree does it backwards: `serve_vless_tls` calls `crate::ws::accept`/`crate::grpc::accept` on the raw socket and then hands the carrier's reader and writer to `ferrox_core::tls::accept`, so the bytes on the wire are `HTTP/1.1 101` first and TLS records second. No Xray client opens with a plain HTTP request, so no Xray client completes; the same inversion is why no config path dials a TLS or REALITY outbound at all.
+
+The obstacle is structural, not conceptual: the carrier `accept` functions take `TcpStream` because they split it with `try_clone`, set read timeouts, and peek. Push the security layer outside and they have to accept a `Read + Write` stream whose reader and writer are the same object — the seam `serve_carried_tls` already proves is possible, in the other direction. Count what that costs: one split abstraction and one trait bound per carrier, against a family of rows that currently cannot connect.
+
+Do not carry both orders. A build that can serve carrier-inside-TLS and TLS-inside-carrier is two protocols wearing one config key, and the wrong one is the one a user's client will pick. The references agree on the order, so this tree agrees with them or it refuses the cell by name.
+
+Prove the new order with a loopback pair in each direction and name the conformance rows it earns. REALITY is the same move with a different handshake, so one seam should carry both.
+```
+
 ## Reading this file as a roadmap
 
 The graph is the point, and it is not a decoration: `ferrox-prompt next` ranks ready slices by leverage, breaks ties towards the smaller one, leaves out the ones waiting on a decision, and reports what each slice unblocks. `P21` waits on `P18`, which waits on `P17`, which waits on `P7` — the longest chain in the file, which is the kind of thing that is obvious once and invisible otherwise.
