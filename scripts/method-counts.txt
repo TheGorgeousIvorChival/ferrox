@@ -122,3 +122,7 @@ trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header
 trojan header-reads-domain-address 3 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan header-bytes-copied-out-of-the-buffer 0 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan key-bytes-compared-early-exit 0 ferrox-app-proxy::tests::the_key_compare_reads_every_byte
+carrier-hysteria ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-hysteria tcp-flows-per-handshake 1 ferrox-app-proxy::tests::hysteria_carries_vless_echo_over_loopback
+carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
+carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks

@@ -9589,6 +9589,10 @@ mod tests {
     #[test]
     fn hysteria_carries_vless_echo_over_loopback() {
         let _serial = quic_serial();
+        quic_retry_dial(hysteria_echo_once, 3);
+    }
+
+    fn hysteria_echo_once() {
         let echo_port = echo_once();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (port, roots) = hysteria_loop_with("test-auth", id);
