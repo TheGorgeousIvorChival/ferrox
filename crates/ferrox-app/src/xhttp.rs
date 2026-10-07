@@ -22,26 +22,7 @@ fn bare_path(target: &str) -> &str {
 }
 
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
-    let mut head = Vec::with_capacity(512);
-    let mut probe = [0u8; 512];
-    loop {
-        if head.len() >= HEAD_LIMIT {
-            return None;
-        }
-        let n = stream.read(&mut probe).ok()?;
-        if n == 0 {
-            return None;
-        }
-        let base = head.len();
-        head.extend_from_slice(&probe[..n]);
-        let scan = base.saturating_sub(3);
-        if let Some(at) = head[scan..].windows(4).position(|w| w == b"\r\n\r\n") {
-            let end = scan + at + 4;
-            let tail = head[end..].to_vec();
-            head.truncate(end);
-            return Some((head, tail));
-        }
-    }
+    crate::proxy::read_http_head(stream, HEAD_LIMIT).map(|head| (head, Vec::new()))
 }
 
 fn size_line(n: usize, out: &mut [u8; 6]) -> usize {

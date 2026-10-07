@@ -499,7 +499,7 @@ Whichever it is, `Xray-core`'s own server is the oracle for the answer and it is
 ## P22 · Take the third copy of the header walk out of the carrier files
 
 **When to use:** When `proxy::header_value` exists and two carriers still keep their own: `xhttp.rs` has a byte-identical copy and a head reader of its own, and `httpheader.rs` a third reader.
-**Status:** todo
+**Status:** done
 **Leverage:** 3
 **Effort:** small
 **Gates:** `cargo test --workspace`

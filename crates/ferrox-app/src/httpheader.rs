@@ -33,20 +33,10 @@ fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
     crate::proxy::read_http_head(stream, HEAD_LIMIT).map(|head| (head, Vec::new()))
 }
 
-fn request_target(head: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(head).ok()?;
-    let mut parts = text.split("\r\n").next()?.split_ascii_whitespace();
-    if parts.next()? != "GET" {
-        return None;
-    }
-    let target = parts.next()?;
-    Some(target.split('?').next().unwrap_or(target))
-}
-
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(HeadReader, TcpStream)> {
     let mut read = stream;
     let (head, prefix) = read_head(&mut read)?;
-    if request_target(&head)? != path {
+    if crate::proxy::request_path(&head)? != path {
         return None;
     }
     let Ok(write) = read.try_clone() else {
@@ -124,18 +114,21 @@ mod tests {
     #[test]
     fn the_request_target_is_a_borrow_and_ignores_the_query() {
         assert_eq!(
-            request_target(b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n"),
+            crate::proxy::request_path(b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n"),
             Some("/camouflage")
         );
         assert_eq!(
-            request_target(b"GET /camouflage?t=17 HTTP/1.1\r\n\r\n"),
+            crate::proxy::request_path(b"GET /camouflage?t=17 HTTP/1.1\r\n\r\n"),
             Some("/camouflage")
         );
-        assert_eq!(request_target(b"POST /camouflage HTTP/1.1\r\n\r\n"), None);
-        assert_eq!(request_target(b"GET\r\n\r\n"), None);
-        assert_eq!(request_target(&[0xff, 0xfe, 0xfd]), None);
         assert_eq!(
-            request_target(b"GET /camouflage HTTP/1.1\r\n\r\n"),
+            crate::proxy::request_path(b"POST /camouflage HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(crate::proxy::request_path(b"GET\r\n\r\n"), None);
+        assert_eq!(crate::proxy::request_path(&[0xff, 0xfe, 0xfd]), None);
+        assert_eq!(
+            crate::proxy::request_path(b"GET /camouflage HTTP/1.1\r\n\r\n"),
             Some("/camouflage"),
             "and the bytes it points at are the head's, not a copy"
         );
