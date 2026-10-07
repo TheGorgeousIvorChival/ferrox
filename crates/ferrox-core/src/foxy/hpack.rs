@@ -244,15 +244,134 @@ fn string_literal<'a>(block: &'a [u8], at: &mut usize) -> Option<Literal<'a>> {
     Some(Literal::Owned(out))
 }
 
-/// The `:status` entries of a static table, HPACK's from index 8 and QPACK's from
-/// index 23. Every other index is a field this lane never reads, so an index
-/// outside these two tables is refused rather than skipped: a block carrying one
-/// is a block whose dynamic table this lane does not have.
+/// The QPACK static table, index-addressed: the 99 name/value pairs every
+/// endpoint knows without any dynamic state, so an indexed field line is two
+/// bytes and a literal one is only needed for names the table never held.
+const QPACK_STATIC: [(&[u8], &[u8]); 99] = [
+    (b":authority", b""),
+    (b":path", b"/"),
+    (b"age", b"0"),
+    (b"content-disposition", b""),
+    (b"content-length", b"0"),
+    (b"cookie", b""),
+    (b"date", b""),
+    (b"etag", b""),
+    (b"if-modified-since", b""),
+    (b"if-none-match", b""),
+    (b"last-modified", b""),
+    (b"link", b""),
+    (b"location", b""),
+    (b"referer", b""),
+    (b"set-cookie", b""),
+    (b":method", b"CONNECT"),
+    (b":method", b"DELETE"),
+    (b":method", b"GET"),
+    (b":method", b"HEAD"),
+    (b":method", b"OPTIONS"),
+    (b":method", b"POST"),
+    (b":method", b"PUT"),
+    (b":scheme", b"http"),
+    (b":scheme", b"https"),
+    (b":status", b"103"),
+    (b":status", b"200"),
+    (b":status", b"304"),
+    (b":status", b"404"),
+    (b":status", b"503"),
+    (b"accept", b"*/*"),
+    (b"accept", b"application/dns-message"),
+    (b"accept-encoding", b"gzip, deflate, br"),
+    (b"accept-ranges", b"bytes"),
+    (b"access-control-allow-headers", b"cache-control"),
+    (b"access-control-allow-headers", b"content-type"),
+    (b"access-control-allow-origin", b"*"),
+    (b"cache-control", b"max-age=0"),
+    (b"cache-control", b"max-age=2592000"),
+    (b"cache-control", b"max-age=604800"),
+    (b"cache-control", b"no-cache"),
+    (b"cache-control", b"no-store"),
+    (b"cache-control", b"public, max-age=31536000"),
+    (b"content-encoding", b"br"),
+    (b"content-encoding", b"gzip"),
+    (b"content-type", b"application/dns-message"),
+    (b"content-type", b"application/javascript"),
+    (b"content-type", b"application/json"),
+    (b"content-type", b"application/x-www-form-urlencoded"),
+    (b"content-type", b"image/gif"),
+    (b"content-type", b"image/jpeg"),
+    (b"content-type", b"image/png"),
+    (b"content-type", b"text/css"),
+    (b"content-type", b"text/html; charset=utf-8"),
+    (b"content-type", b"text/plain"),
+    (b"content-type", b"text/plain;charset=utf-8"),
+    (b"range", b"bytes=0-"),
+    (b"strict-transport-security", b"max-age=31536000"),
+    (
+        b"strict-transport-security",
+        b"max-age=31536000; includesubdomains",
+    ),
+    (
+        b"strict-transport-security",
+        b"max-age=31536000; includesubdomains; preload",
+    ),
+    (b"vary", b"accept-encoding"),
+    (b"vary", b"origin"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-xss-protection", b"1; mode=block"),
+    (b":status", b"100"),
+    (b":status", b"204"),
+    (b":status", b"206"),
+    (b":status", b"302"),
+    (b":status", b"400"),
+    (b":status", b"403"),
+    (b":status", b"421"),
+    (b":status", b"425"),
+    (b":status", b"500"),
+    (b"accept-language", b""),
+    (b"access-control-allow-credentials", b"FALSE"),
+    (b"access-control-allow-credentials", b"TRUE"),
+    (b"access-control-allow-headers", b"*"),
+    (b"access-control-allow-methods", b"get"),
+    (b"access-control-allow-methods", b"get, post, options"),
+    (b"access-control-allow-methods", b"options"),
+    (b"access-control-expose-headers", b"content-length"),
+    (b"access-control-request-headers", b"content-type"),
+    (b"access-control-request-method", b"get"),
+    (b"access-control-request-method", b"post"),
+    (b"alt-svc", b"clear"),
+    (b"authorization", b""),
+    (
+        b"content-security-policy",
+        b"script-src 'none'; object-src 'none'; base-uri 'none'",
+    ),
+    (b"early-data", b"1"),
+    (b"expect-ct", b""),
+    (b"forwarded", b""),
+    (b"if-range", b""),
+    (b"origin", b""),
+    (b"purpose", b"prefetch"),
+    (b"server", b""),
+    (b"timing-allow-origin", b"*"),
+    (b"upgrade-insecure-requests", b"1"),
+    (b"user-agent", b""),
+    (b"x-forwarded-for", b""),
+    (b"x-frame-options", b"deny"),
+    (b"x-frame-options", b"sameorigin"),
+];
+
+/// The `:status` entries of a static table, HPACK's from index 8 and QPACK's
+/// from the table above. Every other index is a field this lane never reads,
+/// so an index outside these two tables is refused rather than skipped: a
+/// block carrying one is a block whose dynamic table this lane does not have.
 fn static_status(index: usize, h2: bool) -> Option<u16> {
-    const H2: [u16; 7] = [200, 204, 206, 304, 400, 404, 500];
-    const QPACK: [u16; 6] = [103, 200, 304, 404, 503, 500];
-    let (table, base) = if h2 { (&H2[..], 8) } else { (&QPACK[..], 23) };
-    table.get(index.checked_sub(base)?).copied()
+    if h2 {
+        const H2: [u16; 7] = [200, 204, 206, 304, 400, 404, 500];
+        return H2.get(index.checked_sub(8)?).copied();
+    }
+    let (name, value) = QPACK_STATIC.get(index)?;
+    if *name != b":status" {
+        return None;
+    }
+    status_of(value)
 }
 
 /// A three-digit decimal status, read in place rather than copied out.
@@ -348,6 +467,55 @@ fn qpack_name<'a>(block: &'a [u8], at: &mut usize) -> Option<Literal<'a>> {
     Some(Literal::Owned(out))
 }
 
+/// Any request as literal field lines: the two zero prefix bytes name no
+/// dynamic state, and each field is a `001` name length, name, value length,
+/// value run with no Huffman to compute.
+pub fn qpack_literal_many(fields: &[(&str, &str)], out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0x00, 0x00]);
+    for (name, value) in fields {
+        out.push(0x20);
+        integer_into(out, 3, name.len());
+        out.extend_from_slice(name.as_bytes());
+        integer(out, 7, 0x00, value.len());
+        out.extend_from_slice(value.as_bytes());
+    }
+}
+
+/// Reads every field of a QPACK block whose references stay inside the static
+/// table: indexed lines, name references with a static index, and literal
+/// names, Huffman-coded or not. Anything naming dynamic state is refused.
+#[must_use]
+pub fn qpack_fields(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    if *block.first()? != 0 || *block.get(1)? != 0 {
+        return None;
+    }
+    let mut at = 2usize;
+    let mut fields = Vec::new();
+    while at < block.len() {
+        let first = block[at];
+        if first & 0x80 != 0 {
+            let index = read_integer(block, &mut at, 6)?;
+            let (name, value) = QPACK_STATIC.get(index)?;
+            fields.push((name.to_vec(), value.to_vec()));
+        } else if first & 0xC0 == 0x40 {
+            if first & 0x20 != 0 {
+                return None;
+            }
+            let index = read_integer(block, &mut at, 4)?;
+            let (name, _) = QPACK_STATIC.get(index)?;
+            let value = string_literal(block, &mut at)?;
+            fields.push((name.to_vec(), value.as_bytes().to_vec()));
+        } else if first & 0xE0 == 0x20 {
+            let name = qpack_name(block, &mut at)?;
+            let value = string_literal(block, &mut at)?;
+            fields.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
+        } else {
+            return None;
+        }
+    }
+    Some(fields)
+}
+
 /// One CONNECT request, three fields, literal names and literal values: the
 /// smallest header block a CONNECT can be written in.
 pub fn hpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
@@ -367,18 +535,14 @@ pub fn hpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
 /// The same three fields under QPACK, whose block starts with a required insert
 /// count of zero and names its fields with the `001` literal pattern.
 pub fn qpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
-    out.extend_from_slice(&[0x00, 0x00]);
-    for (name, value) in [
-        (":method", "CONNECT"),
-        (":authority", target),
-        ("proxy-authorization", bearer),
-    ] {
-        out.push(0x20);
-        integer_into(out, 3, name.len());
-        out.extend_from_slice(name.as_bytes());
-        integer(out, 7, 0x00, value.len());
-        out.extend_from_slice(value.as_bytes());
-    }
+    qpack_literal_many(
+        &[
+            (":method", "CONNECT"),
+            (":authority", target),
+            ("proxy-authorization", bearer),
+        ],
+        out,
+    );
 }
 
 #[cfg(test)]
@@ -595,16 +759,23 @@ mod tests {
             }
         }
         for (index, want) in [
-            (23usize, 103u16),
-            (24, 200),
-            (25, 304),
-            (26, 404),
-            (27, 503),
-            (28, 500),
+            (24usize, 103u16),
+            (25, 200),
+            (26, 304),
+            (27, 404),
+            (28, 503),
+            (63, 100),
+            (64, 204),
+            (71, 500),
         ] {
             let mut q3 = vec![0x00, 0x00];
             integer(&mut q3, 6, 0xC0, index);
             assert_eq!(qpack_status(&q3), Some(want), "qpack {index}");
+        }
+        for index in [15usize, 20, 22, 23, 29, 62, 72, 98, 99, 200] {
+            let mut q3 = vec![0x00, 0x00];
+            integer(&mut q3, 6, 0xC0, index);
+            assert_eq!(qpack_status(&q3), None, "not a status: {index}");
         }
     }
 
@@ -684,6 +855,92 @@ mod tests {
         assert_eq!(qpack_status(&q3), Some(404));
     }
 
+    #[test]
+    fn the_qpack_static_table_holds_99_indexed_entries() {
+        assert_eq!(QPACK_STATIC.len(), 99);
+        for (index, name, value) in [
+            (0usize, ":authority", ""),
+            (1, ":path", "/"),
+            (15, ":method", "CONNECT"),
+            (20, ":method", "POST"),
+            (22, ":scheme", "http"),
+            (23, ":scheme", "https"),
+            (24, ":status", "103"),
+            (25, ":status", "200"),
+            (28, ":status", "503"),
+            (63, ":status", "100"),
+            (71, ":status", "500"),
+            (84, "authorization", ""),
+            (98, "x-frame-options", "sameorigin"),
+        ] {
+            assert_eq!(
+                QPACK_STATIC[index],
+                (name.as_bytes(), value.as_bytes()),
+                "index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn qpack_fields_reads_indexed_named_and_coded_lines() {
+        let mut block = Vec::new();
+        qpack_literal_many(
+            &[(":method", "POST"), ("hysteria-auth", "s3cret")],
+            &mut block,
+        );
+        block.push(0x80 | 0x17);
+        block.extend_from_slice(&[0x4F, 0x0A, 0x03, b'2', b'3', b'3']);
+        assert_eq!(
+            qpack_fields(&block),
+            Some(vec![
+                (b":method".to_vec(), b"POST".to_vec()),
+                (b"hysteria-auth".to_vec(), b"s3cret".to_vec()),
+                (b":scheme".to_vec(), b"https".to_vec()),
+                (b":status".to_vec(), b"233".to_vec()),
+            ])
+        );
+        let mut coded = Vec::new();
+        huffman_encode(b"gzip", &mut coded);
+        let mut huffed = vec![0x00, 0x00, 0x20];
+        integer_into(&mut huffed, 3, 7);
+        huffed.extend_from_slice(b":status");
+        huffed.push(0x80 | coded.len() as u8);
+        huffed.extend_from_slice(&coded);
+        assert_eq!(
+            qpack_fields(&huffed),
+            Some(vec![(b":status".to_vec(), b"gzip".to_vec())])
+        );
+    }
+
+    #[test]
+    fn qpack_fields_refuses_anything_naming_dynamic_state() {
+        assert_eq!(qpack_fields(&[]), None);
+        assert_eq!(qpack_fields(&[0x01, 0x00]), None);
+        assert_eq!(qpack_fields(&[0x00, 0x00, 0x60, 0x00]), None);
+        assert_eq!(qpack_fields(&[0x00, 0x00, 0x10]), None);
+        assert_eq!(qpack_fields(&[0x00, 0x00, 0x00]), None);
+    }
+
+    #[test]
+    fn a_literal_request_encodes_the_connect_form() {
+        let mut many = Vec::new();
+        qpack_literal_many(
+            &[
+                (":method", "CONNECT"),
+                (":authority", "example.com:443"),
+                ("proxy-authorization", "p"),
+            ],
+            &mut many,
+        );
+        let mut one = Vec::new();
+        qpack_connect("example.com:443", "p", &mut one);
+        assert_eq!(many, one);
+        assert_eq!(
+            qpack_fields(&many).expect("reads").len(),
+            3,
+            "three literal fields"
+        );
+    }
     #[test]
     fn a_connect_block_is_the_smallest_literal_form_and_holds_the_bearer() {
         let mut h2 = Vec::new();
