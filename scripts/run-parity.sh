@@ -29,9 +29,12 @@ verify_checkout() {
   local name="$1" rev
   rev="$(pin_of "$name")"
   [[ -n "$rev" ]] || fail "no rev for $name in $pins_file"
-  [[ -d "upstream/$name/.git" ]] || fail "upstream/$name is missing; run scripts/fetch-upstream.sh"
+  if [[ ! -d "upstream/$name/.git" ]]; then
+    fail "upstream/$name is missing; run scripts/fetch-upstream.sh"
+  fi
   local have
-  have="$(git -C "upstream/$name" rev-parse HEAD)"
+  have="$(GIT_CEILING_DIRECTORIES="$PWD" git -C "upstream/$name" rev-parse HEAD 2>/dev/null)" || \
+    fail "upstream/$name has no readable HEAD; re-run scripts/fetch-upstream.sh"
   [[ "$have" == "$rev" ]] || fail "upstream/$name is at $have, not the pinned $rev"
 }
 
@@ -60,7 +63,11 @@ build() {
     echo "$cached"
     return 0
   fi
-  verify_checkout "$name"
+  if ! (verify_checkout "$name" 2>/dev/null); then
+    note "re-fetching $name at its pin; the handoff did not carry it"
+    ./scripts/fetch-upstream.sh --only "$name" >&2 || return 1
+    verify_checkout "$name" || return 1
+  fi
   case "$name" in
     xray-core)
       note "building the pinned Xray-core at $rev"
