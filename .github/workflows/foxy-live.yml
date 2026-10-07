@@ -77,7 +77,7 @@ jobs:
       # bundle the lane read. A refusal with no issuer in it is a refusal nobody
       # can act on.
       - name: What the account host presents
-        if: steps.secrets.outputs.present == 'true'
+        if: always() && steps.secrets.outputs.present == 'true'
         continue-on-error: true
         run: |
           for host in api.accounts.firefox.com firefox.settings.services.mozilla.com; do
