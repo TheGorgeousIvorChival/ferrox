@@ -366,7 +366,7 @@ Report the before and after as a rate over a stated number of runs. "Fixed" is n
 ## P14 · Take the third copy of the config and address walks out of `proxy.rs`
 
 **When to use:** When the next slice touches a protocol role: `find_vless_outbound` (`crates/ferrox-app/src/proxy.rs:801`) and `find_vmess_outbound` (`:839`) walk the same `outbounds` → `settings.vnext[0]` → `users[0]` shape in two nearly identical loops, `shadowsocks::parse_addr_header` (`shadowsocks.rs:251`) and `vmess::decode_target` (`vmess.rs:592`) parse the same address triple in two orders, and `inbound_id` (`:672`) and `inbound_password` (`:717`) each walk `settings.clients[0]` themselves.
-**Status:** todo
+**Status:** done
 **Leverage:** 3
 **Effort:** medium
 **Gates:** `cargo test --workspace`; CI: `conformance.yml` green with the enabled `zeronet` subset executed against `ferrox-app`

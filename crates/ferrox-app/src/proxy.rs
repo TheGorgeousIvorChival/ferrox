@@ -4233,6 +4233,41 @@ pub(crate) fn request_path(head: &[u8]) -> Option<&str> {
     Some(target.split_once('?').map_or(target, |(base, _)| base))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddrKind {
+    V4,
+    V6,
+    Domain,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AddrBody<'a> {
+    V4([u8; 4]),
+    V6([u8; 16]),
+    Domain(&'a str),
+}
+
+pub(crate) fn parse_addr_body(buf: &[u8], kind: AddrKind) -> Option<(AddrBody<'_>, usize)> {
+    match kind {
+        AddrKind::V4 => {
+            let ip: [u8; 4] = buf.get(1..5)?.try_into().ok()?;
+            Some((AddrBody::V4(ip), 5))
+        }
+        AddrKind::V6 => {
+            let ip: [u8; 16] = buf.get(1..17)?.try_into().ok()?;
+            Some((AddrBody::V6(ip), 17))
+        }
+        AddrKind::Domain => {
+            let len = usize::from(*buf.get(1)?);
+            if len == 0 {
+                return None;
+            }
+            let host = std::str::from_utf8(buf.get(2..2 + len)?).ok()?;
+            Some((AddrBody::Domain(host), 2 + len))
+        }
+    }
+}
+
 pub(crate) fn write_all_two(stream: &mut TcpStream, first: &[u8], second: &[u8]) -> bool {
     #[cfg(unix)]
     {
@@ -4693,12 +4728,16 @@ fn read_socks_addr_rest(stream: &mut dyn Read, atyp: u8) -> Option<SocketAddr> {
     }
 }
 
-fn inbound_id(inbound: &Json) -> [u8; 16] {
+fn inbound_first_client(inbound: &Json) -> Option<&Json> {
     inbound
         .get("settings")
         .and_then(|s| s.get("clients"))
         .and_then(Json::as_arr)
         .and_then(|clients| clients.first())
+}
+
+fn inbound_id(inbound: &Json) -> [u8; 16] {
+    inbound_first_client(inbound)
         .and_then(|client| client.get("id"))
         .and_then(Json::as_str)
         .and_then(uuid_bytes)
@@ -4732,11 +4771,7 @@ pub(crate) fn inbound_ss_password(inbound: &Json) -> String {
 }
 
 fn inbound_password(inbound: &Json) -> String {
-    inbound
-        .get("settings")
-        .and_then(|s| s.get("clients"))
-        .and_then(Json::as_arr)
-        .and_then(|clients| clients.first())
+    inbound_first_client(inbound)
         .and_then(|client| client.get("password"))
         .and_then(Json::as_str)
         .unwrap_or("")
@@ -5113,16 +5148,26 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
     None
 }
 
+fn vnext_servers<'a>(
+    root: &'a Json,
+    protocol: &'a str,
+) -> impl Iterator<Item = (&'a Json, &'a Json)> + 'a {
+    let outbounds: &[Json] = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
+    outbounds
+        .iter()
+        .filter(move |outbound| outbound.get("protocol").and_then(Json::as_str) == Some(protocol))
+        .filter_map(|outbound| {
+            let server = outbound
+                .get("settings")
+                .and_then(|s| s.get("vnext"))
+                .and_then(Json::as_arr)
+                .and_then(|servers| servers.first())?;
+            Some((outbound, server))
+        })
+}
+
 fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
-    let empty = Vec::new();
-    let outbounds = root
-        .get("outbounds")
-        .and_then(Json::as_arr)
-        .unwrap_or(&empty);
-    for outbound in outbounds {
-        if outbound.get("protocol").and_then(Json::as_str) != Some("vless") {
-            continue;
-        }
+    for (outbound, server) in vnext_servers(root, "vless") {
         let security = stream_security(outbound);
         let quic_tls = outbound
             .get("streamSettings")
@@ -5133,12 +5178,6 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
         if !vless_security_supported(security) && !quic_tls {
             continue;
         }
-        let vnext = outbound
-            .get("settings")
-            .and_then(|s| s.get("vnext"))
-            .and_then(Json::as_arr)
-            .and_then(|servers| servers.first());
-        let Some(server) = vnext else { continue };
         let address = server.get("address").and_then(Json::as_str)?.to_owned();
         let port = server.get("port").and_then(Json::as_port)?;
         let id = server
@@ -5176,21 +5215,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
 }
 
 fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
-    let empty = Vec::new();
-    let outbounds = root
-        .get("outbounds")
-        .and_then(Json::as_arr)
-        .unwrap_or(&empty);
-    for outbound in outbounds {
-        if outbound.get("protocol").and_then(Json::as_str) != Some("vmess") {
-            continue;
-        }
-        let vnext = outbound
-            .get("settings")
-            .and_then(|s| s.get("vnext"))
-            .and_then(Json::as_arr)
-            .and_then(|servers| servers.first());
-        let Some(server) = vnext else { continue };
+    if let Some((outbound, server)) = vnext_servers(root, "vmess").next() {
         let address = server.get("address").and_then(Json::as_str)?.to_owned();
         let port = server.get("port").and_then(Json::as_port)?;
         let user = server

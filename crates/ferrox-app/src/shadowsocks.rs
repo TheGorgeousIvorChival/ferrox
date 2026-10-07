@@ -472,50 +472,23 @@ pub(crate) fn open_udp_datagram(
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
-    let &atyp = buf.first()?;
-    match atyp {
-        1 => {
-            if buf.len() < 7 {
-                return None;
-            }
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&buf[1..5]);
-            let mut port = [0u8; 2];
-            port.copy_from_slice(&buf[5..7]);
-            Some((
-                SocketAddr::new(std::net::IpAddr::V4(ip.into()), u16::from_be_bytes(port)),
-                7,
-            ))
+    let kind = match buf.first()? {
+        1 => crate::proxy::AddrKind::V4,
+        4 => crate::proxy::AddrKind::V6,
+        3 => crate::proxy::AddrKind::Domain,
+        _ => return None,
+    };
+    let (body, mut used) = crate::proxy::parse_addr_body(buf, kind)?;
+    let port = u16::from_be_bytes(buf.get(used..used + 2)?.try_into().ok()?);
+    used += 2;
+    let target = match body {
+        crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
+        crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
+        crate::proxy::AddrBody::Domain(host) => {
+            format!("{host}:{port}").to_socket_addrs().ok()?.next()?
         }
-        4 => {
-            if buf.len() < 19 {
-                return None;
-            }
-            let mut ip = [0u8; 16];
-            ip.copy_from_slice(&buf[1..17]);
-            let mut port = [0u8; 2];
-            port.copy_from_slice(&buf[17..19]);
-            Some((
-                SocketAddr::new(std::net::IpAddr::V6(ip.into()), u16::from_be_bytes(port)),
-                19,
-            ))
-        }
-        3 => {
-            let len = usize::from(*buf.get(1)?);
-            if len == 0 || buf.len() < 2 + len + 2 {
-                return None;
-            }
-            let host = std::str::from_utf8(&buf[2..2 + len]).ok()?;
-            let mut port = [0u8; 2];
-            port.copy_from_slice(&buf[2 + len..4 + len]);
-            let target = format!("{host}:{}", u16::from_be_bytes(port))
-                .to_socket_addrs()
-                .ok()?
-                .next()?;
-            Some((target, 4 + len))
-        }
-        _ => None,
-    }
+    };
+    Some((target, used))
 }
 
 #[cfg(test)]
