@@ -437,14 +437,6 @@ pub(crate) fn stream_recv_exact(
 /// names their anchors outright. `SSL_CERT_FILE` is honoured everywhere
 /// because that is what OpenSSL-shaped tooling already promises.
 pub(crate) fn system_roots() -> Vec<Vec<u8>> {
-    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
-        if let Ok(pem) = std::fs::read(&path) {
-            let roots = parse_ca_pem(&pem);
-            if !roots.is_empty() {
-                return roots;
-            }
-        }
-    }
     const BUNDLES: [&str; 10] = [
         "/etc/ssl/cert.pem",
         "/etc/ssl/certs/ca-certificates.crt",
@@ -457,6 +449,14 @@ pub(crate) fn system_roots() -> Vec<Vec<u8>> {
         "C:/msys64/mingw64/ssl/certs/ca-bundle.crt",
         "C:/msys64/usr/ssl/certs/ca-bundle.crt",
     ];
+    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+        if let Ok(pem) = std::fs::read(&path) {
+            let roots = parse_ca_pem(&pem);
+            if !roots.is_empty() {
+                return roots;
+            }
+        }
+    }
     for path in BUNDLES {
         if let Ok(pem) = std::fs::read(path) {
             let roots = parse_ca_pem(&pem);
