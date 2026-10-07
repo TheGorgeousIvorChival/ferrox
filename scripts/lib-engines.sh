@@ -17,9 +17,14 @@ verify_checkout() {
   local name="$1" rev
   rev="$(pin_of "$name")"
   [[ -n "$rev" ]] || fail "no rev for $name in $pins_file"
-  [[ -d "upstream/$name/.git" ]] || fail "upstream/$name is missing; run scripts/fetch-upstream.sh"
+  # Never let git walk up to the ferrox tree itself: a missing .git must read
+  # as missing, not as the parent checkout's HEAD.
+  if [[ ! -d "upstream/$name/.git" ]]; then
+    fail "upstream/$name is missing; run scripts/fetch-upstream.sh"
+  fi
   local have
-  have="$(git -C "upstream/$name" rev-parse HEAD)"
+  have="$(GIT_CEILING_DIRECTORIES="$PWD" git -C "upstream/$name" rev-parse HEAD 2>/dev/null)" || \
+    fail "upstream/$name has no readable HEAD; re-run scripts/fetch-upstream.sh"
   [[ "$have" == "$rev" ]] || fail "upstream/$name is at $have, not the pinned $rev"
 }
 
@@ -48,7 +53,14 @@ build() {
     echo "$cached"
     return 0
   fi
-  verify_checkout "$name"
+  # The artifact lane hands checkouts between jobs, and a checkout that did
+  # not survive the handoff is re-fetched at its pin here, never guessed: the
+  # subshell keeps verify_checkout's exit from ending the whole matrix run.
+  if ! (verify_checkout "$name" 2>/dev/null); then
+    note "re-fetching $name at its pin; the handoff did not carry it"
+    ./scripts/fetch-upstream.sh --only "$name" >/dev/null 2>&1 || return 1
+    verify_checkout "$name" || return 1
+  fi
   case "$name" in
     xray-core)
       note "building the pinned Xray-core at $rev"
