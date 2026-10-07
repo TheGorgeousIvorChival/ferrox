@@ -6857,7 +6857,7 @@ mod tests {
             std::fs::write(&key_path, &key_pem).expect("stages key");
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
             config
-                .set_application_protos(&[b"h3".as_slice()])
+                .set_application_protos(&[crate::quic::ALPN])
                 .expect("negotiates");
             config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
             config.set_initial_max_data(crate::quic::MAX_DATA);
@@ -6904,6 +6904,7 @@ mod tests {
                 );
             }
             assert_eq!(seen, expected_header);
+            assert_eq!(conn.application_proto(), crate::quic::ALPN);
             conn.stream_send(0, &[0, 0], false).expect("accepts");
             while let Ok((written, info)) = conn.send(&mut out) {
                 sock.send_to(&out[..written], info.to).expect("answers");
@@ -6996,7 +6997,7 @@ mod tests {
         std::fs::write(&key_path, &key_pem).expect("stages key");
         let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
         server_config
-            .set_application_protos(&[b"h3".as_slice()])
+            .set_application_protos(&[crate::quic::ALPN])
             .expect("negotiates");
         server_config.set_initial_max_data(crate::quic::MAX_DATA);
         server_config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
@@ -7170,7 +7171,7 @@ mod tests {
             std::fs::write(&key_path, &key_pem).expect("stages key");
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
             config
-                .set_application_protos(&[b"h3".as_slice()])
+                .set_application_protos(&[crate::quic::ALPN])
                 .expect("negotiates");
             config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
             config.set_initial_max_data(crate::quic::MAX_DATA);
@@ -7387,8 +7388,13 @@ mod tests {
         let out = find_vless_outbound(&bare, Mimic::Xray).expect("finds anchorless quic");
         assert!(out.quic_roots.is_none());
     }
+    static QUIC_DIAL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn quic_serial() -> std::sync::MutexGuard<'static, ()> {
-        crate::quic::quic_serial()
+        match QUIC_DIAL_SERIAL.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     fn quic_retry_dial(once: fn(), attempts: u32) {

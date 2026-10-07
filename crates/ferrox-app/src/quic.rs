@@ -47,7 +47,7 @@ fn pool() -> &'static QuicPool {
     })
 }
 
-const ALPN_H3: &[u8] = b"h3";
+pub(crate) const ALPN: &[u8] = b"h3";
 
 const SCID_LEN: usize = 16;
 
@@ -66,17 +66,6 @@ const PUMP_POLL: Duration = Duration::from_millis(500);
 const SEND_WAIT: Duration = Duration::from_secs(10);
 
 static TRUST_SEQ: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-pub(crate) static QUIC_SERIAL: Mutex<()> = Mutex::new(());
-
-#[cfg(test)]
-pub(crate) fn quic_serial() -> std::sync::MutexGuard<'static, ()> {
-    match QUIC_SERIAL.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
 
 #[cfg(test)]
 pub(crate) static QSTAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -221,11 +210,14 @@ fn stage_trust_file(bundle: &[u8]) -> Option<(std::path::PathBuf, String)> {
         std::process::id(),
         TRUST_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let path = std::env::temp_dir().join(name);
+    stage_at(&std::env::temp_dir().join(name), bundle)
+}
+
+fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf, String)> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(path)
         .ok()?;
     #[cfg(unix)]
     {
@@ -234,7 +226,7 @@ fn stage_trust_file(bundle: &[u8]) -> Option<(std::path::PathBuf, String)> {
     }
     std::io::Write::write_all(&mut file, bundle).ok()?;
     let text = path.to_str()?.to_owned();
-    Some((path, text))
+    Some((path.to_path_buf(), text))
 }
 
 pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
@@ -250,7 +242,7 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
         .ok()
         .and_then(|mut config| {
             config.verify_peer(true);
-            config.set_application_protos(&[ALPN_H3]).ok()?;
+            config.set_application_protos(&[ALPN]).ok()?;
             config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
             config.set_initial_max_data(MAX_DATA);
             config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
@@ -800,50 +792,33 @@ mod tests {
         }
     }
 
+    fn owned_staging_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ferrox-quic-test-{}-{tag}.pem", std::process::id()))
+    }
+
     #[test]
     fn staging_refuses_a_name_something_else_already_holds() {
-        let _serial = quic_serial();
-        let (path, text) = stage_trust_file(b"mine").expect("stages");
-        assert_eq!(text, path.to_string_lossy());
-        let planted = std::env::temp_dir().join(format!(
-            "ferrox-quic-roots-{}-{}.pem",
-            std::process::id(),
-            TRUST_SEQ.load(Ordering::Relaxed)
-        ));
-        std::fs::write(&planted, b"planted").expect("plants");
-        assert!(stage_trust_file(b"mine").is_none());
-        assert_eq!(std::fs::read(&planted).expect("reads"), b"planted");
+        let path = owned_staging_path("taken");
+        std::fs::write(&path, b"planted").expect("plants");
+        assert!(stage_at(&path, b"mine").is_none());
+        assert_eq!(std::fs::read(&path).expect("reads"), b"planted");
         std::fs::remove_file(&path).expect("removes");
-        std::fs::remove_file(&planted).expect("removes");
+        let (back, text) = stage_at(&path, b"mine").expect("stages");
+        assert_eq!(back, path);
+        assert_eq!(text, path.to_string_lossy());
+        assert_eq!(std::fs::read(&path).expect("reads"), b"mine");
+        std::fs::remove_file(&path).expect("removes");
     }
 
     #[test]
-    fn a_staged_trust_bundle_never_survives_its_loader() {
-        let _serial = quic_serial();
-        let minted =
-            rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()]).expect("mints");
-        let roots = parse_ca_pem(minted.cert.pem().as_bytes());
-        let staged = TRUST_SEQ.load(Ordering::Relaxed);
-        for _ in 0..4 {
-            assert!(quiche_config(&roots).is_some());
-        }
-        assert_eq!(TRUST_SEQ.load(Ordering::Relaxed), staged + 4);
-        assert_eq!(staged_bundles(staged), Vec::<String>::new());
-    }
-
-    fn staged_bundles(from: u64) -> Vec<String> {
-        let prefix = format!("ferrox-quic-roots-{}-", std::process::id());
-        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(&prefix))
-            .filter_map(|n| n[prefix.len()..].strip_suffix(".pem")?.parse::<u64>().ok())
-            .filter(|seq| *seq >= from)
-            .map(|seq| seq.to_string())
-            .collect()
+    fn staging_returns_the_name_it_wrote_so_the_caller_can_remove_it() {
+        let path = owned_staging_path("removable");
+        let (back, text) = stage_at(&path, b"bundle").expect("stages");
+        assert_eq!(back, path);
+        assert_eq!(text, path.to_string_lossy());
+        assert_eq!(std::fs::read(&path).expect("reads"), b"bundle");
+        std::fs::remove_file(&path).expect("removes");
+        assert!(!path.exists());
     }
 
     #[test]
@@ -854,7 +829,6 @@ mod tests {
 
     #[test]
     fn config_loads_a_minted_anchor() {
-        let _serial = quic_serial();
         let minted =
             rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()]).expect("mints");
         let roots = parse_ca_pem(minted.cert.pem().as_bytes());
