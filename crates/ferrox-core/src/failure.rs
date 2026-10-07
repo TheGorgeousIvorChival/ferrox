@@ -178,6 +178,8 @@ impl Ladder {
         }
     }
 
+    // The rung the walk moves to is the rung the ladder keeps, so the report
+    // and the next dial agree on where the session is.
     #[must_use]
     pub fn record_failure(&self, rung: Rung, failure: &Failure) -> Option<Rung> {
         let Ok(mut counts) = self.locked.lock() else {
@@ -189,15 +191,15 @@ impl Ladder {
             return None;
         }
         let (current, _) = Self::unpack(self.packed.load(Ordering::Relaxed));
-        if rung == current {
-            let above = current.next()?;
-            self.packed.store(Self::pack(above, 0), Ordering::Relaxed);
-            counts.climbs = counts.climbs.saturating_add(1);
-            Some(above)
-        } else {
+        let Some(above) = rung.next() else {
             self.packed.store(Self::pack(current, 0), Ordering::Relaxed);
-            rung.next()
+            return None;
+        };
+        self.packed.store(Self::pack(above, 0), Ordering::Relaxed);
+        if above != current {
+            counts.climbs = counts.climbs.saturating_add(1);
         }
+        Some(above)
     }
 
     #[must_use]
