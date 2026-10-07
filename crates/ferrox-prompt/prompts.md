@@ -878,7 +878,7 @@ Until one of those lands, do not re-bless on a single measurement. The 2640 read
 ## P42 · Make the account plane reachable, or say why it cannot be
 
 **When to use:** When `foxy-live.yml` reports `handshake api.accounts.firefox.com: bad certificate: UnknownIssuer` while the settings host beside it verifies: the lane wants to sign in for real and cannot.
-**Status:** todo
+**Status:** done
 **Leverage:** 4
 **Effort:** medium
 **Gates:** `foxy-live.yml` reports a sign-in and a minted pass
