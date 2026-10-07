@@ -118,13 +118,29 @@ pub(crate) struct Ctx {
     output: Mutex<OutputSink>,
 }
 
+const WRITE_ATTEMPTS: u32 = 5;
+const WRITE_RETRY_MS: u64 = 100;
+
 impl Ctx {
-    fn emit(&self, enc: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
-        let mut sink = self.output.lock().unwrap();
-        let OutputSink { buf, write } = &mut *sink;
-        buf.clear();
-        enc(buf);
-        write(buf)
+    fn emit(&self, mut enc: impl FnMut(&mut Vec<u8>)) -> io::Result<()> {
+        let mut last = None;
+        for attempt in 0..WRITE_ATTEMPTS {
+            let outcome = {
+                let mut sink = self.output.lock().unwrap();
+                let OutputSink { buf, write } = &mut *sink;
+                buf.clear();
+                enc(buf);
+                write(buf)
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+            if attempt + 1 < WRITE_ATTEMPTS {
+                thread::sleep(Duration::from_millis(WRITE_RETRY_MS));
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("segment write")))
     }
 
     pub(crate) fn emit_data(&self, d: &DataSegment) -> io::Result<()> {
@@ -570,7 +586,76 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::{ping_due, PING_INTERVAL_MS};
+    use std::io;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    use super::{
+        ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, PING_INTERVAL_MS,
+        WRITE_ATTEMPTS,
+    };
+
+    fn counting_writer(
+        fail_times: u32,
+    ) -> (
+        Arc<AtomicU32>,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        impl FnMut(&[u8]) -> io::Result<()> + Send,
+    ) {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (a, s) = (Arc::clone(&attempts), Arc::clone(&seen));
+        (attempts, seen, move |data: &[u8]| {
+            let n = a.fetch_add(1, Ordering::SeqCst);
+            s.lock().unwrap().push(data.to_vec());
+            if n < fail_times {
+                Err(io::Error::other("transient"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[test]
+    fn a_failed_write_is_retried_with_the_same_bytes() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let (attempts, seen, write) = counting_writer(2);
+        let conn = Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(write),
+            Box::new(|| {}),
+            Config::default(),
+        );
+        conn.ping(1, Command::Terminate);
+        let seen = seen.lock().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(seen[1], seen[2]);
+        assert_eq!(seen[0].len(), CmdOnlySegment::byte_size());
+    }
+
+    #[test]
+    fn a_write_that_never_succeeds_stops_at_the_attempt_limit() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let (attempts, _, write) = counting_writer(u32::MAX);
+        let conn = Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(write),
+            Box::new(|| {}),
+            Config::default(),
+        );
+        conn.ping(1, Command::Ping);
+        assert_eq!(attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+    }
 
     #[test]
     fn one_tick_pings_at_most_once() {
