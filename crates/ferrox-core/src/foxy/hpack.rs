@@ -100,7 +100,7 @@ fn huffman_code(symbol: usize) -> Option<(u32, usize)> {
 /// padding rather than a symbol: a block that decodes one is malformed, and the
 /// all-ones prefix shorter than eight bits that a string may end on is the only
 /// thing allowed after its last symbol.
-fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
+pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let table = huffman();
     let mut acc = 0u32;
     let mut bits = 0usize;

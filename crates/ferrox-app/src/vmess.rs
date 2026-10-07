@@ -203,8 +203,9 @@ fn chacha_key(key: &[u8; 16]) -> [u8; 32] {
     out
 }
 
-const fn crc_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
+// Linear over GF(2): eight bytes decompose into eight table-folded contributions.
+const fn crc_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
     let mut i = 0usize;
     while i < 256 {
         let mut crc = i as u32;
@@ -217,18 +218,41 @@ const fn crc_table() -> [u32; 256] {
             };
             bit += 1;
         }
-        table[i] = crc;
+        tables[0][i] = crc;
         i += 1;
     }
-    table
+    let mut k = 1usize;
+    while k < 8 {
+        let mut i = 0usize;
+        while i < 256 {
+            let crc = tables[k - 1][i];
+            tables[k][i] = tables[0][(crc & 0xff) as usize] ^ (crc >> 8);
+            i += 1;
+        }
+        k += 1;
+    }
+    tables
 }
 
-const CRC_TABLE: [u32; 256] = crc_table();
+const CRC_TABLES: [[u32; 256]; 8] = crc_tables();
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
-    for &byte in data {
-        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize];
+    let (groups, rest) = data.as_chunks::<8>();
+    for chunk in groups {
+        let low = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+        let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        crc = CRC_TABLES[7][(low & 0xff) as usize]
+            ^ CRC_TABLES[6][((low >> 8) & 0xff) as usize]
+            ^ CRC_TABLES[5][((low >> 16) & 0xff) as usize]
+            ^ CRC_TABLES[4][(low >> 24) as usize]
+            ^ CRC_TABLES[3][(high & 0xff) as usize]
+            ^ CRC_TABLES[2][((high >> 8) & 0xff) as usize]
+            ^ CRC_TABLES[1][((high >> 16) & 0xff) as usize]
+            ^ CRC_TABLES[0][(high >> 24) as usize];
+    }
+    for &byte in rest {
+        crc = (crc >> 8) ^ CRC_TABLES[0][((crc ^ u32::from(byte)) & 0xff) as usize];
     }
     !crc
 }

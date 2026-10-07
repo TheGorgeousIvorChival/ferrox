@@ -1,8 +1,8 @@
 use std::cell::RefCell;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use crate::proxy::RELAY_BUFFER;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
 const BUFFER: usize = 2048;
 const SEED: [u32; 4] = [900, 500, 900, 256];
@@ -25,7 +25,6 @@ pub(crate) struct Link<S: Read + Write> {
     hat: usize,
     out: Vec<u8>,
     oat: usize,
-    chunk: Vec<u8>,
     staging: Vec<u8>,
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the staging gate"))]
     staged: usize,
@@ -69,7 +68,6 @@ impl<S: Read + Write> Link<S> {
             hat: 0,
             out: Vec::new(),
             oat: 0,
-            chunk: vec![0u8; RELAY_BUFFER],
             staging: Vec::new(),
             staged: 0,
             read: Reading {
@@ -167,13 +165,28 @@ impl<S: Read + Write> Link<S> {
     /// byte that had to be staged; `staged()` counts them.
     fn fill(&mut self) -> std::io::Result<bool> {
         loop {
-            let n = self.session.read(&mut self.chunk)?;
+            self.compact();
+            let base = self.have.len();
+            self.have.reserve_exact(RELAY_BUFFER);
+            // The read lands in spare capacity; staging here copied every framed byte twice.
+            let read = unsafe {
+                self.have.set_len(base + RELAY_BUFFER);
+                self.session.read(&mut self.have[base..])
+            };
+            let n = match read {
+                Ok(n) => {
+                    self.have.truncate(base + n);
+                    n
+                }
+                Err(error) => {
+                    self.have.truncate(base);
+                    return Err(error);
+                }
+            };
             if n == 0 {
                 self.flush_truncated();
                 return Ok(self.oat < self.out.len());
             }
-            self.compact();
-            self.have.extend_from_slice(&self.chunk[..n]);
             self.staged += n;
             let was = self.out.len();
             let framed = self.unpad();
