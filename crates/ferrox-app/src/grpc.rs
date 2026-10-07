@@ -28,265 +28,6 @@ const MSG_CAP: usize = 16 * 1024 * 1024;
 const HUNK: usize = 16 * 1024;
 const WINDOW_MAX: u64 = (1 << 31) - 1;
 
-const HUFFMAN: [(u32, u8); 256] = [
-    (0x1ff8, 13),
-    (0x007f_ffd8, 23),
-    (0x0fff_ffe2, 28),
-    (0x0fff_ffe3, 28),
-    (0x0fff_ffe4, 28),
-    (0x0fff_ffe5, 28),
-    (0x0fff_ffe6, 28),
-    (0x0fff_ffe7, 28),
-    (0x0fff_ffe8, 28),
-    (0x00ff_ffea, 24),
-    (0x3fff_fffc, 30),
-    (0x0fff_ffe9, 28),
-    (0x0fff_ffea, 28),
-    (0x3fff_fffd, 30),
-    (0x0fff_ffeb, 28),
-    (0x0fff_ffec, 28),
-    (0x0fff_ffed, 28),
-    (0x0fff_ffee, 28),
-    (0x0fff_ffef, 28),
-    (0x0fff_fff0, 28),
-    (0x0fff_fff1, 28),
-    (0x0fff_fff2, 28),
-    (0x3fff_fffe, 30),
-    (0x0fff_fff3, 28),
-    (0x0fff_fff4, 28),
-    (0x0fff_fff5, 28),
-    (0x0fff_fff6, 28),
-    (0x0fff_fff7, 28),
-    (0x0fff_fff8, 28),
-    (0x0fff_fff9, 28),
-    (0x0fff_fffa, 28),
-    (0x0fff_fffb, 28),
-    (0x14, 6),
-    (0x3f8, 10),
-    (0x3f9, 10),
-    (0xffa, 12),
-    (0x1ff9, 13),
-    (0x15, 6),
-    (0xf8, 8),
-    (0x7fa, 11),
-    (0x3fa, 10),
-    (0x3fb, 10),
-    (0xf9, 8),
-    (0x7fb, 11),
-    (0xfa, 8),
-    (0x16, 6),
-    (0x17, 6),
-    (0x18, 6),
-    (0x0, 5),
-    (0x1, 5),
-    (0x2, 5),
-    (0x19, 6),
-    (0x1a, 6),
-    (0x1b, 6),
-    (0x1c, 6),
-    (0x1d, 6),
-    (0x1e, 6),
-    (0x1f, 6),
-    (0x5c, 7),
-    (0xfb, 8),
-    (0x7ffc, 15),
-    (0x20, 6),
-    (0xffb, 12),
-    (0x3fc, 10),
-    (0x1ffa, 13),
-    (0x21, 6),
-    (0x5d, 7),
-    (0x5e, 7),
-    (0x5f, 7),
-    (0x60, 7),
-    (0x61, 7),
-    (0x62, 7),
-    (0x63, 7),
-    (0x64, 7),
-    (0x65, 7),
-    (0x66, 7),
-    (0x67, 7),
-    (0x68, 7),
-    (0x69, 7),
-    (0x6a, 7),
-    (0x6b, 7),
-    (0x6c, 7),
-    (0x6d, 7),
-    (0x6e, 7),
-    (0x6f, 7),
-    (0x70, 7),
-    (0x71, 7),
-    (0x72, 7),
-    (0xfc, 8),
-    (0x73, 7),
-    (0xfd, 8),
-    (0x1ffb, 13),
-    (0x0007_fff0, 19),
-    (0x1ffc, 13),
-    (0x3ffc, 14),
-    (0x22, 6),
-    (0x7ffd, 15),
-    (0x3, 5),
-    (0x23, 6),
-    (0x4, 5),
-    (0x24, 6),
-    (0x5, 5),
-    (0x25, 6),
-    (0x26, 6),
-    (0x27, 6),
-    (0x6, 5),
-    (0x74, 7),
-    (0x75, 7),
-    (0x28, 6),
-    (0x29, 6),
-    (0x2a, 6),
-    (0x7, 5),
-    (0x2b, 6),
-    (0x76, 7),
-    (0x2c, 6),
-    (0x8, 5),
-    (0x9, 5),
-    (0x2d, 6),
-    (0x77, 7),
-    (0x78, 7),
-    (0x79, 7),
-    (0x7a, 7),
-    (0x7b, 7),
-    (0x7ffe, 15),
-    (0x7fc, 11),
-    (0x3ffd, 14),
-    (0x1ffd, 13),
-    (0x0fff_fffc, 28),
-    (0x000f_ffe6, 20),
-    (0x003f_ffd2, 22),
-    (0x000f_ffe7, 20),
-    (0x000f_ffe8, 20),
-    (0x003f_ffd3, 22),
-    (0x003f_ffd4, 22),
-    (0x003f_ffd5, 22),
-    (0x007f_ffd9, 23),
-    (0x003f_ffd6, 22),
-    (0x007f_ffda, 23),
-    (0x007f_ffdb, 23),
-    (0x007f_ffdc, 23),
-    (0x007f_ffdd, 23),
-    (0x007f_ffde, 23),
-    (0x00ff_ffeb, 24),
-    (0x007f_ffdf, 23),
-    (0x00ff_ffec, 24),
-    (0x00ff_ffed, 24),
-    (0x003f_ffd7, 22),
-    (0x007f_ffe0, 23),
-    (0x00ff_ffee, 24),
-    (0x007f_ffe1, 23),
-    (0x007f_ffe2, 23),
-    (0x007f_ffe3, 23),
-    (0x007f_ffe4, 23),
-    (0x001f_ffdc, 21),
-    (0x003f_ffd8, 22),
-    (0x007f_ffe5, 23),
-    (0x003f_ffd9, 22),
-    (0x007f_ffe6, 23),
-    (0x007f_ffe7, 23),
-    (0x00ff_ffef, 24),
-    (0x003f_ffda, 22),
-    (0x001f_ffdd, 21),
-    (0x000f_ffe9, 20),
-    (0x003f_ffdb, 22),
-    (0x003f_ffdc, 22),
-    (0x007f_ffe8, 23),
-    (0x007f_ffe9, 23),
-    (0x001f_ffde, 21),
-    (0x007f_ffea, 23),
-    (0x003f_ffdd, 22),
-    (0x003f_ffde, 22),
-    (0x00ff_fff0, 24),
-    (0x001f_ffdf, 21),
-    (0x003f_ffdf, 22),
-    (0x007f_ffeb, 23),
-    (0x007f_ffec, 23),
-    (0x001f_ffe0, 21),
-    (0x001f_ffe1, 21),
-    (0x003f_ffe0, 22),
-    (0x001f_ffe2, 21),
-    (0x007f_ffed, 23),
-    (0x003f_ffe1, 22),
-    (0x007f_ffee, 23),
-    (0x007f_ffef, 23),
-    (0x000f_ffea, 20),
-    (0x003f_ffe2, 22),
-    (0x003f_ffe3, 22),
-    (0x003f_ffe4, 22),
-    (0x007f_fff0, 23),
-    (0x003f_ffe5, 22),
-    (0x003f_ffe6, 22),
-    (0x007f_fff1, 23),
-    (0x03ff_ffe0, 26),
-    (0x03ff_ffe1, 26),
-    (0x000f_ffeb, 20),
-    (0x0007_fff1, 19),
-    (0x003f_ffe7, 22),
-    (0x007f_fff2, 23),
-    (0x003f_ffe8, 22),
-    (0x01ff_ffec, 25),
-    (0x03ff_ffe2, 26),
-    (0x03ff_ffe3, 26),
-    (0x03ff_ffe4, 26),
-    (0x07ff_ffde, 27),
-    (0x07ff_ffdf, 27),
-    (0x03ff_ffe5, 26),
-    (0x00ff_fff1, 24),
-    (0x01ff_ffed, 25),
-    (0x0007_fff2, 19),
-    (0x001f_ffe3, 21),
-    (0x03ff_ffe6, 26),
-    (0x07ff_ffe0, 27),
-    (0x07ff_ffe1, 27),
-    (0x03ff_ffe7, 26),
-    (0x07ff_ffe2, 27),
-    (0x00ff_fff2, 24),
-    (0x001f_ffe4, 21),
-    (0x001f_ffe5, 21),
-    (0x03ff_ffe8, 26),
-    (0x03ff_ffe9, 26),
-    (0x0fff_fffd, 28),
-    (0x07ff_ffe3, 27),
-    (0x07ff_ffe4, 27),
-    (0x07ff_ffe5, 27),
-    (0x000f_ffec, 20),
-    (0x00ff_fff3, 24),
-    (0x000f_ffed, 20),
-    (0x001f_ffe6, 21),
-    (0x003f_ffe9, 22),
-    (0x001f_ffe7, 21),
-    (0x001f_ffe8, 21),
-    (0x007f_fff3, 23),
-    (0x003f_ffea, 22),
-    (0x003f_ffeb, 22),
-    (0x01ff_ffee, 25),
-    (0x01ff_ffef, 25),
-    (0x00ff_fff4, 24),
-    (0x00ff_fff5, 24),
-    (0x03ff_ffea, 26),
-    (0x007f_fff4, 23),
-    (0x03ff_ffeb, 26),
-    (0x07ff_ffe6, 27),
-    (0x03ff_ffec, 26),
-    (0x03ff_ffed, 26),
-    (0x07ff_ffe7, 27),
-    (0x07ff_ffe8, 27),
-    (0x07ff_ffe9, 27),
-    (0x07ff_ffea, 27),
-    (0x07ff_ffeb, 27),
-    (0x0fff_fffe, 28),
-    (0x07ff_ffec, 27),
-    (0x07ff_ffed, 27),
-    (0x07ff_ffee, 27),
-    (0x07ff_ffef, 27),
-    (0x07ff_fff0, 27),
-    (0x03ff_ffee, 26),
-];
-
 const STATIC: [(&str, &str); 61] = [
     (":authority", ""),
     (":method", "GET"),
@@ -404,39 +145,6 @@ fn prefixed(block: &[u8], prefix: u8) -> Option<(usize, &[u8])> {
     }
 }
 
-fn huffman_decode(data: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut bits = 0u8;
-    let mut at = 0usize;
-    while at < data.len() * 8 {
-        let bit = u32::from(data[at / 8] >> (7 - at % 8)) & 1;
-        acc = (acc << 1) | bit;
-        bits += 1;
-        at += 1;
-        let hit = HUFFMAN
-            .iter()
-            .position(|&(code, len)| len == bits && code == acc);
-        match hit {
-            Some(256) => return None,
-            Some(sym) => {
-                out.push(sym as u8);
-                acc = 0;
-                bits = 0;
-            }
-            None => {
-                if bits > 30 {
-                    return None;
-                }
-            }
-        }
-    }
-    if bits >= 8 || acc != (1u32 << bits) - 1 {
-        return None;
-    }
-    Some(out)
-}
-
 fn string_decode(block: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     let huffman = block.first()? & 0x80 != 0;
     let (len, mut rest) = prefixed(block, 7)?;
@@ -446,7 +154,9 @@ fn string_decode(block: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     let (raw, tail) = rest.split_at(len);
     rest = tail;
     if huffman {
-        Some((huffman_decode(raw)?, rest))
+        let mut out = Vec::new();
+        ferrox_core::foxy::hpack::huffman_decode(raw, &mut out)?;
+        Some((out, rest))
     } else {
         Some((raw.to_vec(), rest))
     }
@@ -1199,8 +909,10 @@ mod tests {
         let coded = [
             0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6B, 0xA0, 0xAB, 0x90, 0xF4, 0xFF,
         ];
-        assert_eq!(huffman_decode(&coded).expect("decodes"), b"www.example.com");
-        assert!(huffman_decode(b"\xff").is_none());
+        let mut plain = Vec::new();
+        ferrox_core::foxy::hpack::huffman_decode(&coded, &mut plain).expect("decodes");
+        assert_eq!(plain, b"www.example.com");
+        assert!(ferrox_core::foxy::hpack::huffman_decode(b"\xff", &mut Vec::new()).is_none());
     }
 
     #[test]
