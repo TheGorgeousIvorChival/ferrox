@@ -1283,7 +1283,10 @@ mod loopback {
             let mut reply = Vec::new();
             frames::quic_varint(&mut reply, frames::H3_HEADERS);
             frames::quic_varint(&mut reply, 3);
-            reply.extend_from_slice(&[0x00, 0x00, 0xd8]);
+            // `0xd9` is QPACK static index 25, which is `:status 200`: the
+            // indexed field line with a six-bit prefix, then the block's two
+            // required zero bytes.
+            reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
             conn.stream_send(stream, &reply, false).expect("answers");
             while let Ok((written, info)) = conn.send(&mut out) {
                 let _ = sock.send_to(&out[..written], info.to);
