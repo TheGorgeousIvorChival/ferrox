@@ -100,6 +100,11 @@ pub(crate) fn qstage(ev: String) {
     }
 }
 
+/// How long a loopback edge waits for the next packet before it lets quiche run
+/// its timers, which is what keeps an idle connection alive in a test.
+#[cfg(test)]
+pub(crate) const SERVER_POLL: Duration = Duration::from_millis(100);
+
 #[cfg(test)]
 pub(crate) fn qms() -> u128 {
     static QT0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -412,15 +417,42 @@ pub(crate) fn stream_recv_exact(
     (out.len() == want).then_some(out)
 }
 
+/// Binds a datagram socket that QUIC will read one packet at a time.
+///
+/// Linux coalesces loopback datagrams into a single skb, so one `recv_from`
+/// can hand back several QUIC packets at once: read into a packet-sized buffer
+/// and the tail of that skb is discarded, so the packets in it are lost with no
+/// error anywhere. One `setsockopt` per socket is cheaper than splitting every
+/// packet, and a kernel that has never heard of UDP GRO declines it harmlessly.
+pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(address)?;
+    #[cfg(target_os = "linux")]
+    if let Ok(raw) = std::os::fd::AsRawFd::as_raw_fd(&sock) {
+        let off: libc::c_int = 0;
+        // SAFETY: `off` outlives the call, and the size is its own.
+        unsafe {
+            libc::setsockopt(
+                raw,
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                std::ptr::addr_of!(off).cast(),
+                libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                    .unwrap_or(libc::socklen_t::MAX),
+            );
+        }
+    }
+    Ok(sock)
+}
+
 pub(crate) fn udp_to_server(
     address: &str,
     port: u16,
 ) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
     let peer = format!("{address}:{port}").to_socket_addrs().ok()?.next()?;
     let sock = if peer.is_ipv6() {
-        UdpSocket::bind("[::]:0").ok()?
+        bind_datagram("[::]:0").ok()?
     } else {
-        UdpSocket::bind("0.0.0.0:0").ok()?
+        bind_datagram("0.0.0.0:0").ok()?
     };
     let local = sock.local_addr().ok()?;
     Some((sock, peer, local))
@@ -806,9 +838,148 @@ fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
     })
 }
 
+/// One connection and one stream on it, with nothing else reading the socket.
+///
+/// The pool's own thread owns the connection while it drives its sessions, so a
+/// loopback that proves the lane proves the lane and not the pool: which reader
+/// owns a shared connection is `P38`'s question, and a proof that depends on the
+/// answer is a proof of the answer.
+#[cfg(test)]
+pub(crate) fn direct_stream(
+    host: &str,
+    address: &str,
+    port: u16,
+    roots: &[Vec<u8>],
+) -> Option<PooledStream> {
+    let (sock, peer, local) = udp_to_server(address, port)?;
+    let mut conn = handshake(&sock, peer, local, host, roots)?;
+    flush_egress(&mut conn, &sock);
+    Some((
+        std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        std::sync::Arc::new(sock),
+        local,
+        4,
+    ))
+}
+
+/// One datagram off a loopback edge's socket, or nothing when none arrived.
+#[cfg(test)]
+pub(crate) fn server_poll(sock: &UdpSocket, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    sock.set_read_timeout(Some(SERVER_POLL)).ok()?;
+    match sock.recv_from(buf) {
+        Ok(found) => Some(found),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            None
+        }
+        Err(e) => panic!("loopback edge socket died: {e:?}"),
+    }
+}
+
+/// Lets a waiting connection run its own timers and answer whatever it queued,
+/// which is the only thing an edge can do between packets.
+#[cfg(test)]
+pub(crate) fn server_idle(conn: &mut quiche::Connection, sock: &UdpSocket, out: &mut [u8]) {
+    conn.on_timeout();
+    while let Ok((written, info)) = conn.send(out) {
+        let _ = sock.send_to(&out[..written], info.to);
+    }
+}
+
+/// A loopback edge's half of a QUIC connection: the first Initial it sees is fed
+/// to quiche and the handshake is driven to completion.
+#[cfg(test)]
+pub(crate) fn server_accept(
+    sock: &UdpSocket,
+    local: SocketAddr,
+    config: &mut quiche::Config,
+) -> quiche::Connection {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let mut out = [0u8; MAX_DATAGRAM];
+    let mut conn = loop {
+        let Some((n, from)) = server_poll(sock, &mut buf) else {
+            continue;
+        };
+        let Ok(header) = quiche::Header::from_slice(&mut buf[..n], 20) else {
+            continue;
+        };
+        if header.ty != quiche::Type::Initial || header.version != quiche::PROTOCOL_VERSION {
+            continue;
+        }
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut fresh = quiche::accept(&cid, None, local, from, config).expect("accepts");
+        let info = quiche::RecvInfo { from, to: local };
+        fresh.recv(&mut buf[..n], info).expect("handshakes");
+        while let Ok((written, info)) = fresh.send(&mut out) {
+            let _ = sock.send_to(&out[..written], info.to);
+        }
+        break fresh;
+    };
+    while !conn.is_established() {
+        if let Some((n, from)) = server_poll(sock, &mut buf) {
+            let info = quiche::RecvInfo { from, to: local };
+            conn.recv(&mut buf[..n], info).expect("drives");
+            while let Ok((written, info)) = conn.send(&mut out) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+        } else {
+            server_idle(&mut conn, sock, &mut out);
+        }
+    }
+    conn
+}
+
+/// A loopback edge's ALPN, flow-control and certificate settings, which are the
+/// ones the lane itself configures, so an edge is not a weaker peer than a real
+/// one for want of a window.
+#[cfg(test)]
+pub(crate) fn server_config(alpn: &[u8]) -> quiche::Config {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+    config.set_application_protos(&[alpn]).expect("negotiates");
+    config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
+    config.set_initial_max_data(MAX_DATA);
+    config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
+    config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_DATA);
+    config.set_initial_max_stream_data_uni(MAX_STREAM_DATA);
+    config.set_initial_max_streams_bidi(MAX_STREAMS);
+    config.set_initial_max_streams_uni(MAX_STREAMS);
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The option this socket is read under is the whole reason the edge stops
+    /// losing packets, so it is read back rather than assumed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_quic_socket_is_bound_with_datagram_coalescing_off() {
+        use std::os::fd::AsRawFd as _;
+        let sock = bind_datagram("127.0.0.1:0").expect("binds");
+        let mut on: libc::c_int = -1;
+        let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+            .expect("size fits a socklen");
+        // SAFETY: `on` and `len` describe the buffer the kernel writes into.
+        let got = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                std::ptr::addr_of_mut!(on).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(got, 0, "the kernel knows UDP_GRO");
+        assert_eq!(on, 0, "one recv_from carries one packet");
+        assert!(udp_to_server("127.0.0.1", 443).is_some(), "still dials");
+    }
 
     #[test]
     fn base64_matches_the_rfc_vectors() {

@@ -153,13 +153,24 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
     }
 }
 
+/// The window a tunnel is not paced by: the reference's 16 MiB, and the
+/// largest frame it will send, and no push, which this lane never accepts.
+pub const WINDOW: u32 = 16 * 1024 * 1024;
+
+/// The protocol's own default, which every window starts at until the peer's
+/// settings or a `WINDOW_UPDATE` move it.
+pub const DEFAULT_WINDOW: u32 = 65_535;
+
+/// The frame size the reference asks the edge to use.
+pub const MAX_FRAME: u32 = 256 * 1024;
+
 /// What a CONNECT lane asks for at the start: a window big enough that a tunnel
 /// is not paced by a round trip, the largest frame the edge may send, and no
 /// push, which this lane never accepts.
 #[must_use]
 pub fn client_settings() -> Vec<u8> {
     let mut out = Vec::with_capacity(18);
-    for (id, value) in [(4u16, 1_048_576u32), (5, 65_536), (2, 0)] {
+    for (id, value) in [(4u16, WINDOW), (5, MAX_FRAME), (2, 0)] {
         out.extend_from_slice(&id.to_be_bytes());
         out.extend_from_slice(&value.to_be_bytes());
     }
@@ -428,7 +439,7 @@ mod tests {
         let found: Vec<(u16, u32)> = (0..settings.len() / 6)
             .filter_map(|at| setting(&settings, at * 6))
             .collect();
-        assert_eq!(found, [(4, 1_048_576), (5, 65_536), (2, 0)]);
+        assert_eq!(found, [(4, WINDOW), (5, MAX_FRAME), (2, 0)]);
         assert!(setting(&settings, 18).is_none());
     }
 

@@ -800,16 +800,17 @@ Drive the estimator through the constructor the connection uses, derive the ack 
 Two costs and one hang, in order of how much they cost a user. A pooled entry is removed only by `leave_session` when the last session ends, so a connection whose sessions all ended closes, but one opened with zero sessions and never re-entered sits in the map with an idle timeout ticking; key it by target and user id as well as server, and let the idle timeout be the reaper rather than a second thread. The `pump` lock is held across `pump_once`, which blocks in `recv_from` for up to `PUMP_POLL`, so a stalled peer stalls every other session sharing that connection; take the connection out of the lock, poll, and take it again, which is the same shape `quiche`'s `poll` wants. And `leave_session` flushes egress once and drops, so a lost CONNECTION_CLOSE leaves the peer to time out.
 
 P30 wants the pool proved under an adversarial packet layer. This slice is what that proof should be pointed at, because a share that cannot be released is not a share a test can schedule around.
+
+Two measurements from P39 narrow this further, and both are cheap to state. First, the cost is not only latency: a lane that drives a pooled connection itself — the Foxy HTTP/3 carrier is the only one — waits for the pump's poll on every read and every write, so one flow behind the pool measured 56 seconds end to end against 0.04 without it. Second, `dial_pooled` and `pooled_stream` share one map keyed by `(address, port, host, roots)` and one ALPN, so a connection opened to carry a Foxy CONNECT can be handed to a VLESS session and vice versa, with neither side knowing which shape the peer was built for. Key the two apart, and either take the connection out of the lock across the poll or stop the pump from existing on a connection a lane owns.
 ```
 
 ## P39 · Prove the Foxy QUIC lane over a socket, not over a codec
 
 **When to use:** When `foxy` with `carrier: h3` is selected and the only green checks are the header-block codec: the lane builds a QPACK CONNECT and reads a status, but nothing has carried a tunnel over a real QUIC connection.
-**Status:** doing
+**Status:** done
 **Leverage:** 3
 **Effort:** medium
 **Gates:** `cargo test -p ferrox-app foxy`; `cargo run -p ferrox-prompt -- check`
-**Depends on:** P29
 **Touches:** crates/ferrox-app/src/foxy.rs
 **Random weight:** 1
 
@@ -821,6 +822,10 @@ The edge writes 46 bytes to the client's port and the client's socket sees nothi
 Then the QUIC lane has the same three proofs the TCP carriers have — the block on the wire, a 2xx opening the tunnel, and the bytes after it — and the carrier stops being a claim.
 
 Do not widen this into a QUIC failover study. One connection, one stream, one status, one echo; anything the loopback exposes beyond that belongs to the next slice.
+
+What the socket half turned out to be, for whoever reads this next: the lane was not losing the edge's reply, it was reading its own request stream's bytes as tunnel payload. `H3::read` copied whatever `stream_recv` returned into the carry buffer, so every DATA frame header the edge sent would have gone into the tunnel ahead of the bytes it framed. No loopback could have caught that and no unit test ever would, because a test edge that writes bare bytes agrees with a lane that reads bare bytes. The proof is `the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes`, and it is worth reading as a shape: it asserts the block the lane wrote against the block the edge read, the status through the QPACK decoder, and the payload after the head through the tunnel.
+
+Two things that measurement settled and that cost the lane its first working run. A QUIC socket bound on Linux coalesces loopback datagrams, so one `recv_from` can carry several packets and the rest of that skb is discarded with no error anywhere; `bind_datagram` turns `UDP_GRO` off once per socket rather than splitting every packet. And the pooled connection's own pump thread starved the lane: it holds the connection mutex across a `recv_from` that waits up to half a second, so a lane that drives the same connection waits behind it every time — the same loopback took 56 seconds against the pool and 0.04 against a connection nothing else was reading. Which reader owns a shared connection is P38's question, so the lane's proof deliberately does not depend on the answer.
 ```
 
 ## P40 · Mint the Foxy pass: FxA login and the Guardian token

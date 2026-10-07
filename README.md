@@ -148,7 +148,7 @@ Custom ARQ, ~5–7 B header overhead, session multiplexing, compatibility kept a
 | # | method | state | learned from |
 | --- | --- | --- | --- |
 | 58 | Free HTTPS-proxy lane: anonymous `POST /v3/launch/` mints a token, server list yields HTTPS proxies exported as `http://` URIs + Clash/sing-box profiles | planned | configer |
-| 59 | Foxy lane: CONNECT to an account's edge over HTTP/1.1, HTTP/2 or HTTP/3, country-pinned at dial, per-flow Bearer, failover inside the country, SPKI pins, split-tunnel | in tree — H1/H2 loopback-proven and the FxA login, Hawk and Guardian mint in (`cargo test -p ferrox-app foxy`, `cargo test -p ferrox-core account`); the QUIC lane's socket proof is open (`P39`) | configer, FoxyVPN |
+| 59 | Foxy lane: CONNECT to an account's edge over HTTP/1.1, HTTP/2 or HTTP/3, country-pinned at dial, per-flow Bearer, failover inside the country, SPKI pins, split-tunnel | in tree, every carrier socket-proven (`cargo test -p ferrox-app foxy`): HTTP/1.1, HTTP/2 and HTTP/3 each carry a tunnel over a real connection, the FxA login with its two-factor branch, the Hawk-signed exchange, the Fastly `/_fs-ch-` bot challenge, the Guardian mint with its activate-and-retry, and the published Remote Settings catalogue that turns a `country` in a `foxy://` link into an edge — `auto` tries QUIC, then HTTP/2, then HTTP/1.1. Whether an edge answers QUIC is a fact about the edge, not about this tree, so `foxy-live.yml` reports it against a real account on a weekly schedule (`P39` done) | configer, FoxyVPN |
 
 ### G — chaining: lanes stack, not just single dials
 

@@ -234,9 +234,13 @@ enum Outbound {
 struct FoxyOut {
     account: Option<std::sync::Arc<crate::foxy_account::Account>>,
     country: String,
+    city: String,
     carrier: crate::foxy::Carrier,
     candidates: Vec<ferrox_core::foxy::Candidate>,
     stored: Option<ferrox_core::foxy::Candidate>,
+    /// Set when the edge refuses the pass, so every later flow is answered
+    /// locally instead of paying a round trip to hear the same status again.
+    unauthenticated: std::sync::Arc<std::sync::atomic::AtomicBool>,
     roots: Vec<Vec<u8>>,
     pins: ferrox_core::foxy::pin::Pins,
     pass: ferrox_core::foxy::Pass,
@@ -2917,9 +2921,13 @@ fn foxy_socks_reply(reply: u8) -> [u8; 10] {
     [5, reply, 0, 1, 0, 0, 0, 0, 0, 0]
 }
 
-/// Opens the tunnel on the first edge that answers, and relays. Every edge of
-/// the pinned country is a candidate, so a refusal moves to the next one rather
-/// than to another country.
+/// How many edges past the first one a refusal may try, which is the count the
+/// reference allows and the most a flow can be worth waiting for.
+const MAX_FOXY_ALTERNATES: usize = 3;
+
+/// Opens the tunnel on the first edge and carrier that answers, and relays.
+/// Every edge of the pinned country is a candidate and the city's edges come
+/// first, so a refusal moves along the tier rather than to another country.
 /// Replaces the pass on the clock the pass itself names. One thread per lane,
 /// started once, and it stops as soon as the pass can no longer be replaced.
 fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
@@ -2938,6 +2946,13 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
 }
 
 fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
+    if foxy
+        .unauthenticated
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = client.write_all(&foxy_socks_reply(0x01));
+        return;
+    }
     if foxy_splits(foxy, asked) {
         let Some(target) = asked.socket() else { return };
         let Some(upstream) = dial_or_report(&target) else {
@@ -2946,57 +2961,77 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
         return relay(&client, &upstream);
     }
     let target = asked.authority();
-    let order =
-        ferrox_core::foxy::dial_order(&foxy.candidates, &foxy.country, foxy.stored.as_ref(), 3);
+    let order = ferrox_core::foxy::catalog::tier(
+        &foxy.candidates,
+        &foxy.country,
+        &foxy.city,
+        MAX_FOXY_ALTERNATES,
+    );
     let mut refusals = ferrox_core::foxy::Refusals::new(256);
     let key = target.clone();
     if refusals.blocked(&key, 0) {
         return;
     }
     let mut last = None;
-    for edge in order {
-        let dial = crate::foxy::FoxyDial {
-            host: edge.host.clone(),
-            port: edge.port,
-            address: foxy.edge_address,
-            carrier: foxy.carrier,
-            roots: foxy.roots.clone(),
-            pins: foxy.pins.clone(),
-            pass: foxy
-                .account
-                .as_ref()
-                .map_or_else(|| foxy.pass.clone(), |account| account.current()),
-        };
-        let quic = match foxy.carrier {
-            crate::foxy::Carrier::H3 => crate::quic::pooled_stream(&foxy_quic_dial(foxy, &edge)),
-            _ => None,
-        };
-        let stream = quic.as_ref().map(|(_, _, _, id)| *id);
-        match crate::foxy::Tunnel::open(&dial, &target, quic) {
-            Ok(mut tunnel) => {
-                if client.write_all(&foxy_socks_reply(0)).is_err() {
+    for edge in ferrox_core::foxy::dial_order(
+        &order,
+        &foxy.country,
+        foxy.stored.as_ref(),
+        MAX_FOXY_ALTERNATES,
+    ) {
+        let pass = foxy
+            .account
+            .as_ref()
+            .map_or_else(|| foxy.pass.clone(), |account| account.current());
+        for carrier in foxy.carrier.order() {
+            let dial = crate::foxy::FoxyDial {
+                host: edge.host.clone(),
+                port: edge.port,
+                address: foxy.edge_address,
+                carrier,
+                roots: foxy.roots.clone(),
+                pins: foxy.pins.clone(),
+                pass: pass.clone(),
+            };
+            let quic = match carrier {
+                crate::foxy::Carrier::H3 => {
+                    crate::quic::pooled_stream(&foxy_quic_dial(foxy, &edge))
+                }
+                _ => None,
+            };
+            let stream = quic.as_ref().map(|(_, _, _, id)| *id);
+            match crate::foxy::Tunnel::open(&dial, &target, quic) {
+                Ok(mut tunnel) => {
+                    foxy.unauthenticated
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    if client.write_all(&foxy_socks_reply(0)).is_err() {
+                        return;
+                    }
+                    if !foxy_exit_agrees(&mut tunnel, foxy) {
+                        return;
+                    }
+                    let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+                    relay_tunnel(&client, &tunnel);
+                    if let (Some(id), crate::foxy::Carrier::H3) = (stream, carrier) {
+                        crate::quic::release_stream(&foxy_quic_dial(foxy, &edge), id);
+                    }
                     return;
                 }
-                if !foxy_exit_agrees(&mut tunnel, foxy) {
-                    return;
-                }
-                let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
-                relay_tunnel(&client, &tunnel);
-                if let (Some(id), crate::foxy::Carrier::H3) = (stream, foxy.carrier) {
-                    crate::quic::release_stream(&foxy_quic_dial(foxy, &edge), id);
-                }
-                return;
-            }
-            Err(failure) => {
-                if let ferrox_core::foxy::Failure::Rejected(status) = failure {
-                    if ferrox_core::foxy::pass_is_rejected(status) {
-                        break;
+                Err(failure) => {
+                    // A refused pass is the pass, not the edge: every carrier and
+                    // every edge would answer the same way, so the loop stops.
+                    if let ferrox_core::foxy::Failure::Rejected(status) = failure {
+                        if ferrox_core::foxy::pass_is_rejected(status) {
+                            foxy.unauthenticated
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        if ferrox_core::foxy::target_is_unreachable(status) {
+                            refusals.remember(&key, now_secs() + 30);
+                        }
                     }
-                    if ferrox_core::foxy::target_is_unreachable(status) {
-                        refusals.remember(&key, now_secs() + 30);
-                    }
+                    last = Some(failure);
                 }
-                last = Some(failure);
             }
         }
     }
@@ -4604,15 +4639,67 @@ fn is_freedom(root: &Json) -> bool {
     has_protocol(root, "outbounds", "freedom")
 }
 
-fn foxy_carrier(settings: Option<&Json>) -> crate::foxy::Carrier {
-    match settings
-        .and_then(|s| s.get("carrier"))
-        .and_then(Json::as_str)
-    {
-        Some("h1" | "http/1.1") => crate::foxy::Carrier::H1,
-        Some("h3" | "quic") => crate::foxy::Carrier::H3,
-        _ => crate::foxy::Carrier::H2,
+/// The carrier the config names, or the one the link names, or `auto`: a lane
+/// that is told nothing tries QUIC, then HTTP/2, then HTTP/1.1, rather than
+/// committing to one carrier the edge may not answer.
+fn foxy_carrier(
+    settings: Option<&Json>,
+    link: &ferrox_core::foxy::link::FoxyLink,
+) -> crate::foxy::Carrier {
+    let named = foxy_text(settings, "carrier");
+    let named = if named.is_empty() {
+        link.carrier().to_owned()
+    } else {
+        named
+    };
+    crate::foxy::carrier(&named)
+}
+
+/// A list the config writes out, or the one the link carries comma-separated:
+/// the same field, two spellings, because a link has no arrays.
+fn foxy_list_or(
+    link: &ferrox_core::foxy::link::FoxyLink,
+    settings: Option<&Json>,
+    key: &str,
+) -> Vec<String> {
+    let listed = foxy_strings(settings.and_then(|s| s.get(key)));
+    if !listed.is_empty() {
+        return listed;
     }
+    link.param(key)
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every edge the config lists in the pinned country, city first, so a
+/// configured failover is the same failover the catalogue would have chosen.
+fn foxy_edges(outbound: &Json, country: &str, city: &str) -> Vec<ferrox_core::foxy::Candidate> {
+    let edges = outbound
+        .get("settings")
+        .and_then(|s| s.get("servers"))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[]);
+    edges
+        .iter()
+        .filter_map(|edge| {
+            let host = edge.get("host").and_then(Json::as_str)?.to_owned();
+            let port = edge.get("port").and_then(Json::as_port)?;
+            let code = edge
+                .get("country")
+                .and_then(Json::as_str)
+                .unwrap_or(country);
+            let name = edge.get("city").and_then(Json::as_str).unwrap_or(city);
+            Some(ferrox_core::foxy::Candidate {
+                host,
+                port,
+                country: code.to_owned(),
+                city: name.to_owned(),
+            })
+        })
+        .collect()
 }
 
 fn foxy_strings(value: Option<&Json>) -> Vec<String> {
@@ -4634,40 +4721,15 @@ fn foxy_ports(value: Option<&Json>) -> Vec<u16> {
         .collect()
 }
 
-fn foxy_edge(outbound: &Json, country: &str, city: &str) -> Option<ferrox_core::foxy::Candidate> {
-    let edges = outbound
-        .get("settings")
-        .and_then(|s| s.get("servers"))
-        .and_then(Json::as_arr)
-        .unwrap_or(&[]);
-    let first = edges.iter().find(|edge| {
-        let in_country = edge
-            .get("country")
-            .and_then(Json::as_str)
-            .is_none_or(|code| code.eq_ignore_ascii_case(country));
-        let in_city = edge
-            .get("city")
-            .and_then(Json::as_str)
-            .is_none_or(|name| name == city);
-        in_country && in_city
-    })?;
-    let host = first.get("host").and_then(Json::as_str)?.to_owned();
-    let port = first.get("port").and_then(Json::as_port)?;
-    Some(ferrox_core::foxy::Candidate {
-        host,
-        port,
-        country: country.to_owned(),
-        city: city.to_owned(),
-    })
-}
-
 /// The account a `foxy` outbound names: an account to sign in with, or a pass
 /// pasted in. Either way it becomes one `Account` whose pass the renewal thread
 /// owns, so the dial and the renewal read the same value.
 fn foxy_account(
     email: &str,
     password: &str,
+    code: &str,
     configured: &str,
+    guardian: &str,
     roots: &[Vec<u8>],
 ) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
     let pass = ferrox_core::foxy::Pass {
@@ -4684,10 +4746,9 @@ fn foxy_account(
             ferrox_core::foxy::account::FXA_SERVER,
             roots.to_vec(),
         )?,
-        guardian: crate::foxy_account::Endpoint::parse(
-            ferrox_core::foxy::account::GUARDIAN_SERVER,
-            roots.to_vec(),
-        )?,
+        guardian: crate::foxy_account::Endpoint::parse(guardian, roots.to_vec())?,
+        jar: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_challenge::Jar::default())),
+        pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
         auth: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_account::Auth {
             access_token: String::new(),
             refresh_token: String::new(),
@@ -4698,6 +4759,13 @@ fn foxy_account(
     if !email.is_empty() && pass.token.is_empty() {
         if let Err(denied) = account.sign_in(email, password) {
             eprintln!("foxy: the account did not sign in: {denied}");
+            return None;
+        }
+        if account.needs_code() {
+            let Err(denied) = account.verify_code(code) else {
+                return Some(account);
+            };
+            eprintln!("foxy: the account wants a two-factor code in settings.code: {denied}");
             return None;
         }
     }
@@ -4712,6 +4780,47 @@ fn foxy_text(settings: Option<&Json>, key: &str) -> String {
         .to_owned()
 }
 
+/// The inline field first, the link's parameter second: a config may carry
+/// both, and the one written out in full is the one a person edited last.
+fn foxy_text_or(
+    link: &ferrox_core::foxy::link::FoxyLink,
+    settings: Option<&Json>,
+    key: &str,
+) -> String {
+    let inline = foxy_text(settings, key);
+    if inline.is_empty() {
+        link.param(key).to_owned()
+    } else {
+        inline
+    }
+}
+
+/// The country the lane pins at dial, upper-cased so a hand-typed link matches
+/// the catalogue, and defaulted to the one place every account has an exit.
+fn foxy_country(link: &ferrox_core::foxy::link::FoxyLink, settings: Option<&Json>) -> String {
+    let named = foxy_text(settings, "country");
+    let named = if named.is_empty() {
+        link.country().to_owned()
+    } else {
+        named
+    };
+    let named = if named.is_empty() {
+        "US".to_owned()
+    } else {
+        named
+    };
+    named.to_ascii_uppercase()
+}
+
+/// One host as an address, which is what pins a dial to a host and keeps the TLS
+/// name with the name.
+fn resolve(host: &str, port: u16) -> Option<SocketAddr> {
+    format!("{host}:{port}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+}
+
 fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     let empty = Vec::new();
     for outbound in root
@@ -4723,40 +4832,56 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             continue;
         }
         let settings = outbound.get("settings");
-        let configured = foxy_text(settings, "pass");
-        let email = foxy_text(settings, "email");
-        let password = foxy_text(settings, "password");
+        let link = ferrox_core::foxy::link::FoxyLink::parse(&foxy_text(settings, "link"))
+            .unwrap_or_default();
+        let configured = foxy_text_or(&link, settings, "pass");
+        let email = foxy_text_or(&link, settings, "email");
+        let password = foxy_text_or(&link, settings, "password");
+        let code = foxy_text_or(&link, settings, "code");
         if configured.is_empty() && email.is_empty() {
             continue;
         }
-        let country = {
-            let code = foxy_text(settings, "country");
-            if code.is_empty() {
-                "US".to_owned()
-            } else {
-                code
-            }
-        };
-        let city = foxy_text(settings, "city");
+        let country = foxy_country(&link, settings);
+        let city = foxy_text_or(&link, settings, "city").to_ascii_uppercase();
         let roots = settings
             .and_then(|s| s.get("caCertFile"))
             .and_then(Json::as_str)
             .and_then(|path| std::fs::read(path).ok())
             .map(|pem| crate::quic::parse_ca_pem(&pem))
             .unwrap_or_default();
-        let pins = ferrox_core::foxy::pin::Pins::parse(foxy_strings(
-            settings.and_then(|s| s.get("spkiPins")),
-        ));
-        let edge_address = settings
-            .and_then(|s| s.get("edgeAddress"))
-            .and_then(Json::as_str)
-            .and_then(|host| {
-                format!("{host}:443")
-                    .to_socket_addrs()
-                    .ok()
-                    .and_then(|mut addrs| addrs.next())
-            });
-        let account = foxy_account(&email, &password, &configured, &roots);
+        let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
+        // An edge the config or the link names outright is dialed whatever the
+        // catalogue publishes, because naming one is a decision and guessing is
+        // not; an address is the poison-proof dial and never the TLS name.
+        let named = link.host();
+        let named_address = foxy_text(settings, "edgeAddress");
+        let edge_address = if named_address.is_empty() {
+            None
+        } else {
+            resolve(&named_address, 443)
+        };
+        let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
+            host: named.to_owned(),
+            port: link.port(),
+            country: country.clone(),
+            city: city.clone(),
+        });
+        let configured_edges = foxy_edges(outbound, &country, &city);
+        let candidates = match named_edge {
+            Some(edge) => vec![edge],
+            None if !configured_edges.is_empty() => configured_edges,
+            // Nothing configured names an edge, so the published list does: this
+            // is what lets a link that says only `country=US` reach an exit.
+            None => crate::foxy_catalog::edges(roots.clone()),
+        };
+        let account = foxy_account(
+            &email,
+            &password,
+            &code,
+            &configured,
+            link.guardian(),
+            &roots,
+        );
         let pass = account.as_ref().map_or_else(
             || ferrox_core::foxy::Pass {
                 token: configured.clone(),
@@ -4771,17 +4896,19 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         }
         return Some(FoxyOut {
             account,
-            candidates: foxy_edge(outbound, &country, &city).into_iter().collect(),
+            candidates,
             stored: None,
+            unauthenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             country,
-            carrier: foxy_carrier(settings),
+            city,
+            carrier: foxy_carrier(settings, &link),
             roots,
             pins,
             pass,
             edge_address,
             direct_ports: foxy_ports(settings.and_then(|s| s.get("directPorts"))),
-            direct_suffixes: foxy_strings(settings.and_then(|s| s.get("directDomains"))),
-            exit_probe: match foxy_text(settings, "exitProbe") {
+            direct_suffixes: foxy_list_or(&link, settings, "directDomains"),
+            exit_probe: match foxy_text_or(&link, settings, "exitProbe") {
                 probe if probe.is_empty() => None,
                 probe => Some(probe),
             },
@@ -8631,7 +8758,7 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let expected_header = vless_header(&id, 1, &target);
         let server = quic_vless_echo_server(
@@ -8805,7 +8932,7 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let server = quic_vless_echo_server(
             quic_sock,
@@ -8875,7 +9002,7 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let server = quic_concurrent_echo_server(
