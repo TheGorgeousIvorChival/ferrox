@@ -461,7 +461,7 @@ pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
         use std::os::fd::AsRawFd as _;
         let off: libc::c_int = 0;
         // SAFETY: `off` outlives the call, and the size is its own.
-        let _ = unsafe {
+        unsafe {
             libc::setsockopt(
                 sock.as_raw_fd(),
                 libc::SOL_UDP,
@@ -470,7 +470,7 @@ pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
                 libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
                     .unwrap_or(libc::socklen_t::MAX),
             );
-        };
+        }
     }
     Ok(sock)
 }
@@ -1015,7 +1015,7 @@ mod tests {
                 libc::SOL_UDP,
                 libc::UDP_GRO,
                 std::ptr::addr_of_mut!(on).cast(),
-                &mut len,
+                std::ptr::addr_of_mut!(len),
             )
         };
         assert_eq!(got, 0, "the kernel knows UDP_GRO");

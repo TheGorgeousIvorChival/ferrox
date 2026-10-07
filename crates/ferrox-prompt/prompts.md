@@ -856,3 +856,21 @@ Numbers do not go in prose here. This file's gate checks structure — ids, depe
 Rotate with `ferrox-prompt next --rotate` when the ranking is not the question you are asking. It draws from ready slices only, weighted by `**Random weight:**`, and records the draw in `.ferrox/slices.log` so the next few calls do not offer the same slice twice.
 
 Statuses are the only field a contributor edits to record progress. Mark a slice `done` when its gates are green, not when its diff is finished: the gates are what the next contributor is entitled to trust.
+
+## P41 · Make the exact operation count an exact operation count
+
+**When to use:** When `ops.yml` goes red on a diff that moves no instruction, or when a re-bless is the only thing standing between a merge and the gate: the count claims to be exact across machines and is not exact run to run.
+**Status:** todo
+**Leverage:** 4
+**Effort:** medium
+**Gates:** `ops.yml` green on five consecutive runs with no change to `crates/`; `scripts/count-ops.sh check` prints the same number twice in a row on one commit
+**Touches:** scripts/count-ops.sh, scripts/expected-ops.txt
+**Random weight:** 1
+
+```text
+`der_to_pem` is blessed at 2653 and `scripts/expected-ops.txt` calls these figures "exact across machines". They are not. Commits `019d786` and `d8350b4` differ only in `expected-ops.txt` — no Rust file between them, so the binaries are identical — and callgrind measured that binary at 2640 on one `ops.yml` run and 2653 on the next. Thirteen instructions of noise on a symbol whose whole job is to notice thirteen instructions.
+
+Decide what the gate is for before deciding how to fix it. Two honest readings, and the repository has to pick one rather than keep a number that means neither. Either the count is exact and the measurement is wrong: then find the variance, which is the run-to-run part of the work and belongs in `count-ops.sh` — whatever the measured test does that depends on time, entropy or an address is the candidate, and a symbol chosen from a test with none of those is the other half. Or the count is a regression tripwire with a tolerance, and then the file should say so and carry a band rather than a figure, because a row that moves on noise trains everyone to re-bless it, which is exactly how a real thirteen-instruction regression gets waved through.
+
+Until one of those lands, do not re-bless on a single measurement. The 2640 reading is not evidence of a smaller `der_to_pem`; it is evidence that the instrument reads differently twice.
+```
