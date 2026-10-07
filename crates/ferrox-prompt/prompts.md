@@ -647,7 +647,7 @@ Prove it the way the core was proved: the oracle for the arithmetic, the loopbac
 ## P30 · Prove the pooled QUIC sharing under an adversarial packet layer
 
 **When to use:** When the pool test goes red on a diff that touches neither of its files: the sharing has a socket test and no adversarial proof, so a loss the protocol should survive reads as a failure.
-**Status:** todo
+**Status:** doing
 **Leverage:** 3
 **Effort:** medium
 **Gates:** `cargo test --workspace` green on three consecutive `ci.yml` runs
