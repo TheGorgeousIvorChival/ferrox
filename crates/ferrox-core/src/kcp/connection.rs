@@ -332,6 +332,13 @@ impl Connection {
     }
 }
 
+const PING_INTERVAL_MS: u32 = 3000;
+
+// A ping resets `last_ping_time`, so a worker ping already satisfies the interval.
+fn ping_due(current: u32, last_ping: u32, worker_pinged: bool) -> bool {
+    worker_pinged || current.wrapping_sub(last_ping) >= PING_INTERVAL_MS
+}
+
 impl Connection {
     pub fn flush(&self) {
         let current = self.elapsed();
@@ -364,11 +371,12 @@ impl Connection {
             self.set_state(State::Terminating);
         }
         self.receiving.lock().unwrap().flush(current);
-        let should_ping = self.sending.lock().unwrap().flush(current);
-        if current.wrapping_sub(self.last_ping_time.load(Ordering::SeqCst)) >= 3000 {
-            self.ping(current, Command::Ping);
-        }
-        if should_ping {
+        let worker_pinged = self.sending.lock().unwrap().flush(current);
+        if ping_due(
+            current,
+            self.last_ping_time.load(Ordering::SeqCst),
+            worker_pinged,
+        ) {
             self.ping(current, Command::Ping);
         }
     }
@@ -542,5 +550,35 @@ impl Connection {
     fn poke(&self) {
         self.data_input.signal();
         self.data_output.signal();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ping_due, PING_INTERVAL_MS};
+
+    #[test]
+    fn one_tick_pings_at_most_once() {
+        for last in [0, 1, 500, 12_500] {
+            for gap in [0, 1, 42, PING_INTERVAL_MS - 1, PING_INTERVAL_MS, 90_000] {
+                assert!(ping_due(last + gap, last, true));
+                assert_eq!(ping_due(last + gap, last, false), gap >= PING_INTERVAL_MS);
+            }
+        }
+    }
+
+    #[test]
+    fn the_interval_wraps_instead_of_underflowing() {
+        let before = u32::MAX - (PING_INTERVAL_MS - 2);
+        assert!(!ping_due(
+            before.wrapping_add(PING_INTERVAL_MS - 1),
+            before,
+            false
+        ));
+        assert!(ping_due(
+            before.wrapping_add(PING_INTERVAL_MS),
+            before,
+            false
+        ));
     }
 }
