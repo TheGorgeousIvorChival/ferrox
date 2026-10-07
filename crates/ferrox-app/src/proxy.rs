@@ -8392,6 +8392,7 @@ mod tests {
         (conn, peer_scid)
     }
 
+    #[allow(clippy::too_many_lines)] // A protocol loop: header, accept, then echo.
     fn quic_vless_echo_server(
         sock: UdpSocket,
         cert_pem: Vec<u8>,
@@ -8506,26 +8507,27 @@ mod tests {
     }
 
     /// How often the ferry misbehaves, counted over the packets it carries.
-    /// Zero disables a fault, so the faithful case is the same code path.
+    /// Each field is the `n`th packet to misbehave; zero disables that fault,
+    /// so the faithful case is the same code path rather than a second ferry.
     #[derive(Clone, Copy, PartialEq)]
     struct FerryFaults {
-        drop_every: usize,
-        duplicate_every: usize,
-        hold_every: usize,
+        drop: usize,
+        duplicate: usize,
+        hold: usize,
     }
 
     const FAITHFUL: FerryFaults = FerryFaults {
-        drop_every: 0,
-        duplicate_every: 0,
-        hold_every: 0,
+        drop: 0,
+        duplicate: 0,
+        hold: 0,
     };
 
     /// The loss a loopback socket cannot be asked for on demand: one packet in
     /// four dropped, one in seven doubled, one in five held back a round.
     const LOSSY: FerryFaults = FerryFaults {
-        drop_every: 4,
-        duplicate_every: 7,
-        hold_every: 5,
+        drop: 4,
+        duplicate: 7,
+        hold: 5,
     };
 
     /// The two ends and the addresses they name each other by, so a ferry and
@@ -8589,9 +8591,10 @@ mod tests {
             // A faithful ferry must never fail to hand a packet over; an
             // adversarial one may, because a dropped or reordered packet is
             // exactly what the protocol has to survive.
-            if outcome.is_err() && self.faults == FAITHFUL {
-                panic!("quic ferry could not deliver {} bytes", buf.len());
-            }
+            assert!(
+                !(outcome.is_err() && self.faults == FAITHFUL),
+                "a faithful ferry must deliver every packet it carries"
+            );
         }
 
         /// One packet through the faults. A held packet waits in `held` and
@@ -8605,16 +8608,16 @@ mod tests {
         ) {
             self.carried += 1;
             let seen = self.carried;
-            let hits = |every: usize| every > 0 && seen % every == 0;
-            if hits(self.faults.drop_every) {
+            let hits = |every: usize| every > 0 && seen.is_multiple_of(every);
+            if hits(self.faults.drop) {
                 self.dropped += 1;
                 return;
             }
-            if hits(self.faults.hold_every) {
+            if hits(self.faults.hold) {
                 held.push((bytes, to_server));
                 return;
             }
-            let twice = hits(self.faults.duplicate_every);
+            let twice = hits(self.faults.duplicate);
             self.deliver(pipe, &bytes, to_server);
             if twice {
                 self.duplicated += 1;
