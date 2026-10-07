@@ -142,6 +142,10 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
         }
         _ => {
             let owned = address.to_owned();
+            if matches!(carrier, Carrier::Kcp) {
+                thread::spawn(move || serve_kcp_loop(&owned, id, freedom));
+                return true;
+            }
             let role = Role::Vless {
                 id,
                 carrier,
@@ -1567,6 +1571,115 @@ fn dial_vless(client: &TcpStream, mut uplink: TcpStream, vless: &VlessOut, targe
     }
 }
 
+// KCP speaks the same VLESS bytes as TCP over a reliable UDP stream.
+struct KcpIo {
+    conn: Arc<ferrox_core::kcp::Connection>,
+}
+
+impl Read for KcpIo {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.conn
+            .read(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+    }
+}
+
+fn kcp_relay(tcp: &TcpStream, conn: &Arc<ferrox_core::kcp::Connection>) {
+    let Ok(tcp_read) = tcp.try_clone() else {
+        return;
+    };
+    let Ok(mut tcp_write) = tcp.try_clone() else {
+        return;
+    };
+    let up = Arc::clone(conn);
+    let done = RelayPool::global().run(move || {
+        let mut tcp_read = tcp_read;
+        let mut buf = vec![0u8; 16384];
+        loop {
+            match tcp_read.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if up.write(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        up.close();
+    });
+    let mut buf = vec![0u8; 16384];
+    loop {
+        match conn.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if tcp_write.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = tcp_write.shutdown(Shutdown::Write);
+    join(&done);
+}
+
+fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, id: &[u8; 16], freedom: bool) {
+    let mut io = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut io) else {
+        return;
+    };
+    if got != *id || !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if conn.write(&[0, 0]).is_err() {
+        return;
+    }
+    kcp_relay(&uplink, conn);
+}
+
+fn dial_vless_kcp(
+    client: &TcpStream,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    vless: &VlessOut,
+    target: &SocketAddr,
+) {
+    let header = vless_header(&vless.id, 1, target);
+    if conn.write(&header).is_err() {
+        return;
+    }
+    let mut io = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    if read_vless_response(&mut io).is_none() {
+        return;
+    }
+    kcp_relay(client, conn);
+}
+
+fn serve_kcp_loop(address: &str, id: [u8; 16], freedom: bool) {
+    let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        return;
+    };
+    let Ok(listener) =
+        ferrox_core::kcp::Listener::bind(server, ferrox_core::kcp::Config::default())
+    else {
+        return;
+    };
+    loop {
+        let Ok(session) = listener.accept() else {
+            continue;
+        };
+        std::thread::spawn(move || serve_vless_kcp(&session, &id, freedom));
+    }
+}
+
 struct UdpUplink {
     write: TcpStream,
     target: SocketAddr,
@@ -2491,6 +2604,20 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
                 },
                 &target,
             );
+            return;
+        }
+        if matches!(vless.carrier, Carrier::Kcp) && !vless.mux {
+            let endpoint = format!("{}:{}", vless.address, vless.port);
+            let Some(server) = endpoint.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+                return;
+            };
+            let conversation = ferrox_core::kcp::fresh_conversation();
+            let Ok(session) =
+                ferrox_core::kcp::dial(server, ferrox_core::kcp::Config::default(), conversation)
+            else {
+                return;
+            };
+            dial_vless_kcp(&client, &session, vless, &target);
             return;
         }
     }
@@ -8003,6 +8130,62 @@ mod tests {
         let (conns, streams) = server.join().expect("joins");
         assert_eq!(conns, 1, "one UDP association, not two handshakes");
         assert_eq!(streams, 2, "two VLESS sessions on it");
+    }
+
+    #[test]
+    fn kcp_carries_vless_echo_over_loopback() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let kcp_addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let listener =
+            ferrox_core::kcp::Listener::bind(kcp_addr, ferrox_core::kcp::Config::default())
+                .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp(&conn, &id, true);
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let header = vless_header(&id, 1, &target);
+        let server_addr: SocketAddr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+        let conn = ferrox_core::kcp::dial(
+            server_addr,
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        conn.write(&header).expect("writes");
+        let mut io = KcpIo {
+            conn: Arc::clone(&conn),
+        };
+        read_vless_response(&mut io).expect("replies");
+        conn.write(b"ping").expect("writes");
+        conn.set_read_deadline(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < 4 {
+            let n = conn.read(&mut back[at..]).expect("echoes");
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        assert_eq!(&back, b"ping");
+        conn.close();
+        server.join().expect("joins");
     }
 }
 

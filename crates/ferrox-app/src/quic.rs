@@ -87,6 +87,18 @@ pub(crate) fn qms() -> u128 {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+const fn b64_table() -> [u8; 256] {
+    let mut table = [255u8; 256];
+    let mut i = 0usize;
+    while i < 64 {
+        table[B64[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+}
+
+const B64_TABLE: [u8; 256] = b64_table();
+
 fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
     assert!(bytes.len() <= 48, "base64 lines are 48 input bytes");
     let mut written = 0;
@@ -110,9 +122,12 @@ fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
 }
 
 fn base64_value(byte: u8) -> Option<u8> {
-    B64.iter()
-        .position(|digit| *digit == byte)
-        .map(|slot| slot as u8)
+    let v = B64_TABLE[byte as usize];
+    if v == 255 {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 fn base64_decode(text: &[u8], out: &mut Vec<u8>) -> bool {
