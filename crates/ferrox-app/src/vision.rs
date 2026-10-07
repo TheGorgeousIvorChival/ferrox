@@ -27,6 +27,8 @@ pub(crate) struct Link<S: Read + Write> {
     oat: usize,
     chunk: Vec<u8>,
     staging: Vec<u8>,
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the staging gate"))]
+    staged: usize,
     read: Reading,
     write: Writing,
     tls: Tls,
@@ -69,6 +71,7 @@ impl<S: Read + Write> Link<S> {
             oat: 0,
             chunk: vec![0u8; RELAY_BUFFER],
             staging: Vec::new(),
+            staged: 0,
             read: Reading {
                 padding: true,
                 mid_frame: false,
@@ -101,21 +104,56 @@ impl<S: Read + Write> Read for Link<S> {
             self.out.clear();
             self.oat = 0;
         }
+        if !self.read.padding {
+            if self.oat < self.out.len() {
+                return Ok(self.copy_out(buf));
+            }
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            return self.read_direct(buf);
+        }
         while self.oat >= self.out.len() {
             if !self.fill()? {
                 return Ok(0);
             }
         }
-        let n = (self.out.len() - self.oat).min(buf.len());
-        buf[..n].copy_from_slice(&self.out[self.oat..self.oat + n]);
-        self.oat += n;
-        Ok(n)
+        Ok(self.copy_out(buf))
     }
 }
 
 impl<S: Read + Write> Link<S> {
+    fn copy_out(&mut self, buf: &mut [u8]) -> usize {
+        let n = (self.out.len() - self.oat).min(buf.len());
+        buf[..n].copy_from_slice(&self.out[self.oat..self.oat + n]);
+        self.oat += n;
+        n
+    }
+
+    /// Once the framing is over the payload is delivered straight into the
+    /// caller's buffer: the staged path needed two copies, this needs none.
+    fn read_direct(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let raw = self.read.raw;
+        let n = match self.raw.as_mut() {
+            Some(handle) if raw => handle.read(buf)?,
+            _ => self.session.read(buf)?,
+        };
+        if n > 0 && !raw && self.tls.budget > 0 {
+            self.tls.observe(&buf[..n]);
+        }
+        Ok(n)
+    }
+
     fn pending(&self) -> usize {
         self.have.len() - self.hat
+    }
+
+    /// Bytes that passed through a staging buffer. The switch out of Vision
+    /// framing ends it: everything after is delivered into the caller's buffer
+    /// with no copy at all.
+    #[cfg(test)]
+    pub(crate) fn staged(&self) -> usize {
+        self.staged
     }
 
     fn compact(&mut self) {
@@ -125,44 +163,28 @@ impl<S: Read + Write> Link<S> {
         }
     }
 
+    /// Reached only while the framing is live, so every byte read here is a
+    /// byte that had to be staged; `staged()` counts them.
     fn fill(&mut self) -> std::io::Result<bool> {
         loop {
-            if self.read.raw {
-                let Some(raw) = self.raw.as_mut() else {
-                    return Err(std::io::Error::other("vision: no raw socket to read"));
-                };
-                let n = raw.read(&mut self.chunk)?;
-                if n == 0 {
-                    return Ok(false);
-                }
-                self.out.extend_from_slice(&self.chunk[..n]);
-                return Ok(true);
-            }
             let n = self.session.read(&mut self.chunk)?;
             if n == 0 {
                 self.flush_truncated();
                 return Ok(self.oat < self.out.len());
             }
-            if self.read.padding {
-                self.compact();
-                self.have.extend_from_slice(&self.chunk[..n]);
-                let was = self.out.len();
-                let framed = self.unpad();
-                if self.tls.budget > 0 && self.out.len() > was {
-                    self.tls.observe(&self.out[was..]);
+            self.compact();
+            self.have.extend_from_slice(&self.chunk[..n]);
+            self.staged += n;
+            let was = self.out.len();
+            let framed = self.unpad();
+            if self.tls.budget > 0 && self.out.len() > was {
+                self.tls.observe(&self.out[was..]);
+            }
+            if !framed {
+                if self.out.len() > was {
+                    return Ok(true);
                 }
-                if !framed {
-                    if self.out.len() > was {
-                        return Ok(true);
-                    }
-                    continue;
-                }
-            } else {
-                let was = self.out.len();
-                self.out.extend_from_slice(&self.chunk[..n]);
-                if self.tls.budget > 0 && self.out.len() > was {
-                    self.tls.observe(&self.out[was..]);
-                }
+                continue;
             }
             if self.oat < self.out.len() {
                 return Ok(true);
@@ -176,8 +198,11 @@ impl<S: Read + Write> Link<S> {
                 return false;
             }
             if self.have[self.hat..self.hat + 16] != self.uuid {
+                self.read.padding = false;
                 let tail = self.have.len();
+                let taken = tail - self.hat;
                 self.out.extend_from_slice(&self.have[self.hat..tail]);
+                self.staged += taken;
                 self.hat = tail;
                 return true;
             }
@@ -207,6 +232,7 @@ impl<S: Read + Write> Link<S> {
                 let take = self.read.want_content.min(self.pending());
                 self.out
                     .extend_from_slice(&self.have[self.hat..self.hat + take]);
+                self.staged += take;
                 self.hat += take;
                 self.read.want_content -= take;
                 continue;
@@ -223,7 +249,9 @@ impl<S: Read + Write> Link<S> {
         self.read.padding = false;
         self.read.raw = self.read.command == CMD_DIRECT && self.raw.is_some();
         let tail = self.have.len();
+        let taken = tail - self.hat;
         self.out.extend_from_slice(&self.have[self.hat..tail]);
+        self.staged += taken;
         self.hat = tail;
         true
     }
@@ -231,7 +259,9 @@ impl<S: Read + Write> Link<S> {
     fn flush_truncated(&mut self) {
         if !self.read.mid_frame {
             let tail = self.have.len();
+            let taken = tail - self.hat;
             self.out.extend_from_slice(&self.have[self.hat..tail]);
+            self.staged += taken;
             self.hat = tail;
         }
     }
@@ -488,6 +518,66 @@ mod tests {
         let mut out = Vec::new();
         link.read_to_end(&mut out).expect("reads");
         assert_eq!(out, b"no framing here at all");
+    }
+
+    /// Past the switch the payload is delivered with no staging at all: the tail
+    /// is copied zero times, where the framed path copied it twice.
+    #[test]
+    fn the_framing_switch_ends_the_staging() {
+        /// Hands out `step` bytes at a time, so a read boundary lands exactly
+        /// on the end of the framing.
+        struct Drip<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Drip<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Drip<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tail = b"straight through, never staged";
+        let mut input = frame(true, 0, b"padded", 8);
+        input.extend(frame(false, 1, b"end", 0));
+        input.extend_from_slice(tail);
+        let framed = input.len() - tail.len();
+        let mut link = Link::new(
+            Drip {
+                left: &input,
+                step: framed,
+            },
+            None,
+            &UUID,
+        );
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        loop {
+            let n = link.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, [b"paddedend".as_slice(), tail.as_slice()].concat());
+        assert_eq!(
+            link.staged(),
+            framed + b"paddedend".len(),
+            "only framed bytes are staged: {} in, {} more out",
+            framed,
+            b"paddedend".len()
+        );
     }
 
     #[test]

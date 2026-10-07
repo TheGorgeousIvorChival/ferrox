@@ -564,9 +564,13 @@ fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> 
         }
         ferrox_core::addr::Addr::Name(bytes) => {
             let host = std::str::from_utf8(bytes).ok()?;
-            format!("{host}:{port}").to_socket_addrs().ok()?.next()
+            resolve_endpoint(host, port)
         }
     }
+}
+
+fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
+    format!("{host}:{port}").to_socket_addrs().ok()?.next()
 }
 
 fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {
@@ -4316,25 +4320,92 @@ fn read_varint(body: &[u8], at: &mut usize) -> Option<u32> {
     None
 }
 
+/// The longest trojan request header a peer can send: key, CRLF, command, the
+/// longest address (a 255-byte domain) with its port, and CRLF.
+const TROJAN_HEAD_MAX: usize = 56 + 2 + 1 + 1 + 1 + 255 + 2 + 2;
+
+/// Every byte of `got` is examined, so how long the comparison takes does not
+/// depend on how much of the key was right, and a short read never agrees.
+fn key_agrees(got: &[u8], key: &[u8; 56]) -> bool {
+    if got.len() != key.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in got.iter().zip(key) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Fill `head[..want]` from `stream`, returning the cursor. A `dyn Read` may
+/// hand back short reads, so this loops; the count is what the header costs.
+fn trojan_take(
+    stream: &mut dyn Read,
+    head: &mut [u8; TROJAN_HEAD_MAX],
+    filled: &mut usize,
+    want: usize,
+) -> bool {
+    while *filled < want {
+        match stream.read(&mut head[*filled..want]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => *filled += n,
+        }
+    }
+    true
+}
+
+/// One read for the whole header, parsed in place: two reads for a numeric
+/// address and three for a domain, against the seven and eight the
+/// field-at-a-time parse spent.
 fn decode_trojan_request(stream: &mut dyn Read, key: &[u8; 56]) -> Option<(u8, SocketAddr)> {
-    let mut got = [0u8; 56];
-    read_exact(stream, &mut got).ok()?;
-    if got != *key {
+    let mut head = [0u8; TROJAN_HEAD_MAX];
+    let mut filled = 0usize;
+    if !trojan_take(stream, &mut head, &mut filled, 60)
+        || !key_agrees(&head[..56], key)
+        || head[56..58] != *b"\r\n"
+    {
         return None;
     }
-    let mut crlf = [0u8; 2];
-    read_exact(stream, &mut crlf).ok()?;
-    if crlf != *b"\r\n" {
+    let cmd = head[58];
+    // The port ends the address in every form, so the CRLF that closes the
+    // header is the two bytes after it.
+    let (target, port_end) = match head[59] {
+        1 => {
+            if !trojan_take(stream, &mut head, &mut filled, 68) {
+                return None;
+            }
+            let mut ip = [0u8; 4];
+            ip.copy_from_slice(&head[60..64]);
+            let port = u16::from_be_bytes([head[64], head[65]]);
+            (SocketAddr::new(std::net::IpAddr::V4(ip.into()), port), 66)
+        }
+        4 => {
+            if !trojan_take(stream, &mut head, &mut filled, 80) {
+                return None;
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&head[60..76]);
+            let port = u16::from_be_bytes([head[76], head[77]]);
+            (SocketAddr::new(std::net::IpAddr::V6(ip.into()), port), 78)
+        }
+        3 => {
+            if !trojan_take(stream, &mut head, &mut filled, 61) {
+                return None;
+            }
+            let name_end = 61 + usize::from(head[60]);
+            if !trojan_take(stream, &mut head, &mut filled, name_end + 4) {
+                return None;
+            }
+            let host = std::str::from_utf8(&head[61..name_end]).ok()?;
+            let port = u16::from_be_bytes([head[name_end], head[name_end + 1]]);
+            (resolve_endpoint(host, port)?, name_end + 2)
+        }
+        _ => return None,
+    };
+    if head[port_end..port_end + 2] != *b"\r\n" {
         return None;
     }
-    let mut cmd = [0u8; 1];
-    read_exact(stream, &mut cmd).ok()?;
-    let target = read_socks_addr(stream)?;
-    read_exact(stream, &mut crlf).ok()?;
-    if crlf != *b"\r\n" {
-        return None;
-    }
-    Some((cmd[0], target))
+    Some((cmd, target))
 }
 
 fn read_addr(stream: &mut dyn Read, port: u16) -> Option<SocketAddr> {
@@ -4358,7 +4429,7 @@ fn read_addr(stream: &mut dyn Read, port: u16) -> Option<SocketAddr> {
     let mut name = vec![0u8; usize::from(len[0])];
     read_exact(stream, &mut name).ok()?;
     let host = String::from_utf8(name).ok()?;
-    format!("{host}:{port}").to_socket_addrs().ok()?.next()
+    resolve_endpoint(&host, port)
 }
 
 pub(crate) fn push_addr(header: &mut Vec<u8>, target: &SocketAddr, v6: u8) {
@@ -5674,6 +5745,68 @@ mod tests {
         assert!(bad.read(&mut closed).is_err() || closed == [0]);
         drop(good);
         drop(bad);
+    }
+
+    #[test]
+    fn the_trojan_header_costs_two_reads_not_seven() {
+        struct Counting<'a> {
+            at: usize,
+            wire: &'a [u8],
+            reads: usize,
+        }
+        impl Read for Counting<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let left = self.wire.len() - self.at;
+                if left == 0 {
+                    return Ok(0);
+                }
+                let n = left.min(buf.len());
+                buf[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        let key = trojan_key("an-example-shared-password");
+        for (addr, reads) in [
+            (b"\x01\x7f\x00\x00\x01\x1f\x90".to_vec(), 2usize),
+            (
+                [4u8]
+                    .into_iter()
+                    .chain([0u8; 15])
+                    .chain([1u8, 0x1f, 0x90])
+                    .collect::<Vec<u8>>(),
+                2,
+            ),
+            (b"\x03\x09localhost\x1f\x90".to_vec(), 3),
+        ] {
+            let mut wire = key.to_vec();
+            wire.extend_from_slice(b"\r\n\x01");
+            wire.extend_from_slice(&addr);
+            wire.extend_from_slice(b"\r\n");
+            let mut reader = Counting {
+                at: 0,
+                wire: &wire,
+                reads: 0,
+            };
+            let (cmd, _) = decode_trojan_request(&mut reader, &key)
+                .unwrap_or_else(|| panic!("decodes {addr:?}"));
+            assert_eq!(cmd, 1, "{addr:?}");
+            assert_eq!(reader.reads, reads, "{addr:?}");
+        }
+    }
+
+    #[test]
+    fn the_key_compare_reads_every_byte() {
+        let key = trojan_key("an-example-shared-password");
+        assert!(key_agrees(&key, &key), "the key agrees with itself");
+        for at in [0usize, 1, 27, 55] {
+            let mut other = key;
+            other[at] ^= 0x01;
+            assert!(!key_agrees(&other, &key), "byte {at} differs");
+        }
+        assert!(!key_agrees(&key[..55], &key), "a short read never agrees");
     }
 
     #[test]
