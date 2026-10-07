@@ -696,6 +696,8 @@ The accepted set is in `upstream/xray-core/infra/conf/transport_internet.go`: tc
 The obstacle is structural and all three of these rungs meet it: `crates/ferrox-app/src/quic.rs` is a client with a pool and no listener, and a carrier that owns its own congestion loop needs a server role the app does not have. Decide in the report whether one QUIC listener is shared by hysteria, masque and xdrive or whether each writes its own, because a second QUIC stack is the debt this repository refuses to land.
 
 Report the rows this earns and the rows that stay refused, each with its reason. A refusal that names itself is a verdict; the refusal this slice replaces is a name with nothing behind it.
+
+What the lane measured once it existed, for whoever closes the linux gate: `hysteria_carries_vless_echo_over_loopback` parks the full 120s on the linux runner and nowhere else, and two mechanisms have already been named. UDP GRO was the first guess and is ruled out — `serve_loop` and the bisect server were bound plain and are now bound through `bind_datagram`, and the run stayed red (`b74938a`, ci 37682179836). The second is the pool hang's own shape: both hand-rolled peers, which drive quiche single-threaded, echo green on linux, while the threaded `serve_loop` plus `dial_vless` fails at the first echo — the moment `relay` spawns a second contender on the connection mutex that `recv_exact` holds across `pump_once`'s blocking recv, exactly the convoy `803a8f0` took out of the pool's `pump`. Give `recv_exact` and the serve drivers the same lock-out-of-the-wait shape and read the next linux run.
 ```
 
 ## P33 · Carry MASQUE CONNECT-IP
