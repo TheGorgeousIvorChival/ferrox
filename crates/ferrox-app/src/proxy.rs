@@ -51,43 +51,46 @@ pub(crate) fn serve_file(path: &str) -> ! {
                 "trojan" => {
                     let key = trojan_key(&inbound_password(inbound));
                     let carrier = inbound_carrier(inbound);
-                    let address_clone = address.clone();
-                    let role = Role::Trojan {
-                        key,
-                        carrier,
-                        freedom,
-                    };
-                    thread::spawn(move || accept_loop(&address_clone, &role));
+                    spawn_role(
+                        &address,
+                        Role::Trojan {
+                            key,
+                            carrier,
+                            freedom,
+                        },
+                    );
                     inbounds += 1;
                 }
                 "vmess" => {
                     let id = inbound_id(inbound);
                     let carrier = inbound_carrier(inbound);
-                    let address_clone = address.clone();
-                    let role = Role::Vmess {
-                        id,
-                        carrier,
-                        freedom,
-                    };
-                    thread::spawn(move || accept_loop(&address_clone, &role));
+                    spawn_role(
+                        &address,
+                        Role::Vmess {
+                            id,
+                            carrier,
+                            freedom,
+                        },
+                    );
                     inbounds += 1;
                 }
                 "shadowsocks" => {
                     let password = inbound_ss_password(inbound);
                     let method = inbound_method(inbound);
                     let carrier = inbound_carrier(inbound);
-                    let address_clone = address.clone();
                     let udp_address = address.clone();
                     let udp_password = password.clone();
                     let udp_method = method.clone();
                     let udp_carrier = carrier.clone();
-                    let role = Role::Shadowsocks {
-                        password,
-                        method,
-                        carrier,
-                        freedom,
-                    };
-                    thread::spawn(move || accept_loop(&address_clone, &role));
+                    spawn_role(
+                        &address,
+                        Role::Shadowsocks {
+                            password,
+                            method,
+                            carrier,
+                            freedom,
+                        },
+                    );
                     if matches!(udp_carrier, Carrier::Raw) {
                         thread::spawn(move || {
                             crate::shadowsocks::serve_udp(
@@ -119,6 +122,11 @@ pub(crate) fn serve_file(path: &str) -> ! {
         thread::park();
         report_dial_failures();
     }
+}
+
+fn spawn_role(address: &str, role: Role) {
+    let address = address.to_owned();
+    thread::spawn(move || accept_loop(&address, &role));
 }
 
 fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {

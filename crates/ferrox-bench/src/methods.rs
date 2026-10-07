@@ -79,8 +79,8 @@ pub fn table() -> String {
         s,
         "\n> Status cells above are read from the parser at report time for every row the\n\
          > `vless://` format can express; the rest mirror `transport.rs` until their rung\n\
-         > lands. Upstream suites (Xray-core, ZeroNet/Zray, xray-rust, sing-box) check each\n\
-         > implemented rung from their pins — see `docs/conformance.md`."
+         > lands. Upstream suites with a seam (ZeroNet/Zray, xray-rust) check each\n\
+         > implemented rung from their pins."
     );
     s
 }

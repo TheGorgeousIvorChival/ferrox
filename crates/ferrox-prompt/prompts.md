@@ -57,7 +57,7 @@ Simpler with less code wins every tie at equal performance: the explainable form
 
 Unsafe only for a measured win, safe Rust whenever it ties: if the safe form is as fast, the safe form ships, and every `unsafe` block still carries its proof obligation in one line.
 
-A finished rung runs all four projects' related suites against it — Xray-core, sing-box, xray-rust, ZeroNet — unmodified, from the pins. Green here plus red there is not done.
+A finished rung runs every related suite with a seam against it — Xray-core where one exists, xray-rust, ZeroNet — unmodified, from the pins. Green here plus red there is not done.
 
 Local checkouts under `upstream/` are for reading. They prove nothing about speed: a number produced off a named CI runner is not evidence about any runner.
 ```
@@ -226,7 +226,7 @@ A throughput ceiling that is reported honestly is more useful than one that is w
 ```text
 `vless.rs` parses the share link a ZeroNet or v2rayNG user actually pastes, preserves every query key including PattNG's `unsafe-*` fingerprints, and reports a transport this core does not implement as unsupported-with-a-reason rather than by leaving the cell out. That distinction is the whole design and it must survive into whatever is built on it.
 
-One surface, not five. A single drop-in for Xray-core, sing-box, Amnezia and the Rust ports of each is five compatibility surfaces with different wire formats, config schemas and APIs, and a surface built on an unproven primitive inherits its bugs and its silence.
+One surface. A drop-in for Xray-core is one compatibility surface with one wire format, one config schema and one API, and a surface built on an unproven primitive inherits its bugs and its silence. Other cores are read for technique, never claimed as surfaces.
 
 So: take the one transport the parser reports as supported — `type=tcp + security=reality + flow=xtls-rprx-vision` — and make it actually carry a record through `record::fill_exact`. Then run the pinned upstream suite against the result, unmodified, and report the count honestly including the failures.
 
@@ -241,7 +241,7 @@ The order is deliberate: primitives first, each proved, then a surface. If the s
 
 **Add-on — upstream-vless:** Wire-format sources, in order: `upstream/xray-core/proxy/vless/` under `encoding`, `inbound`, `outbound`, then `upstream/sing-box/protocol/vless/`, `upstream/xray-rust/crates/`, `upstream/zeronet/crates/zero-protocol/` with `zero-transport/`; implement the narrower parser and prove it faster per length.
 
-**Add-on — upstream-tests-on-done:** When the rung dials, run all four suites via `scripts/run-upstream-suite.sh` — `upstream/xray-core/proxy/vless/`, `upstream/sing-box/protocol/vless/`, `upstream/xray-rust/crates/`, `upstream/zeronet/crates/` — before calling it done.
+**Add-on — upstream-tests-on-done:** When the rung dials, run the suites with a seam via `scripts/run-upstream-suite.sh` — `upstream/xray-rust/crates/`, `upstream/zeronet/crates/` — before calling it done.
 
 ## P8 · Rewrite for readability without making it slower
 
@@ -286,7 +286,7 @@ Leave the debt you did not pay. If a second duplication is visible but out of sc
 
 ## P9 · Port one upstream suite to Rust and retire its toolchain
 
-**When to use:** When an upstream suite's only job in CI is to need its toolchain — Go for xray-core, and whatever sing-box needs next — while what it checks is behavior this tree could state itself.
+**When to use:** When an upstream suite's only job in CI is to need its toolchain — Go for the Go suites — while what it checks is behavior this tree could state itself.
 **Status:** todo
 **Leverage:** 4
 **Effort:** large
