@@ -117,11 +117,16 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                     return false;
                 };
                 let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
-                let serve: crate::hysteria::Serve = Arc::new(move |flow| {
-                    serve_vless_hysteria(flow, &id, freedom);
+                let serve: crate::hysteria::Serve = Arc::new(move |flow, target| {
+                    serve_hysteria(flow, &target, freedom);
+                });
+                let serve_udp: crate::hysteria::ServeUdp = Arc::new(move |ctx| {
+                    serve_hysteria_udp(ctx, freedom);
                 });
                 thread::spawn(move || {
-                    crate::hysteria::serve_loop(&owned, &config, &cert_path, &key_path, &serve);
+                    crate::hysteria::serve_loop(
+                        &owned, &config, &cert_path, &key_path, &serve, &serve_udp,
+                    );
                 });
                 return true;
             }
@@ -1694,20 +1699,54 @@ fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, id: &[u8; 16], free
     kcp_relay(&uplink, conn);
 }
 
-fn serve_vless_hysteria(mut flow: crate::hysteria::Flow, id: &[u8; 16], freedom: bool) {
-    let Some((got, _flow, cmd, target)) = decode_request(&mut flow) else {
-        return;
-    };
-    if got != *id || !freedom || cmd != 1 {
+fn serve_hysteria(flow: crate::hysteria::Flow, target: &SocketAddr, freedom: bool) {
+    if !freedom {
         return;
     }
-    let Some(uplink) = dial_or_report(&target) else {
+    let Some(uplink) = dial_or_report(target) else {
         return;
     };
-    if flow.write_all(&[0, 0]).is_err() {
-        return;
-    }
     crate::hysteria::relay(&uplink, &flow);
+}
+
+fn serve_hysteria_udp(ctx: crate::hysteria::UdpCtx, freedom: bool) {
+    if !freedom {
+        return;
+    }
+    let Some(target) = crate::hysteria::parse_addr_text(&ctx.addr) else {
+        return;
+    };
+    let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let Ok(uplink) = UdpSocket::bind(bind) else {
+        return;
+    };
+    if uplink.connect(target).is_err() || uplink.set_read_timeout(Some(UDP_IDLE)).is_err() {
+        return;
+    }
+    let addr = ctx.addr.clone();
+    let answer = ctx.flow.clone();
+    let Ok(back) = uplink.try_clone() else {
+        return;
+    };
+    let done = RelayPool::global().run(move || {
+        let mut buf = vec![0u8; UDP_BUF];
+        loop {
+            match back.recv(&mut buf) {
+                Ok(n) => {
+                    if n == 0 || !answer.send(&addr, &buf[..n]) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    for payload in &ctx.rx {
+        if uplink.send(&payload).is_err() {
+            break;
+        }
+    }
+    join(&done);
 }
 
 fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
@@ -2914,7 +2953,7 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
         }
         if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux {
             if let Some(dial) = hysteria_dial_session(vless) {
-                crate::hysteria::dial_vless(&client, &dial, &vless.id, &target);
+                crate::hysteria::dial_direct(&client, &dial, &target);
             }
             return;
         }
@@ -3167,6 +3206,9 @@ fn serve_socks_udp(mut client: TcpStream, out: &Outbound) {
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw) => {
             serve_socks_udp_shadowsocks(&relay, ss);
         }
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) => {
+            serve_socks_udp_vless_hysteria(&relay, vless);
+        }
         _ => {}
     }
 }
@@ -3357,6 +3399,66 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
     if let Some(old) = uplink.take() {
         let _ = old.write.shutdown(Shutdown::Both);
         join(&old.done);
+    }
+}
+
+fn serve_socks_udp_vless_hysteria(relay: &UdpSocket, vless: &VlessOut) {
+    let Some(dial) = hysteria_dial_session(vless) else {
+        return;
+    };
+    let Some(mut link) = crate::hysteria::connect_udp(&dial) else {
+        return;
+    };
+    let mut source: Option<SocketAddr> = None;
+    let mut uplink: Option<(SocketAddr, u32)> = None;
+    let mut buf = vec![0u8; UDP_BUF];
+    let mut packet = vec![0u8; UDP_BUF];
+    loop {
+        match relay.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                source = Some(src);
+                let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                    continue;
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+                let redial = match &uplink {
+                    Some(up) => up.0 != dest,
+                    None => true,
+                };
+                if redial {
+                    uplink = Some((dest, link.next_session()));
+                }
+                let Some((_, id)) = uplink else {
+                    continue;
+                };
+                if !link.send(id, &crate::hysteria::addr_text(&dest), payload) {
+                    uplink = None;
+                }
+            }
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => break,
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        while let Some((id, data)) = link.recv(deadline) {
+            let Some((dest, want)) = uplink else {
+                continue;
+            };
+            if want != id {
+                continue;
+            }
+            let Some(source) = source else {
+                continue;
+            };
+            packet.clear();
+            packet.extend_from_slice(&[0, 0, 0]);
+            push_socks_addr(&mut packet, &dest);
+            packet.extend_from_slice(&data);
+            if relay.send_to(&packet, source).is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -9628,7 +9730,7 @@ mod tests {
         assert!(matches!(stream_carrier(Some(&old)), Carrier::Unknown));
     }
 
-    fn hysteria_loop_with(auth: &str, id: [u8; 16]) -> (u16, Vec<Vec<u8>>) {
+    fn hysteria_loop_with(auth: &str) -> (u16, Vec<Vec<u8>>) {
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let stamp = std::time::SystemTime::now()
@@ -9651,26 +9753,25 @@ mod tests {
             auth: auth.to_owned(),
             cc: ferrox_core::hysteria::Congestion::Bbr,
         };
-        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
-            serve_vless_hysteria(flow, &id, true);
+        let serve: crate::hysteria::Serve = Arc::new(move |flow, target| {
+            serve_hysteria(flow, &target, true);
+        });
+        let serve_udp: crate::hysteria::ServeUdp = Arc::new(move |ctx| {
+            serve_hysteria_udp(ctx, true);
         });
         let (cert_path, key_path) = (
             cert_path.to_str().expect("ascii").to_owned(),
             key_path.to_str().expect("ascii").to_owned(),
         );
         thread::spawn(move || {
-            crate::hysteria::serve_loop(&address, &config, &cert_path, &key_path, &serve);
+            crate::hysteria::serve_loop(
+                &address, &config, &cert_path, &key_path, &serve, &serve_udp,
+            );
         });
         (port, roots)
     }
 
-    fn hysteria_tcp_pair(
-        port: u16,
-        roots: Vec<Vec<u8>>,
-        auth: &str,
-        id: [u8; 16],
-        target: SocketAddr,
-    ) -> TcpStream {
+    fn hysteria_tcp_pair(port: u16, roots: Vec<Vec<u8>>, auth: &str, target: SocketAddr) -> TcpStream {
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let dial = crate::hysteria::Dial {
@@ -9685,7 +9786,7 @@ mod tests {
         };
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            crate::hysteria::dial_vless(&stream, &dial, &id, &target);
+            crate::hysteria::dial_direct(&stream, &dial, &target);
         });
         let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -9753,12 +9854,12 @@ mod tests {
         }
     }
 
-    fn hysteria_test_read_prefix(
+    fn hysteria_test_read_request(
         conn: &mut quiche::Connection,
         sock: &UdpSocket,
         local: SocketAddr,
         out: &mut [u8; 1350],
-    ) -> Vec<u8> {
+    ) -> (String, Vec<u8>) {
         let mut buf = [0u8; 1350];
         let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
         let mut prefix = Vec::new();
@@ -9777,8 +9878,12 @@ mod tests {
             while let Ok((written, info)) = conn.send(out) {
                 sock.send_to(&out[..written], info.to).expect("answers");
             }
-            if prefix.len() >= 2 {
-                return prefix.split_off(2);
+            if let Some(consumed) = ferrox_core::hysteria::read_tcp_prefix(&prefix) {
+                if let Some((addr, used)) =
+                    ferrox_core::hysteria::decode_tcp_request(&prefix[consumed..])
+                {
+                    return (addr.to_owned(), prefix[consumed + used..].to_vec());
+                }
             }
         }
     }
@@ -9791,7 +9896,6 @@ mod tests {
 
     fn hysteria_client_once() {
         let echo_port = echo_once();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
@@ -9832,15 +9936,23 @@ mod tests {
             while let Ok((written, info)) = conn.send(&mut out) {
                 sock.send_to(&out[..written], info.to).expect("answers");
             }
-            let rest = hysteria_test_read_prefix(&mut conn, &sock, local, &mut out);
+            let rest = hysteria_test_read_request(&mut conn, &sock, local, &mut out);
+            let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+            assert_eq!(rest.0, target.to_string(), "address arrives as text");
+            let mut answer = Vec::new();
+            assert!(ferrox_core::hysteria::encode_tcp_response(true, "", &[], &mut answer));
+            conn.stream_send(4, &answer, true).expect("answers");
+            while let Ok((written, info)) = conn.send(&mut out) {
+                sock.send_to(&out[..written], info.to).expect("answers");
+            }
             let flow = crate::hysteria::Flow::from_parts(
                 Arc::new(Mutex::new(conn)),
                 Arc::new(sock),
                 local,
                 4,
-                rest,
+                rest.1,
             );
-            serve_vless_hysteria(flow, &id, true);
+            serve_hysteria(flow, &target, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let dial = crate::hysteria::Dial {
@@ -9856,8 +9968,7 @@ mod tests {
         let Some(session) = crate::hysteria::connect(&dial) else {
             panic!("client connects");
         };
-        let header = vless_header(&id, 1, &target);
-        let Some(mut flow) = crate::hysteria::open_flow(&session, &header) else {
+        let Some(mut flow) = crate::hysteria::open_flow(&session, &target) else {
             panic!("flow opens");
         };
         flow.write_all(b"ping").expect("writes");
@@ -9875,8 +9986,7 @@ mod tests {
     fn hysteria_server_once() {
         use ferrox_core::foxy::frames as h3;
         let echo_port = echo_once();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("bisect2-auth", id);
+        let (port, roots) = hysteria_loop_with("bisect2-auth");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
@@ -9917,16 +10027,26 @@ mod tests {
             }
         };
         assert!(ferrox_core::hysteria::verify_auth_response(&body));
-        let header = vless_header(&id, 1, &target);
-        let mut prefix = Vec::with_capacity(2 + header.len());
+        let mut prefix = Vec::new();
         ferrox_core::hysteria::tcp_prefix(&mut prefix);
-        prefix.extend_from_slice(&header);
+        assert!(ferrox_core::hysteria::encode_tcp_request(
+            &target.to_string(),
+            &[0u8; 64],
+            &mut prefix
+        ));
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 4, &prefix, false, horizon
         ));
-        let reply = crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 2, horizon)
-            .expect("replies");
-        assert_eq!(reply.as_slice(), &[0, 0]);
+        let mut head = Vec::new();
+        let ok = loop {
+            let piece = crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 1, horizon)
+                .expect("replies");
+            head.extend_from_slice(&piece);
+            if let Some((ok, _, _)) = ferrox_core::hysteria::decode_tcp_response(&head) {
+                break ok;
+            }
+        };
+        assert!(ok, "server answers ok");
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 4, b"ping", false, horizon
         ));
@@ -9936,17 +10056,16 @@ mod tests {
     }
 
     #[test]
-    fn hysteria_carries_vless_echo_over_loopback() {
+    fn hysteria_carries_tcp_echo_over_loopback() {
         let _serial = quic_serial();
         quic_retry_dial(hysteria_echo_once, 3);
     }
 
     fn hysteria_echo_once() {
         let echo_port = echo_once();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let (port, roots) = hysteria_loop_with("test-auth");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut client = hysteria_tcp_pair(port, roots, "test-auth", id, target);
+        let mut client = hysteria_tcp_pair(port, roots, "test-auth", target);
         client.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
@@ -9961,12 +10080,129 @@ mod tests {
 
     fn hysteria_refuses_once() {
         let echo_port = echo_once();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let (port, roots) = hysteria_loop_with("test-auth");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut client = hysteria_tcp_pair(port, roots, "wrong-auth", id, target);
+        let mut client = hysteria_tcp_pair(port, roots, "wrong-auth", target);
         let mut probe = [0u8; 1];
         assert_eq!(client.read(&mut probe).expect("reads"), 0);
+    }
+
+    fn udp_echo_once() -> u16 {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
+    fn hysteria_udp_dial(port: u16, roots: Vec<Vec<u8>>, auth: &str) -> crate::hysteria::UdpLink {
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                auth: auth.to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+            },
+            roots: Some(roots),
+        };
+        crate::hysteria::connect_udp(&dial).expect("associates")
+    }
+
+    #[test]
+    fn hysteria_carries_udp_echo_over_loopback() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_udp_echo_once, 3);
+    }
+
+    fn hysteria_udp_echo_once() {
+        let echo_port = udp_echo_once();
+        let (port, roots) = hysteria_loop_with("test-auth");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut link = hysteria_udp_dial(port, roots, "test-auth");
+        let horizon = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let id = link.next_session();
+        assert!(link.send(id, &target.to_string(), b"ping"));
+        let (back_id, back) = link.recv(horizon).expect("echoes");
+        assert_eq!(back_id, id);
+        assert_eq!(back.as_slice(), b"ping");
+        let big = vec![0x5au8; 4000];
+        let frag_id = link.next_session();
+        assert!(link.send(frag_id, &target.to_string(), &big));
+        let (frag_back_id, frag_back) = link.recv(horizon).expect("reassembles");
+        assert_eq!(frag_back_id, frag_id);
+        assert_eq!(frag_back, big);
+    }
+
+    #[test]
+    fn hysteria_socks_udp_reaches_echo() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_socks_udp_once, 3);
+    }
+
+    fn hysteria_socks_udp_once() {
+        let echo_port = udp_echo_once();
+        let (port, roots) = hysteria_loop_with("test-auth");
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                auth: "test-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+            }),
+            host: "localhost".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: Some(roots),
+        });
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut datagram = vec![0u8, 0, 0];
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"ping");
     }
 
     fn echo_once() -> u16 {
