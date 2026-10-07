@@ -1,3 +1,4 @@
+mod foxy;
 mod grpc;
 mod httpheader;
 mod httpupgrade;

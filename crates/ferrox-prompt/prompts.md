@@ -660,94 +660,42 @@ Two streams already share one handshake through `dial_pooled`, proved by the soc
 Then earn the gate the hard way: three consecutive green `ci.yml` runs with no change to either file between them. A socket test that passes twice and fails the third is testing the scheduler, and the fix is in the test's determinism, not in its budget.
 ```
 
-## P31 · Put the security layer outside the carrier, where both references put it
+## P36 · Prove the Foxy QUIC lane over a socket, not over a codec
 
-**When to use:** When a `security: tls` or `security: reality` row over a stream carrier is next to carry, and a real Xray peer cannot complete the handshake: this tree serves the carrier first and runs the TLS session inside it, where both references run TLS first and build the carrier on top.
-**Status:** todo
-**Leverage:** 5
-**Effort:** large
-**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with the `ws_tls`, `httpupgrade_tls` and `grpc_tls` rows executed against `ferrox-app`
-**Touches:** crates/ferrox-app/src/proxy.rs, crates/ferrox-app/src/ws.rs, crates/ferrox-app/src/httpupgrade.rs, crates/ferrox-app/src/grpc.rs, crates/ferrox-app/src/xhttp.rs
-**Random weight:** 4
-
-```text
-The ordering is the whole bug and it is why the TLS rows are the ones that stay red. In `upstream/xray-core/transport/internet/websocket/hub.go` the listener is wrapped with `tls.NewListener` before the HTTP server sees a byte, and in `transport/internet/tcp/hub.go` each accepted connection is wrapped with `tls.Server` before the header authenticator runs; the dial side does the same, `internet.DialSystem` then the security conn then the transport dialer. This tree does it backwards: `serve_vless_tls` calls `crate::ws::accept`/`crate::grpc::accept` on the raw socket and then hands the carrier's reader and writer to `ferrox_core::tls::accept`, so the bytes on the wire are `HTTP/1.1 101` first and TLS records second. No Xray client opens with a plain HTTP request, so no Xray client completes; the same inversion is why no config path dials a TLS or REALITY outbound at all.
-
-The obstacle is structural, not conceptual: the carrier `accept` functions take `TcpStream` because they split it with `try_clone`, set read timeouts, and peek. Push the security layer outside and they have to accept a `Read + Write` stream whose reader and writer are the same object — the seam `serve_carried_tls` already proves is possible, in the other direction. Count what that costs: one split abstraction and one trait bound per carrier, against a family of rows that currently cannot connect.
-
-Do not carry both orders. A build that can serve carrier-inside-TLS and TLS-inside-carrier is two protocols wearing one config key, and the wrong one is the one a user's client will pick. The references agree on the order, so this tree agrees with them or it refuses the cell by name.
-
-Prove the new order with a loopback pair in each direction and name the conformance rows it earns. REALITY is the same move with a different handshake, so one seam should carry both.
-```
-
-## P32 · Carry Hysteria, the first transport the pinned Xray-core has and this tree knows only by name
-
-**When to use:** When a Hysteria row is next: `TransportKind::Hysteria` gives it a verdict in the link table and there is no implementation behind it, while the reference accepts `hysteria` and builds it on QUIC with its own congestion control.
-**Status:** todo
+**When to use:** When `foxy` with `carrier: h3` is selected and the only green checks are the header-block codec: the lane builds a QPACK CONNECT and reads a status, but nothing has carried a tunnel over a real QUIC connection.
+**Status:** doing
 **Leverage:** 3
-**Effort:** large
-**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with a `hysteria` row executed against `ferrox-app`
-**Touches:** crates/ferrox-core/src/transport.rs, crates/ferrox-app/src/proxy.rs
-**Random weight:** 2
-
-```text
-The accepted set is in `upstream/xray-core/infra/conf/transport_internet.go`: tcp, splithttp, mkcp, grpc, websocket, httpupgrade, hysteria, masque, xdrive. This tree implements all but the last three, and this is the first of them. Read `upstream/xray-core/transport/internet/hysteria/` for the framing and the congestion loop, then write the smaller thing — the pinned `upstream/quiche` is the QUIC stack, and the cryptography is `rustls` in `ferrox-core`, not a second TLS.
-
-The obstacle is structural and all three of these rungs meet it: `crates/ferrox-app/src/quic.rs` is a client with a pool and no listener, and a carrier that owns its own congestion loop needs a server role the app does not have. Decide in the report whether one QUIC listener is shared by hysteria, masque and xdrive or whether each writes its own, because a second QUIC stack is the debt this repository refuses to land.
-
-Report the rows this earns and the rows that stay refused, each with its reason. A refusal that names itself is a verdict; the refusal this slice replaces is a name with nothing behind it.
-```
-
-## P33 · Carry MASQUE CONNECT-IP
-
-**When to use:** When the MASQUE row is next: RFC 9484 CONNECT-IP is named in the treemap, `Carrier::Masque` sits in the refused set, and the reference accepts `masque` over HTTP/3.
-**Status:** todo
-**Leverage:** 3
-**Effort:** large
-**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with a `masque` row executed against `ferrox-app`
-**Touches:** crates/ferrox-app/src/quic.rs, crates/ferrox-app/src/proxy.rs
-**Random weight:** 1
-
-```text
-HTTP/3 with CONNECT-IP capsules, and `quiche` is already pinned as the stack for this rung. Read `upstream/xray-core/transport/internet/masque/` for the capsule framing before writing anything, and read `crates/ferrox-app/src/quic.rs` for what a `quiche` driver in this tree already looks like, so the new one is that shape rather than a second dialect beside it.
-
-The UDP half is not optional: CONNECT-IP carries datagrams, and outside the mux this tree's UDP support is raw-carrier only. That is the part of this rung the mux does not cover, and it is the part to size before starting.
-
-Name the modes implemented and the modes refused. One mode that carries a datagram is further along than a stub that reports the row green.
-```
-
-## P34 · Carry xdrive
-
-**When to use:** When the xdrive row is next: it parses to a verdict and refuses, while the reference accepts `xdrive` and has an implementation directory behind it.
-**Status:** todo
-**Leverage:** 2
-**Effort:** large
-**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with an `xdrive` row executed against `ferrox-app`
-**Touches:** crates/ferrox-core/src/transport.rs, crates/ferrox-app/src/proxy.rs
-**Random weight:** 1
-
-```text
-Read `upstream/xray-core/transport/internet/xdrive/` and the `xdriveSettings` key this tree already reads for its `host` only. Do not schedule it ahead of P32 and P33: all three are the same structural question — a QUIC-family carrier with no listener in this tree — and answering it once is what keeps this from being three stacks.
-
-If the reading says this one is not a QUIC carrier, say so in the report and the `**Touches:**` of this section changes; a name is not evidence about its wire format.
-```
-
-## P35 · Decide whether `quic` stays a transport this tree dials
-
-**When to use:** When the drop-in claim is next examined: the pinned Xray-core refuses the QUIC transport by name at config load, while this tree dials it and the link table calls it implemented.
-**Status:** todo
-**Leverage:** 4
 **Effort:** medium
-**Gates:** `cargo test --workspace`; `cargo run -p ferrox-app -- check "<a type=quic link>"` printing the verdict this row should carry
-**Touches:** crates/ferrox-core/src/transport.rs, crates/ferrox-app/src/proxy.rs, README.md
-**Random weight:** 2
+**Gates:** `cargo test -p ferrox-app foxy`; `cargo run -p ferrox-prompt -- check`
+**Depends on:** P29
+**Touches:** crates/ferrox-app/src/foxy.rs
+**Random weight:** 1
 
 ```text
-Three things disagree today. `upstream/xray-core/infra/conf/transport_internet.go` answers `case "quic":` with `PrintRemovedFeatureError("QUIC transport (without web service, etc.)", ...)`, so a real Xray-core refuses the transport rather than serving it. `TransportKind::is_dialled()` lists `Quic`, so `VlessLink::support()` reports `Implemented { method: "vless-quic" }`. `Carrier::Quic` is in `refused_carriers!()`, so the server role refuses what the client role dials, and the dial is reachable only from a SOCKS inbound without Mux.
+The lane's request half is already proven: `ferrox_core::foxy::hpack` reproduces the exact QPACK block the edge must read, byte for byte. What is not green is the response half — an in-process QUIC edge that answers one request stream has not yet got its `:status` back through `H3::read_head`, and a red test in this tree blocks every other slice.
 
-Pick the direction and say why. Either the transport is one this tree drops, in which case `is_dialled` loses a variant and `refused_carriers!()` keeps it, or it stays, in which case the claim it carries has to be narrower than `Implemented` — the reference states the replacement in the same error it uses to refuse, and a drop-in that accepts a config the reference rejects is a difference a user meets as a bug.
+Take the loopback edge the way `quic.rs` takes its own: accept on a loopback UDP socket, drive the handshake, answer the request stream, echo what follows. Then the QUIC lane has the same three proofs the TCP carriers have — the block on the wire, a 2xx opening the tunnel, and the bytes after it — and the carrier stops being a claim.
 
-Whichever way it goes, delete the disagreement rather than documenting it: one place that decides, and the other two reading it.
+Do not widen this into a QUIC failover study. One connection, one stream, one status, one echo; anything the loopback exposes beyond that belongs to the next slice.
+```
+
+## P37 · Mint the Foxy pass: FxA login and the Guardian token
+
+**When to use:** When the Foxy lane is in tree but every pass is still pasted into the config: the dial is proven, the account that authorises it is not.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; `cargo run -p ferrox-prompt -- check`
+**Depends on:** P36
+**Touches:** +crates/ferrox-core/src/foxy/account.rs, crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+The lane takes a pass as input today and that is the whole gap. What a real client owes is the FxA login — the stretched password, the Hawk-signed requests, the the two-factor branch — and the Guardian call that turns an access token into a proxy pass with an expiry the renewal clock already knows how to read.
+
+The pinned references already say where every byte goes: `POST /account/login`, `POST /oauth/token` with `fxa-credentials` and then `refresh_token`, `GET /api/v1/fpn/token`, and the `406` challenge the edge answers with `/_fs-ch-` before it will serve an account. That challenge is a bot defence, not a protocol step: if the slice lands without it, the lane must refuse the `406` with the reason named rather than retrying blind, and the next slice can decide whether the defence is worth implementing.
+
+Nothing here may print a token, and the pinned upstream trees are for reading: learn the request shapes and write the smaller client.
 ```
 
 ## Reading this file as a roadmap

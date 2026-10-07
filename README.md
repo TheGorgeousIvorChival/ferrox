@@ -148,7 +148,7 @@ Custom ARQ, ~5–7 B header overhead, session multiplexing, compatibility kept a
 | # | method | state | learned from |
 | --- | --- | --- | --- |
 | 58 | Free HTTPS-proxy lane: anonymous `POST /v3/launch/` mints a token, server list yields HTTPS proxies exported as `http://` URIs + Clash/sing-box profiles | planned | configer |
-| 59 | Foxy lane: FxA account + Guardian proxy-pass over a Fastly H2 CONNECT edge, country-pinned at dial, Bearer rotation, failover, SPKI pins, split-tunnel | planned | configer |
+| 59 | Foxy lane: CONNECT to an account's edge over HTTP/1.1, HTTP/2 or HTTP/3, country-pinned at dial, per-flow Bearer, failover inside the country, SPKI pins, split-tunnel | in tree — H1/H2 loopback-proven (`cargo test -p ferrox-app foxy`), the QUIC lane's codec proven and its socket proof open (`P36`); the FxA/Guardian mint is `P37` | configer, FoxyVPN |
 
 ### G — chaining: lanes stack, not just single dials
 
