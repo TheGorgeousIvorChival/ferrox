@@ -89,7 +89,7 @@ fn try_carrier(
         port: edge.port,
         address: None,
         carrier,
-        roots: Vec::new(),
+        roots: crate::quic::system_roots(),
         pins: ferrox_core::foxy::pin::Pins::default(),
         pass: pass.clone(),
     };
@@ -157,7 +157,7 @@ fn the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers() {
     );
     println!("pass minted, quota left {:?}", pass.quota_remaining);
 
-    let edges = crate::foxy_catalog::edges(Vec::new());
+    let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
     let picked = ferrox_core::foxy::catalog::tier(&edges, &country, "", 3);
     assert!(
         !picked.is_empty(),
@@ -196,7 +196,7 @@ fn the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers() {
 #[ignore = "needs the network; run by foxy-live.yml"]
 fn the_quic_lane_reaches_the_edge_over_udp_or_says_why_not() {
     let country = std::env::var("FOXY_COUNTRY").unwrap_or_else(|_| "US".to_owned());
-    let edges = crate::foxy_catalog::edges(Vec::new());
+    let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
     let picked = ferrox_core::foxy::catalog::tier(&edges, &country, "", 1);
     let Some(edge) = picked.first() else {
         panic!("the catalogue publishes no edge for {country}");

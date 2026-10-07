@@ -421,6 +421,32 @@ pub(crate) fn stream_recv_exact(
     (out.len() == want).then_some(out)
 }
 
+/// The trust anchors this machine trusts, read from the bundle the platform
+/// ships rather than from a new dependency.
+///
+/// A lane that dials a pinned address with its own CA never needs these; a lane
+/// that talks to a publicly trusted host cannot work without them, because an
+/// empty root store is not "trust the platform" — it is trust nothing. The
+/// bundles are unix paths: on Windows the store is not a file, and `caCertFile`
+/// is where a Windows user names their anchors.
+pub(crate) fn system_roots() -> Vec<Vec<u8>> {
+    const BUNDLES: [&str; 4] = [
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+    ];
+    for path in BUNDLES {
+        if let Ok(pem) = std::fs::read(path) {
+            let roots = parse_ca_pem(&pem);
+            if !roots.is_empty() {
+                return roots;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Binds a datagram socket that QUIC will read one packet at a time.
 ///
 /// Linux coalesces loopback datagrams into a single skb, so one `recv_from`
@@ -960,6 +986,17 @@ pub(crate) fn server_config(alpn: &[u8]) -> quiche::Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The anchors this machine trusts come from the platform bundle, so a lane
+    /// that talks to a publicly trusted host is not trusting nothing.
+    #[test]
+    fn the_platform_bundle_is_read_into_trust_anchors() {
+        let roots = system_roots();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(roots.len() > 50, "a bundle with {} anchors", roots.len());
+        }
+        assert_eq!(parse_ca_pem(b"not a pem at all"), Vec::<Vec<u8>>::new());
+    }
 
     /// The option this socket is read under is the whole reason the edge stops
     /// losing packets, so it is read back rather than assumed.

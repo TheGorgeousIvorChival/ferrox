@@ -22,3 +22,4 @@ upstream/*
 __pycache__/
 *.pyc
 /.obsidian
+/.claude

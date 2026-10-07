@@ -4969,12 +4969,17 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         }
         let country = foxy_country(&link, settings);
         let city = foxy_text_or(&link, settings, "city").to_ascii_uppercase();
+        // A CA file names the anchors to trust; without one the lane trusts the
+        // anchors this machine already trusts, because an empty root store is
+        // not "trust the platform" — it is trust nothing, and the account plane
+        // is publicly trusted.
         let roots = settings
             .and_then(|s| s.get("caCertFile"))
             .and_then(Json::as_str)
             .and_then(|path| std::fs::read(path).ok())
             .map(|pem| crate::quic::parse_ca_pem(&pem))
-            .unwrap_or_default();
+            .filter(|roots: &Vec<Vec<u8>>| !roots.is_empty())
+            .unwrap_or_else(crate::quic::system_roots);
         let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
         // An edge the config or the link names outright is dialed whatever the
         // catalogue publishes, because naming one is a decision and guessing is
