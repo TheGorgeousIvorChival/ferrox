@@ -56,6 +56,7 @@ graph TD
 | tcp-flows-per-handshake | 1 | ferrox-app-proxy::tests::hysteria_carries_vless_echo_over_loopback |
 | wrong-password-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying |
 | non-v2-configs-carried | 0 | ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks |
+| udp-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none |
 | pinned-hysteria-client-verdicts | 1 | scripts/run-upstream-suite.sh |
 <!-- counts:end -->
 
@@ -89,6 +90,9 @@ tunnel. No artefact from this branch has been read.
 - **A custom brutal sender.** `brutal` and `force-brutal` pace as quiche `bbr`
   (`Congestion::quiche_name`), stated in the settings test. That is a
   narrower congestion loop, not a second implementation of one.
+- **Rate-capped pacing.** `up_mbps`/`down_mbps` are never read; flows pace by
+  quiche `bbr` uncapped, which is wire-compatible with a capped peer and
+  differs only in throughput, so the keys stay accepted-and-ignored.
 - **A per-chunk relay clone.** The relay direction held its `Flow` behind one
   clone for the whole direction rather than cloning the backlog `Vec` per
   16 KiB chunk.
