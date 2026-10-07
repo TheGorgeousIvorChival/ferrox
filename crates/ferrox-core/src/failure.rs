@@ -375,6 +375,7 @@ mod tests {
             TransportKind::Quic => "quic",
             TransportKind::HttpUpgrade => "httpupgrade",
             TransportKind::Kcp => "kcp",
+            TransportKind::Http => "http",
             TransportKind::Hysteria => "hysteria",
             TransportKind::Masque => "masque",
             TransportKind::Xdrive => "xdrive",

@@ -9,6 +9,7 @@ pub enum TransportKind {
     Quic,
     HttpUpgrade,
     Kcp,
+    Http,
     Hysteria,
     Masque,
     Xdrive,
@@ -16,7 +17,7 @@ pub enum TransportKind {
 }
 
 impl TransportKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Tcp,
         Self::Ws,
         Self::Xhttp,
@@ -24,6 +25,7 @@ impl TransportKind {
         Self::Quic,
         Self::HttpUpgrade,
         Self::Kcp,
+        Self::Http,
         Self::Hysteria,
         Self::Masque,
         Self::Xdrive,
@@ -42,6 +44,7 @@ impl TransportKind {
             "quic" => Self::Quic,
             "httpupgrade" => Self::HttpUpgrade,
             "kcp" | "mkcp" => Self::Kcp,
+            "http" | "h2" | "h3" => Self::Http,
             "hysteria" => Self::Hysteria,
             "masque" => Self::Masque,
             "xdrive" => Self::Xdrive,

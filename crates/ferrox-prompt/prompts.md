@@ -680,6 +680,76 @@ Do not carry both orders. A build that can serve carrier-inside-TLS and TLS-insi
 Prove the new order with a loopback pair in each direction and name the conformance rows it earns. REALITY is the same move with a different handshake, so one seam should carry both.
 ```
 
+## P32 · Carry Hysteria, the first transport the pinned Xray-core has and this tree knows only by name
+
+**When to use:** When a Hysteria row is next: `TransportKind::Hysteria` gives it a verdict in the link table and there is no implementation behind it, while the reference accepts `hysteria` and builds it on QUIC with its own congestion control.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with a `hysteria` row executed against `ferrox-app`
+**Touches:** crates/ferrox-core/src/transport.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 2
+
+```text
+The accepted set is in `upstream/xray-core/infra/conf/transport_internet.go`: tcp, splithttp, mkcp, grpc, websocket, httpupgrade, hysteria, masque, xdrive. This tree implements all but the last three, and this is the first of them. Read `upstream/xray-core/transport/internet/hysteria/` for the framing and the congestion loop, then write the smaller thing — the pinned `upstream/quiche` is the QUIC stack, and the cryptography is `rustls` in `ferrox-core`, not a second TLS.
+
+The obstacle is structural and all three of these rungs meet it: `crates/ferrox-app/src/quic.rs` is a client with a pool and no listener, and a carrier that owns its own congestion loop needs a server role the app does not have. Decide in the report whether one QUIC listener is shared by hysteria, masque and xdrive or whether each writes its own, because a second QUIC stack is the debt this repository refuses to land.
+
+Report the rows this earns and the rows that stay refused, each with its reason. A refusal that names itself is a verdict; the refusal this slice replaces is a name with nothing behind it.
+```
+
+## P33 · Carry MASQUE CONNECT-IP
+
+**When to use:** When the MASQUE row is next: RFC 9484 CONNECT-IP is named in the treemap, `Carrier::Masque` sits in the refused set, and the reference accepts `masque` over HTTP/3.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with a `masque` row executed against `ferrox-app`
+**Touches:** crates/ferrox-app/src/quic.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+HTTP/3 with CONNECT-IP capsules, and `quiche` is already pinned as the stack for this rung. Read `upstream/xray-core/transport/internet/masque/` for the capsule framing before writing anything, and read `crates/ferrox-app/src/quic.rs` for what a `quiche` driver in this tree already looks like, so the new one is that shape rather than a second dialect beside it.
+
+The UDP half is not optional: CONNECT-IP carries datagrams, and outside the mux this tree's UDP support is raw-carrier only. That is the part of this rung the mux does not cover, and it is the part to size before starting.
+
+Name the modes implemented and the modes refused. One mode that carries a datagram is further along than a stub that reports the row green.
+```
+
+## P34 · Carry xdrive
+
+**When to use:** When the xdrive row is next: it parses to a verdict and refuses, while the reference accepts `xdrive` and has an implementation directory behind it.
+**Status:** todo
+**Leverage:** 2
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with an `xdrive` row executed against `ferrox-app`
+**Touches:** crates/ferrox-core/src/transport.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+Read `upstream/xray-core/transport/internet/xdrive/` and the `xdriveSettings` key this tree already reads for its `host` only. Do not schedule it ahead of P32 and P33: all three are the same structural question — a QUIC-family carrier with no listener in this tree — and answering it once is what keeps this from being three stacks.
+
+If the reading says this one is not a QUIC carrier, say so in the report and the `**Touches:**` of this section changes; a name is not evidence about its wire format.
+```
+
+## P35 · Decide whether `quic` stays a transport this tree dials
+
+**When to use:** When the drop-in claim is next examined: the pinned Xray-core refuses the QUIC transport by name at config load, while this tree dials it and the link table calls it implemented.
+**Status:** todo
+**Leverage:** 4
+**Effort:** medium
+**Gates:** `cargo test --workspace`; `cargo run -p ferrox-app -- check "<a type=quic link>"` printing the verdict this row should carry
+**Touches:** crates/ferrox-core/src/transport.rs, crates/ferrox-app/src/proxy.rs, README.md
+**Random weight:** 2
+
+```text
+Three things disagree today. `upstream/xray-core/infra/conf/transport_internet.go` answers `case "quic":` with `PrintRemovedFeatureError("QUIC transport (without web service, etc.)", ...)`, so a real Xray-core refuses the transport rather than serving it. `TransportKind::is_dialled()` lists `Quic`, so `VlessLink::support()` reports `Implemented { method: "vless-quic" }`. `Carrier::Quic` is in `refused_carriers!()`, so the server role refuses what the client role dials, and the dial is reachable only from a SOCKS inbound without Mux.
+
+Pick the direction and say why. Either the transport is one this tree drops, in which case `is_dialled` loses a variant and `refused_carriers!()` keeps it, or it stays, in which case the claim it carries has to be narrower than `Implemented` — the reference states the replacement in the same error it uses to refuse, and a drop-in that accepts a config the reference rejects is a difference a user meets as a bug.
+
+Whichever way it goes, delete the disagreement rather than documenting it: one place that decides, and the other two reading it.
+```
+
 ## Reading this file as a roadmap
 
 The graph is the point, and it is not a decoration: `ferrox-prompt next` ranks ready slices by leverage, breaks ties towards the smaller one, leaves out the ones waiting on a decision, and reports what each slice unblocks. `P21` waits on `P18`, which waits on `P17`, which waits on `P7` — the longest chain in the file, which is the kind of thing that is obvious once and invisible otherwise.
