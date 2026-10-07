@@ -542,15 +542,11 @@ fn carrier_method(kind: TransportKind) -> Option<&'static str> {
 }
 
 fn validate_uuid(uuid: &str) -> Result<(), VlessError> {
-    let parts: Vec<&str> = uuid.split('-').collect();
-    if parts.len() != 5
-        || parts[0].len() != 8
-        || parts[1].len() != 4
-        || parts[2].len() != 4
-        || parts[3].len() != 4
-        || parts[4].len() != 12
-        || !uuid.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
-    {
+    let b = uuid.as_bytes();
+    if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+        return Err(VlessError::Uuid);
+    }
+    if !b.iter().all(|c| *c == b'-' || c.is_ascii_hexdigit()) {
         return Err(VlessError::Uuid);
     }
     Ok(())
@@ -593,12 +589,9 @@ fn uuid_bytes(uuid: &str) -> [u8; 16] {
         if c == b'-' {
             continue;
         }
-        let (v, ok) = match c {
-            b'0'..=b'9' => (c - b'0', true),
-            b'a'..=b'f' => (c - b'a' + 10, true),
-            b'A'..=b'F' => (c - b'A' + 10, true),
-            _ => (0, false),
-        };
+        let v = HEX[c as usize];
+        let ok = v != 0xFF;
+        let v = if ok { v } else { 0 };
         if let Some((h, hok)) = hi.take() {
             if idx < 16 {
                 out[idx] = if hok && ok { (h << 4) | v } else { 0 };

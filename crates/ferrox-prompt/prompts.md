@@ -747,10 +747,62 @@ Three things disagree today. `upstream/xray-core/infra/conf/transport_internet.g
 
 Pick the direction and say why. Either the transport is one this tree drops, in which case `is_dialled` loses a variant and `refused_carriers!()` keeps it, or it stays, in which case the claim it carries has to be narrower than `Implemented` — the reference states the replacement in the same error it uses to refuse, and a drop-in that accepts a config the reference rejects is a difference a user meets as a bug.
 
+The ALPN is part of that answer and is measured here, not assumed. `crates/ferrox-app/src/quic.rs` offers `h3` and then writes a VLESS request header as the first bytes of the stream, which is not an HTTP/3 frame; `crates/ferrox-app/src/proxy.rs` now asserts the negotiated application protocol against what the carrier offers, because both sides used to set `h3` and nothing checked that anything was negotiated. Offering no ALPN at all fails the handshake and turns all four QUIC socket tests red, so an ALPN is required and its value is a decision: speak HTTP/3, name the raw-stream carrier honestly, or drop the transport.
+
 Whichever way it goes, delete the disagreement rather than documenting it: one place that decides, and the other two reading it.
 ```
 
-## P36 · Prove the Foxy QUIC lane over a socket, not over a codec
+## P36 · Give the KCP config a consumer or stop naming the knobs
+
+**When to use:** When `Carrier::Kcp` is next asked for its settings: `proxy.rs` reads `kcpSettings` only for `host`, which is not an mKCP setting, so `mtu`, `tti`, `uplinkCapacity`, `downlinkCapacity`, `cwndMultiplier` and `maxSendingWindow` are unreachable from any config file, and the `Config` arithmetic that would consume them has no validator anywhere in the tree.
+**Status:** todo
+**Leverage:** 3
+**Effort:** small
+**Gates:** `cargo test --workspace`
+**Depends on:** P29
+**Touches:** crates/ferrox-app/src/proxy.rs, crates/ferrox-core/src/kcp/config.rs
+**Random weight:** 2
+
+```text
+Parsing the six knobs before there is a dial path that uses them is a second way of reading a config, and `prompts.md` currently claims `Carrier::Kcp` "parses their settings" when it parses none of them. Either this slice parses all six into `ferrox_core::kcp::Config` and P29 hands that config to `Connection::new`, or it corrects the sentence in `prompts.md` and leaves the struct to P29. Say which.
+
+Where the validation goes is upstream's answer read rather than invented: `infra/conf/transport_method.go:562-573` rejects `mtu < 21`, `tti` outside 10 to 1000, `cwndMultiplier < 1` and a `maxSendingWindow` below one MTU, in the config builder and not in the KCP package. Those four bounds are exactly the ones that keep `Config`'s derived sizes total, and `crates/ferrox-core/src/kcp/config.rs` now saturates instead of panicking, so the bounds are a rejection policy rather than a memory-safety requirement. Decide which this tree wants, because a setting that silently saturates and a setting that is refused are different user experiences.
+```
+
+## P37 · Cover the KCP connection, not only its arithmetic
+
+**When to use:** When the next KCP change touches `connection.rs`: the oracle proves `SendingWindow`, `AckList`, `RoundTripInfo` and three serializers against the captured Go output, and proves nothing about the state machine, `flush`, `Ping`, `Terminate`, deadlines, or `read_segment` in the parse direction, which is only ever self-round-tripped.
+**Status:** todo
+**Leverage:** 4
+**Effort:** medium
+**Gates:** `cargo test --workspace`; `cargo run -p ferrox-core --example kcp_interop`
+**Touches:** scripts/kcp-oracle/main.go, scripts/kcp-oracle/expected.txt, crates/ferrox-core/src/kcp/oracle.rs, scripts/check.sh
+**Random weight:** 4
+
+```text
+Three holes are named by reading `oracle.rs` against the Go harness. `RoundTripInfo::default()` gives `min_rtt = 0` where `Connection::new` uses `RoundTripInfo::new(config.tti)`, so the `srtt < minRtt` clamp and the `minRtt < 4*variation` branch never run, and `on_packet_loss`'s `Timeout() == 0` guard always trips. `al_flush` passes `(1350 - 17) / 4` as a literal rather than going through the `mtu = mss + 18` and `limit = (mtu - 17) / 4` derivation `ReceivingWorker` uses, so a change to either leaves the oracle green. And `scripts/kcp-oracle/interop/main.go`, the Go echo server and client that would compare bytes over a real socket, is referenced by nothing: no script, no workflow, no `Cargo.toml` target.
+
+Drive the estimator through the constructor the connection uses, derive the ack limit through `ReceivingWorker`, and put `interop/main.go` behind the same command that runs `crates/ferrox-core/examples/kcp_interop.rs`. Then the four bugs this tree's own suite found — the double ping, the missing wakeup, the close deadlock and the payload copy on a discarded segment — were all reachable by a rule that already existed, and the next one will be too.
+```
+
+## P38 · Give the pooled QUIC connection an owner that lets it go
+
+**When to use:** When the next QUIC slice reads `quic.rs`: the pool is a process-global `OnceLock` keyed by `(address, port, host, roots)` with no eviction and no target or user in the key, so a connection outlives its last session for the life of the process, and `pump` holds the connection mutex across a `recv_from` that waits up to 500 ms.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace` green on three consecutive `ci.yml` runs
+**Depends on:** P30
+**Touches:** crates/ferrox-app/src/quic.rs
+**Random weight:** 2
+
+```text
+Two costs and one hang, in order of how much they cost a user. A pooled entry is removed only by `leave_session` when the last session ends, so a connection whose sessions all ended closes, but one opened with zero sessions and never re-entered sits in the map with an idle timeout ticking; key it by target and user id as well as server, and let the idle timeout be the reaper rather than a second thread. The `pump` lock is held across `pump_once`, which blocks in `recv_from` for up to `PUMP_POLL`, so a stalled peer stalls every other session sharing that connection; take the connection out of the lock, poll, and take it again, which is the same shape `quiche`'s `poll` wants. And `leave_session` flushes egress once and drops, so a lost CONNECTION_CLOSE leaves the peer to time out.
+
+P30 wants the pool proved under an adversarial packet layer. This slice is what that proof should be pointed at, because a share that cannot be released is not a share a test can schedule around.
+```
+
+## P39 · Prove the Foxy QUIC lane over a socket, not over a codec
 
 **When to use:** When `foxy` with `carrier: h3` is selected and the only green checks are the header-block codec: the lane builds a QPACK CONNECT and reads a status, but nothing has carried a tunnel over a real QUIC connection.
 **Status:** doing
@@ -769,14 +821,14 @@ Take the loopback edge the way `quic.rs` takes its own: accept on a loopback UDP
 Do not widen this into a QUIC failover study. One connection, one stream, one status, one echo; anything the loopback exposes beyond that belongs to the next slice.
 ```
 
-## P37 · Mint the Foxy pass: FxA login and the Guardian token
+## P40 · Mint the Foxy pass: FxA login and the Guardian token
 
 **When to use:** When the Foxy lane is in tree but every pass is still pasted into the config: the dial is proven, the account that authorises it is not.
 **Status:** todo
 **Leverage:** 3
 **Effort:** large
 **Gates:** `cargo test --workspace`; `cargo run -p ferrox-prompt -- check`
-**Depends on:** P36
+**Depends on:** P39
 **Touches:** +crates/ferrox-core/src/foxy/account.rs, crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/proxy.rs
 **Random weight:** 1
 
@@ -786,6 +838,7 @@ The lane takes a pass as input today and that is the whole gap. What a real clie
 The pinned references already say where every byte goes: `POST /account/login`, `POST /oauth/token` with `fxa-credentials` and then `refresh_token`, `GET /api/v1/fpn/token`, and the `406` challenge the edge answers with `/_fs-ch-` before it will serve an account. That challenge is a bot defence, not a protocol step: if the slice lands without it, the lane must refuse the `406` with the reason named rather than retrying blind, and the next slice can decide whether the defence is worth implementing.
 
 Nothing here may print a token, and the pinned upstream trees are for reading: learn the request shapes and write the smaller client.
+
 ```
 
 ## Reading this file as a roadmap

@@ -70,7 +70,7 @@ fn pool() -> &'static QuicPool {
     })
 }
 
-const ALPN_H3: &[u8] = b"h3";
+pub(crate) const ALPN: &[u8] = b"h3";
 
 const SCID_LEN: usize = 16;
 
@@ -230,15 +230,32 @@ pub(crate) fn parse_ca_pem(pem: &[u8]) -> Vec<Vec<u8>> {
     certs
 }
 
-fn stage_trust_file(bundle: &[u8]) -> Option<std::path::PathBuf> {
+// create_new is O_EXCL, so a name already sitting in a shared tmp is a failure
+// rather than a file to truncate; following one would hand BoringSSL a trust
+// bundle this process did not write.
+fn stage_trust_file(bundle: &[u8]) -> Option<(std::path::PathBuf, String)> {
     let name = format!(
         "ferrox-quic-roots-{}-{}.pem",
         std::process::id(),
         TRUST_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let path = std::env::temp_dir().join(name);
-    std::fs::write(&path, bundle).ok()?;
-    Some(path)
+    stage_at(&std::env::temp_dir().join(name), bundle)
+}
+
+fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf, String)> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    std::io::Write::write_all(&mut file, bundle).ok()?;
+    let text = path.to_str()?.to_owned();
+    Some((path.to_path_buf(), text))
 }
 
 pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
@@ -249,13 +266,12 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
     for root in roots {
         bundle.extend_from_slice(&der_to_pem(root, "CERTIFICATE"));
     }
-    let path = stage_trust_file(&bundle)?;
-    let path_text = path.to_str()?.to_owned();
+    let (path, path_text) = stage_trust_file(&bundle)?;
     let config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .ok()
         .and_then(|mut config| {
             config.verify_peer(true);
-            config.set_application_protos(&[ALPN_H3]).ok()?;
+            config.set_application_protos(&[ALPN]).ok()?;
             config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
             config.set_initial_max_data(MAX_DATA);
             config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
@@ -846,6 +862,52 @@ mod tests {
         let mut pem = der_to_pem(&[1u8; 32], "CERTIFICATE");
         pem.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n");
         assert_eq!(parse_ca_pem(&pem), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn the_base64_table_agrees_with_the_alphabet() {
+        for byte in 0..=u8::MAX {
+            let scanned = B64
+                .iter()
+                .position(|digit| *digit == byte)
+                .map_or(u8::MAX, |slot| slot as u8);
+            assert_eq!(B64_TABLE[usize::from(byte)], scanned, "byte {byte:#04x}");
+        }
+        for (slot, digit) in B64.iter().enumerate() {
+            assert_eq!(base64_value(*digit), Some(slot as u8));
+        }
+        for byte in [b'=', b' ', b'\n', b'!', 0, 0xff] {
+            assert_eq!(base64_value(byte), None);
+        }
+    }
+
+    fn owned_staging_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ferrox-quic-test-{}-{tag}.pem", std::process::id()))
+    }
+
+    #[test]
+    fn staging_refuses_a_name_something_else_already_holds() {
+        let path = owned_staging_path("taken");
+        std::fs::write(&path, b"planted").expect("plants");
+        assert!(stage_at(&path, b"mine").is_none());
+        assert_eq!(std::fs::read(&path).expect("reads"), b"planted");
+        std::fs::remove_file(&path).expect("removes");
+        let (back, text) = stage_at(&path, b"mine").expect("stages");
+        assert_eq!(back, path);
+        assert_eq!(text, path.to_string_lossy());
+        assert_eq!(std::fs::read(&path).expect("reads"), b"mine");
+        std::fs::remove_file(&path).expect("removes");
+    }
+
+    #[test]
+    fn staging_returns_the_name_it_wrote_so_the_caller_can_remove_it() {
+        let path = owned_staging_path("removable");
+        let (back, text) = stage_at(&path, b"bundle").expect("stages");
+        assert_eq!(back, path);
+        assert_eq!(text, path.to_string_lossy());
+        assert_eq!(std::fs::read(&path).expect("reads"), b"bundle");
+        std::fs::remove_file(&path).expect("removes");
+        assert!(!path.exists());
     }
 
     #[test]

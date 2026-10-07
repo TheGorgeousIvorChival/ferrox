@@ -26,7 +26,9 @@ fn mac(state: &mut Poly1305, aad: &[u8], ciphertext: &[u8]) {
     for section in [aad, ciphertext] {
         state.update(section);
         let slack = (16 - section.len() % 16) % 16;
-        state.update(&[0u8; 16][..slack]);
+        if slack != 0 {
+            state.update(&[0u8; 16][..slack]);
+        }
     }
     let mut lengths = [0u8; 16];
     lengths[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());

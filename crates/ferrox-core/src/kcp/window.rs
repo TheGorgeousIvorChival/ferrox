@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
 use super::segment::{AckSegment, DataSegment};
@@ -47,30 +48,34 @@ impl SendingWindow {
     }
 
     pub fn handle_fast_ack(&mut self, number: u32, rto: u32) {
+        let third = rto / 3;
         for seg in &mut self.cache {
             if seg.number == number || number.wrapping_sub(seg.number) > 0x7FFF_FFFF {
                 return;
             }
-            if seg.transmit > 0 && seg.timeout > rto / 3 {
-                seg.timeout -= rto / 3;
+            if seg.transmit > 0 && seg.timeout > third {
+                seg.timeout -= third;
             }
         }
     }
 
     pub fn remove(&mut self, number: u32) -> bool {
-        for i in 0..self.cache.len() {
-            if self.cache[i].number > number {
-                return false;
-            }
-            if self.cache[i].number == number {
-                if self.total_in_flight > 0 {
-                    self.total_in_flight -= 1;
-                }
-                self.cache.remove(i);
-                return true;
-            }
+        let Some(index) = self.cache.iter().position(|s| s.number >= number) else {
+            return false;
+        };
+        if self.cache[index].number != number {
+            return false;
         }
-        false
+        if self.total_in_flight > 0 {
+            self.total_in_flight -= 1;
+        }
+        self.cache.remove(index);
+        true
+    }
+
+    pub fn release(&mut self) {
+        self.cache.clear();
+        self.total_in_flight = 0;
     }
 
     pub fn flush(
@@ -120,11 +125,13 @@ impl ReceivingWindow {
     }
 
     pub fn set(&mut self, id: u32, value: DataSegment) -> bool {
-        if self.cache.contains_key(&id) {
-            return false;
+        match self.cache.entry(id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(value);
+                true
+            }
         }
-        self.cache.insert(id, value);
-        true
     }
 
     #[must_use]
@@ -137,12 +144,21 @@ impl ReceivingWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AckEntry {
+    number: u32,
+    timestamp: u32,
+    next_flush: u32,
+}
+
+// Upstream bounds an ack's number list and the deferred-candidate buffer
+// separately, and they are separate limits that happen to share a value.
+const FLUSH_CANDIDATES: usize = 128;
+
 #[derive(Debug, Default)]
 pub struct AckList {
-    numbers: Vec<u32>,
-    timestamps: Vec<u32>,
-    next_flush: Vec<u32>,
-    staging: Vec<u32>,
+    entries: Vec<AckEntry>,
+    candidates: Vec<u32>,
     dirty: bool,
 }
 
@@ -153,36 +169,34 @@ impl AckList {
     }
 
     pub fn add(&mut self, number: u32, timestamp: u32) {
-        self.numbers.push(number);
-        self.timestamps.push(timestamp);
-        self.next_flush.push(0);
+        self.entries.push(AckEntry {
+            number,
+            timestamp,
+            next_flush: 0,
+        });
         self.dirty = true;
     }
 
     pub fn clear(&mut self, una: u32) {
-        let mut count = 0usize;
-        for i in 0..self.numbers.len() {
-            if self.numbers[i] < una {
+        let mut kept = 0;
+        for i in 0..self.entries.len() {
+            if self.entries[i].number < una {
                 continue;
             }
-            if i != count {
-                self.numbers[count] = self.numbers[i];
-                self.timestamps[count] = self.timestamps[i];
-                self.next_flush[count] = self.next_flush[i];
+            if i != kept {
+                self.entries[kept] = self.entries[i];
             }
-            count += 1;
+            kept += 1;
         }
-        if count < self.numbers.len() {
-            self.numbers.truncate(count);
-            self.timestamps.truncate(count);
-            self.next_flush.truncate(count);
+        if kept < self.entries.len() {
+            self.entries.truncate(kept);
             self.dirty = true;
         }
     }
 
     #[must_use]
     pub fn is_pending(&self) -> bool {
-        !self.numbers.is_empty()
+        !self.entries.is_empty()
     }
 
     pub fn flush(
@@ -192,23 +206,19 @@ impl AckList {
         limit: usize,
         write: &mut impl FnMut(&mut AckSegment),
     ) {
-        let mut candidates = std::mem::take(&mut self.staging);
-        candidates.clear();
         let mut seg = AckSegment::new(limit);
-        for i in 0..self.numbers.len() {
-            if self.next_flush[i] > current {
-                if candidates.len() < 128 {
-                    candidates.push(self.numbers[i]);
+        let timeout = (rto / 2).max(20);
+        self.candidates.clear();
+        for entry in &mut self.entries {
+            if entry.next_flush > current {
+                if self.candidates.len() < FLUSH_CANDIDATES {
+                    self.candidates.push(entry.number);
                 }
                 continue;
             }
-            seg.put_number(self.numbers[i]);
-            seg.put_timestamp(self.timestamps[i]);
-            let mut timeout = rto / 2;
-            if timeout < 20 {
-                timeout = 20;
-            }
-            self.next_flush[i] = current + timeout;
+            seg.put_number(entry.number);
+            seg.put_timestamp(entry.timestamp);
+            entry.next_flush = current + timeout;
             if seg.is_full() {
                 write(&mut seg);
                 seg = AckSegment::new(limit);
@@ -216,16 +226,15 @@ impl AckList {
             }
         }
         if self.dirty || !seg.is_empty() {
-            for number in candidates.drain(..) {
+            for index in 0..self.candidates.len() {
                 if seg.is_full() {
                     break;
                 }
-                seg.put_number(number);
+                seg.put_number(self.candidates[index]);
             }
             write(&mut seg);
             self.dirty = false;
         }
-        self.staging = candidates;
     }
 }
 
@@ -275,12 +284,65 @@ mod tests {
         assert_eq!(w.cache.front().unwrap().timeout, before - 100);
     }
     #[test]
+    fn release_empties_the_window_where_clear_at_the_wrap_would_not() {
+        let mut w = SendingWindow::new();
+        w.push(u32::MAX, b"last".to_vec());
+        w.push(0, b"first".to_vec());
+        w.clear(u32::MAX);
+        assert_eq!(w.len(), 2);
+
+        let mut w = SendingWindow::new();
+        w.push(u32::MAX, b"last".to_vec());
+        w.push(0, b"first".to_vec());
+        w.release();
+        assert!(w.is_empty());
+        assert_eq!(w.len(), 0);
+    }
+
+    #[test]
+    fn removing_beyond_the_window_is_not_a_removal() {
+        let mut w = SendingWindow::new();
+        w.push(4, b"a".to_vec());
+        w.push(5, b"b".to_vec());
+        assert!(!w.remove(3));
+        assert!(!w.remove(6));
+        assert!(w.remove(5));
+        assert!(!w.remove(5));
+        assert!(w.remove(4));
+        assert!(w.is_empty());
+    }
+
+    #[test]
     fn ack_list_clear_drops_the_acknowledged_prefix() {
         let mut l = AckList::new();
         l.add(5, 10);
         l.add(7, 20);
         l.clear(7);
-        assert_eq!(l.numbers, vec![7]);
+        assert_eq!(
+            l.entries.iter().map(|e| e.number).collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert_eq!(l.entries[0].timestamp, 20);
+    }
+
+    #[test]
+    fn the_ack_list_reuses_its_scratch_across_flushes() {
+        let mut l = AckList::new();
+        l.add(1, 100);
+        l.add(2, 110);
+        l.flush(0, 100, 300, &mut |_: &mut AckSegment| {});
+        for current in 1..50u32 {
+            l.flush(current, 100, 300, &mut |_: &mut AckSegment| {});
+            assert_eq!(l.candidates, vec![1, 2]);
+        }
+        l.flush(50, 100, 300, &mut |_: &mut AckSegment| {});
+        let scratch = l.candidates.as_ptr();
+        for current in 51..100u32 {
+            l.flush(current, 100, 300, &mut |_: &mut AckSegment| {});
+            assert_eq!(l.candidates, vec![1, 2]);
+        }
+        assert_eq!(l.candidates.as_ptr(), scratch);
+        assert_eq!(l.entries.len(), 2);
     }
 
     #[test]

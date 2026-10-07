@@ -114,7 +114,8 @@ impl EarlyData {
             return untouched();
         };
         let mut first: Option<&str> = None;
-        let mut out = base.to_owned();
+        let mut out = String::with_capacity(path.len());
+        out.push_str(base);
         let mut sep = '?';
         for pair in query.split('&') {
             if pair.is_empty() {

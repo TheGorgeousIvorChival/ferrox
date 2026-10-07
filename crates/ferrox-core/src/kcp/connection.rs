@@ -118,13 +118,29 @@ pub(crate) struct Ctx {
     output: Mutex<OutputSink>,
 }
 
+const WRITE_ATTEMPTS: u32 = 5;
+const WRITE_RETRY_MS: u64 = 100;
+
 impl Ctx {
-    fn emit(&self, enc: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
-        let mut sink = self.output.lock().unwrap();
-        let OutputSink { buf, write } = &mut *sink;
-        buf.clear();
-        enc(buf);
-        write(buf)
+    fn emit(&self, mut enc: impl FnMut(&mut Vec<u8>)) -> io::Result<()> {
+        let mut last = None;
+        for attempt in 0..WRITE_ATTEMPTS {
+            let outcome = {
+                let mut sink = self.output.lock().unwrap();
+                let OutputSink { buf, write } = &mut *sink;
+                buf.clear();
+                enc(buf);
+                write(buf)
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+            if attempt + 1 < WRITE_ATTEMPTS {
+                thread::sleep(Duration::from_millis(WRITE_RETRY_MS));
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("segment write")))
     }
 
     pub(crate) fn emit_data(&self, d: &DataSegment) -> io::Result<()> {
@@ -154,6 +170,7 @@ pub struct Connection {
     since: Instant,
     data_input: Notifier,
     data_output: Notifier,
+    update: Notifier,
     rd: Mutex<Option<Instant>>,
     wd: Mutex<Option<Instant>>,
     mss: u32,
@@ -177,7 +194,7 @@ impl Connection {
         closer: Box<dyn FnOnce() + Send>,
         config: Config,
     ) -> Arc<Self> {
-        let mss = config.mtu - super::segment::DATA_SEGMENT_OVERHEAD;
+        let mss = config.payload_size();
         let ctx = Arc::new(Ctx {
             meta,
             config,
@@ -196,10 +213,11 @@ impl Connection {
             since: Instant::now(),
             data_input: Notifier::new(),
             data_output: Notifier::new(),
+            update: Notifier::new(),
             rd: Mutex::new(None),
             wd: Mutex::new(None),
             mss,
-            receiving: Mutex::new(ReceivingWorker::new(config, mss, Arc::clone(&ctx))),
+            receiving: Mutex::new(ReceivingWorker::new(config, Arc::clone(&ctx))),
             sending: Mutex::new(SendingWorker::new(config, Arc::clone(&ctx))),
             closer: Mutex::new(Some(closer)),
             terminated: AtomicBool::new(false),
@@ -207,15 +225,20 @@ impl Connection {
         let weak = Arc::downgrade(&conn);
         thread::spawn(move || {
             let mut last_uncond = Instant::now();
+            let mut seen = u64::MAX;
             loop {
                 let Some(conn) = weak.upgrade() else { break };
                 let draining =
                     conn.state() == State::Terminating || conn.state() == State::PeerTerminating;
-                thread::sleep(if draining {
+                let idle = if draining {
                     Duration::from_secs(1)
                 } else {
                     Duration::from_millis(u64::from(config.tti))
-                });
+                };
+                if conn.update.gen() == seen {
+                    conn.update.wait_since(seen, Some(idle));
+                }
+                seen = conn.update.gen();
                 if conn.state() == State::Terminated {
                     break;
                 }
@@ -256,6 +279,7 @@ impl Connection {
                 self.sending.lock().unwrap().close_write();
                 self.data_input.signal();
                 self.data_output.signal();
+                self.wake_update();
                 self.terminated.store(true, Ordering::SeqCst);
                 self.terminate();
             }
@@ -284,8 +308,12 @@ impl Connection {
             }
             match seg {
                 Segment::Data(d) => {
-                    self.receiving.lock().unwrap().process_segment(d);
-                    if self.receiving.lock().unwrap().is_data_available() {
+                    let available = {
+                        let mut receiving = self.receiving.lock().unwrap();
+                        receiving.process_segment(d);
+                        receiving.is_data_available()
+                    };
+                    if available {
                         self.data_input.signal();
                     }
                 }
@@ -328,8 +356,15 @@ impl Connection {
                 }
             }
         }
-        self.poke();
+        self.wake_update();
     }
+}
+
+const PING_INTERVAL_MS: u32 = 3000;
+
+// A ping resets `last_ping_time`, so a worker ping already satisfies the interval.
+fn ping_due(current: u32, last_ping: u32, worker_pinged: bool) -> bool {
+    worker_pinged || current.wrapping_sub(last_ping) >= PING_INTERVAL_MS
 }
 
 impl Connection {
@@ -364,11 +399,12 @@ impl Connection {
             self.set_state(State::Terminating);
         }
         self.receiving.lock().unwrap().flush(current);
-        let should_ping = self.sending.lock().unwrap().flush(current);
-        if current.wrapping_sub(self.last_ping_time.load(Ordering::SeqCst)) >= 3000 {
-            self.ping(current, Command::Ping);
-        }
-        if should_ping {
+        let worker_pinged = self.sending.lock().unwrap().flush(current);
+        if ping_due(
+            current,
+            self.last_ping_time.load(Ordering::SeqCst),
+            worker_pinged,
+        ) {
             self.ping(current, Command::Ping);
         }
     }
@@ -495,6 +531,7 @@ impl Connection {
 
     pub fn write(&self, b: &[u8]) -> Result<usize, ConnError> {
         let mut offset = 0;
+        let mut pushed = false;
         while offset < b.len() {
             if self.state() != State::Active {
                 return Err(ConnError::Closed);
@@ -507,11 +544,18 @@ impl Connection {
                 .unwrap()
                 .push(b[offset..offset + n].to_vec())
             {
+                if pushed {
+                    self.wake_update();
+                    pushed = false;
+                }
                 self.wait_for_data_output(snap)?;
                 continue;
             }
-            self.poke();
+            pushed = true;
             offset += n;
+        }
+        if pushed {
+            self.wake_update();
         }
         Ok(b.len())
     }
@@ -539,8 +583,177 @@ impl Connection {
         self.ctx.meta.remote
     }
 
-    fn poke(&self) {
-        self.data_input.signal();
-        self.data_output.signal();
+    fn wake_update(&self) {
+        self.update.signal();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use std::time::Duration;
+
+    use super::{
+        ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, Segment,
+        PING_INTERVAL_MS, WRITE_ATTEMPTS,
+    };
+
+    struct Recorder {
+        attempts: AtomicU32,
+        seen: Mutex<Vec<Vec<u8>>>,
+        fail_times: u32,
+    }
+
+    impl Recorder {
+        fn new(fail_times: u32) -> Arc<Self> {
+            Arc::new(Self {
+                attempts: AtomicU32::new(0),
+                seen: Mutex::new(Vec::new()),
+                fail_times,
+            })
+        }
+
+        fn write(&self, data: &[u8]) -> io::Result<()> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(data.to_vec());
+            if n < self.fail_times {
+                Err(io::Error::other("transient"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn recording_connection(fail_times: u32) -> (Arc<Recorder>, Arc<Connection>) {
+        let recorder = Recorder::new(fail_times);
+        let sink = Arc::clone(&recorder);
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(move |data: &[u8]| sink.write(data)),
+            Box::new(|| {}),
+            Config::default(),
+        );
+        (recorder, conn)
+    }
+
+    #[test]
+    fn a_failed_write_is_retried_with_the_same_bytes() {
+        let (recorder, conn) = recording_connection(2);
+        conn.ping(1, Command::Terminate);
+        let seen = recorder.seen.lock().unwrap();
+        assert_eq!(recorder.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(seen[1], seen[2]);
+        assert_eq!(seen[0].len(), CmdOnlySegment::byte_size());
+    }
+
+    #[test]
+    fn a_write_that_never_succeeds_stops_at_the_attempt_limit() {
+        let (recorder, conn) = recording_connection(u32::MAX);
+        conn.ping(1, Command::Ping);
+        assert_eq!(recorder.attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+    }
+
+    fn data(number: u32, sending_next: u32, payload: &[u8]) -> Segment {
+        Segment::Data(super::DataSegment {
+            conv: 4,
+            option: super::SegmentOption::NONE,
+            timestamp: 0,
+            number,
+            sending_next,
+            payload: payload.to_vec(),
+            timeout: 0,
+            transmit: 0,
+        })
+    }
+
+    fn echoing_connection() -> Arc<Connection> {
+        let local = ([127, 0, 0, 1], 1).into();
+        Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config::default(),
+        )
+    }
+
+    fn read_once(conn: &Connection, b: &mut [u8]) -> Result<usize, super::ConnError> {
+        conn.set_read_deadline(std::time::Instant::now() + Duration::from_millis(200));
+        conn.read(b)
+    }
+
+    #[test]
+    fn an_in_order_segment_is_delivered_once() {
+        let conn = echoing_connection();
+        conn.input(vec![data(0, 0, b"first"), data(1, 0, b"second")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Ok(11));
+        assert_eq!(&buf[..11], b"firstsecond");
+        assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
+    }
+
+    #[test]
+    fn a_segment_beyond_the_receiving_window_is_dropped() {
+        let conn = echoing_connection();
+        let beyond = Config::default().receiving_in_flight_size();
+        conn.input(vec![data(beyond, 0, b"too far")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
+    }
+
+    #[test]
+    fn a_retransmitted_segment_is_delivered_once() {
+        let conn = echoing_connection();
+        conn.input(vec![data(0, 0, b"payload"), data(0, 0, b"payload")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Ok(7));
+        assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
+    }
+
+    #[test]
+    fn a_segment_arriving_out_of_order_waits_for_its_turn() {
+        let conn = echoing_connection();
+        conn.input(vec![data(1, 0, b"second"), data(0, 0, b"first")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Ok(11));
+        assert_eq!(&buf[..11], b"firstsecond");
+    }
+
+    #[test]
+    fn one_tick_pings_at_most_once() {
+        for last in [0, 1, 500, 12_500] {
+            for gap in [0, 1, 42, PING_INTERVAL_MS - 1, PING_INTERVAL_MS, 90_000] {
+                assert!(ping_due(last + gap, last, true));
+                assert_eq!(ping_due(last + gap, last, false), gap >= PING_INTERVAL_MS);
+            }
+        }
+    }
+
+    #[test]
+    fn the_interval_wraps_instead_of_underflowing() {
+        let before = u32::MAX - (PING_INTERVAL_MS - 2);
+        assert!(!ping_due(
+            before.wrapping_add(PING_INTERVAL_MS - 1),
+            before,
+            false
+        ));
+        assert!(ping_due(
+            before.wrapping_add(PING_INTERVAL_MS),
+            before,
+            false
+        ));
     }
 }
