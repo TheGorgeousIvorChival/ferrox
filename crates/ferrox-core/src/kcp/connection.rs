@@ -308,8 +308,12 @@ impl Connection {
             }
             match seg {
                 Segment::Data(d) => {
-                    self.receiving.lock().unwrap().process_segment(d.clone());
-                    if self.receiving.lock().unwrap().is_data_available() {
+                    let available = {
+                        let mut receiving = self.receiving.lock().unwrap();
+                        receiving.process_segment(d);
+                        receiving.is_data_available()
+                    };
+                    if available {
                         self.data_input.signal();
                     }
                 }
@@ -590,9 +594,11 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use std::time::Duration;
+
     use super::{
-        ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, PING_INTERVAL_MS,
-        WRITE_ATTEMPTS,
+        ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, Segment,
+        PING_INTERVAL_MS, WRITE_ATTEMPTS,
     };
 
     struct Recorder {
@@ -655,6 +661,75 @@ mod tests {
         let (recorder, conn) = recording_connection(u32::MAX);
         conn.ping(1, Command::Ping);
         assert_eq!(recorder.attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+    }
+
+    fn data(number: u32, sending_next: u32, payload: &[u8]) -> Segment {
+        Segment::Data(super::DataSegment {
+            conv: 4,
+            option: super::SegmentOption::NONE,
+            timestamp: 0,
+            number,
+            sending_next,
+            payload: payload.to_vec(),
+            timeout: 0,
+            transmit: 0,
+        })
+    }
+
+    fn echoing_connection() -> Arc<Connection> {
+        let local = ([127, 0, 0, 1], 1).into();
+        Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config::default(),
+        )
+    }
+
+    fn read_once(conn: &Connection, b: &mut [u8]) -> Result<usize, super::ConnError> {
+        conn.set_read_deadline(std::time::Instant::now() + Duration::from_millis(200));
+        conn.read(b)
+    }
+
+    #[test]
+    fn an_in_order_segment_is_delivered_once() {
+        let conn = echoing_connection();
+        conn.input(&[data(0, 0, b"first"), data(1, 0, b"second")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Ok(11));
+        assert_eq!(&buf[..11], b"firstsecond");
+        assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
+    }
+
+    #[test]
+    fn a_segment_beyond_the_receiving_window_is_dropped() {
+        let conn = echoing_connection();
+        let beyond = Config::default().receiving_in_flight_size();
+        conn.input(&[data(beyond, 0, b"too far")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
+    }
+
+    #[test]
+    fn a_retransmitted_segment_is_delivered_once() {
+        let conn = echoing_connection();
+        conn.input(&[data(0, 0, b"payload"), data(0, 0, b"payload")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Ok(7));
+        assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
+    }
+
+    #[test]
+    fn a_segment_arriving_out_of_order_waits_for_its_turn() {
+        let conn = echoing_connection();
+        conn.input(&[data(1, 0, b"second"), data(0, 0, b"first")]);
+        let mut buf = [0u8; 32];
+        assert_eq!(read_once(&conn, &mut buf), Ok(11));
+        assert_eq!(&buf[..11], b"firstsecond");
     }
 
     #[test]

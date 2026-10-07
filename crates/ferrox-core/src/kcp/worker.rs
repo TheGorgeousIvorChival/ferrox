@@ -198,9 +198,7 @@ impl SendingWorker {
     }
 
     pub fn release(&mut self) {
-        while !self.window.is_empty() {
-            self.window.remove(self.window.first_number());
-        }
+        self.window.release();
         self.closed = true;
     }
 }
@@ -256,17 +254,13 @@ impl ReceivingWorker {
         self.acklist.clear(next_number);
     }
 
-    pub fn process_segment(&mut self, seg: DataSegment) {
+    pub fn process_segment(&mut self, seg: &DataSegment) {
         let number = seg.number;
-        let idx = number.wrapping_sub(self.next_number);
-        if idx >= self.window_size {
+        if number.wrapping_sub(self.next_number) >= self.window_size {
             return;
         }
         self.acklist.clear(seg.sending_next);
         self.acklist.add(number, seg.timestamp);
-        if self.window.has(number) {
-            return;
-        }
         self.window.set(number, seg);
     }
 

@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
 use super::segment::{AckSegment, DataSegment};
@@ -47,30 +48,34 @@ impl SendingWindow {
     }
 
     pub fn handle_fast_ack(&mut self, number: u32, rto: u32) {
+        let third = rto / 3;
         for seg in &mut self.cache {
             if seg.number == number || number.wrapping_sub(seg.number) > 0x7FFF_FFFF {
                 return;
             }
-            if seg.transmit > 0 && seg.timeout > rto / 3 {
-                seg.timeout -= rto / 3;
+            if seg.transmit > 0 && seg.timeout > third {
+                seg.timeout -= third;
             }
         }
     }
 
     pub fn remove(&mut self, number: u32) -> bool {
-        for i in 0..self.cache.len() {
-            if self.cache[i].number > number {
-                return false;
-            }
-            if self.cache[i].number == number {
-                if self.total_in_flight > 0 {
-                    self.total_in_flight -= 1;
-                }
-                self.cache.remove(i);
-                return true;
-            }
+        let Some(index) = self.cache.iter().position(|s| s.number >= number) else {
+            return false;
+        };
+        if self.cache[index].number != number {
+            return false;
         }
-        false
+        if self.total_in_flight > 0 {
+            self.total_in_flight -= 1;
+        }
+        self.cache.remove(index);
+        true
+    }
+
+    pub fn release(&mut self) {
+        self.cache.clear();
+        self.total_in_flight = 0;
     }
 
     pub fn flush(
@@ -119,12 +124,14 @@ impl ReceivingWindow {
         Self::default()
     }
 
-    pub fn set(&mut self, id: u32, value: DataSegment) -> bool {
-        if self.cache.contains_key(&id) {
-            return false;
+    pub fn set(&mut self, id: u32, value: &DataSegment) -> bool {
+        match self.cache.entry(id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(value.clone());
+                true
+            }
         }
-        self.cache.insert(id, value);
-        true
     }
 
     #[must_use]
@@ -276,6 +283,35 @@ mod tests {
         w.handle_fast_ack(2, 300);
         assert_eq!(w.cache.front().unwrap().timeout, before - 100);
     }
+    #[test]
+    fn release_empties_the_window_where_clear_at_the_wrap_would_not() {
+        let mut w = SendingWindow::new();
+        w.push(u32::MAX, b"last".to_vec());
+        w.push(0, b"first".to_vec());
+        w.clear(u32::MAX);
+        assert_eq!(w.len(), 2);
+
+        let mut w = SendingWindow::new();
+        w.push(u32::MAX, b"last".to_vec());
+        w.push(0, b"first".to_vec());
+        w.release();
+        assert!(w.is_empty());
+        assert_eq!(w.len(), 0);
+    }
+
+    #[test]
+    fn removing_beyond_the_window_is_not_a_removal() {
+        let mut w = SendingWindow::new();
+        w.push(4, b"a".to_vec());
+        w.push(5, b"b".to_vec());
+        assert!(!w.remove(3));
+        assert!(!w.remove(6));
+        assert!(w.remove(5));
+        assert!(!w.remove(5));
+        assert!(w.remove(4));
+        assert!(w.is_empty());
+    }
+
     #[test]
     fn ack_list_clear_drops_the_acknowledged_prefix() {
         let mut l = AckList::new();
