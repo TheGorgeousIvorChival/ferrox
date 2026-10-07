@@ -100,7 +100,9 @@ rather than a gap in the table:
 
 ## Connection methods
 
-**Every method below parses.** A row is only as good as what a binary does with it, and there are two separate answers, so the table carries both:
+The goal is a drop-in replacement for xray-core — the same JSON, the same share links, every protocol, transport and security it dials or serves — and then a superset of it: everything sing-box, ZeroNet and LxBox carry that Xray does not. Tables A–I are the verdict so far; tables J–L are the rest of that superset, read off the four pinned trees, each row naming the paths that prove the reference has it.
+
+**Every method in table A parses.** A row is only as good as what a binary does with it, and there are two separate answers, so the table carries both:
 
 | column | meaning |
 | --- | --- |
@@ -114,8 +116,8 @@ They are not the same, and where they differ the table says so. `Support::Planne
 ### A — proxy protocols (the share-link world)
 
 Every implemented row links to its page: the counts, the data-path graph, and
-what was removed against the three pinned implementations live there, not here.
-This table is the verdict; the page is the evidence.
+what was removed against the pinned implementations live there, not here.
+This table is the verdict; the page is the evidence. Rows 1–22 are the share-link world; rows 61–77 are the xray-core config surface the tree must also read — same columns, same honesty.
 
 | # | method | link | binary | page | notes |
 | --- | --- | --- | --- | --- | --- |
@@ -141,6 +143,23 @@ This table is the verdict; the page is the evidence.
 | 20 | MASQUE CONNECT-IP (RFC 9484) | planned — *"parses, dial needs a QUIC stack"* | refused | [carrier-quic](docs/function/carrier-quic.md) | Name only: `TransportKind::Masque`, `Carrier::Masque`. quiche is pinned as the default stack for this rung when it lands. |
 | 21 | TUIC / AnyTLS / ShadowTLS / Snell / Naive / SSH / OpenConnect / OpenVPN | parse to `TransportKind::Other` — *"unknown type: parses, transport not scheduled"* | refused | — | Zero occurrences in `crates/`. They are refused by falling into `Other`, not by a hand-written list, so there is no per-protocol reason string to quote for them. |
 | 22 | Mux / XUDP / `multi` | — | implemented, **raw carrier only** | [mux-cool](docs/function/mux-cool.md) | The codec is complete — `Status`/`Network`/`Target`/`Outgoing`/`Incoming`, `global_id`, `CHUNK_MAX` (`mux.rs`) — and it is wired in both roles when `mux.enabled` is true. XUDP rides the mux: a `Network::Udp` target opens a UDP socket keyed by the frame's `global_id`, datagrams arrive as `Keep` frames carrying their own destination, and replies return as `Keep` frames carrying their source. The client sends one XUDP session per SOCKS association instead of dialling a carrier per destination. Both roles encode the mux request the way upstream does — command 3, no address (`vless_mux_header`) — so a real Xray peer agrees on the wire; `KeepAlive` is a no-op and the cap is `DEFAULT_CAP` 8 sessions. |
+| 61 | HTTP proxy, both roles | — (config-driven) | refused | — | Planned. Xray `proxy/http/` both roles; sing-box `protocol/http/` in+out. No plain HTTP CONNECT lane in tree — the foxy CONNECT (`proxy.rs:3514`) is account-bound. |
+| 62 | dokodemo-door transparent inbound | — (config-driven) | refused | — | Planned. Xray `proxy/dokodemo/`, TCP+UDP. Zero occurrences in `crates/`. |
+| 63 | blackhole sink outbound | — (config-driven) | refused | — | Planned. Xray `proxy/blackhole/`; sing-box `protocol/block/`. The only sink-shaped outbound in tree is `Freedom` (`proxy.rs:247`). |
+| 64 | DNS outbound | — (config-driven) | refused | — | Planned. Xray `proxy/dns/` + `app/dns/` (UDP/TCP/DoH/QUIC/FakeDNS); sing-box `protocol/dns/`; ZeroNet `zero-dns` (UDP/TCP/DoT/DoH/DoH2/DoH3/DoQ). No `dns` protocol in `proxy.rs`. |
+| 65 | loopback re-inject inbound | — (config-driven) | refused | — | Planned. Xray `proxy/loopback/`. `loopback` in tree means loopback test sockets only. |
+| 66 | Shadowsocks-2022 ciphers | — (config-driven) | refused by name (row 7) | [shadowsocks](docs/function/shadowsocks.md) | Planned. Xray `proxy/shadowsocks_2022/`; ZeroNet `shadowsocks2022.rs` (`2022-blake3-*`, TCP-only like ours). |
+| 67 | TUN inbound (native) | — (config-driven) | refused | — | Planned. Xray `proxy/tun/`; sing-box `protocol/tun/` + `transport/device/`; ZeroNet `zero-tun`. Row 41 is the tun2socks translator; this row is the native inbound. |
+| 68 | Unix domain sockets | — (config-driven) | refused | — | Planned. Xray `transport/internet/system_listener.go:46-75` Unix wrappers. Tree binds TCP only (`unix` hits are `UNIX_EPOCH` clocks). |
+| 69 | finalmask post-TLS mask chain | — (config-driven) | refused | — | Planned. Xray `transport/internet/finalmask/` (`fragment`/`noise`/`salamander`/`realm`/…). Zero occurrences in `crates/`. |
+| 70 | xdrive cloud-drive carrier | — (config-driven) | refused | — | Name only: `TransportKind::Xdrive`, `Carrier::Xdrive` (`refused_carriers!`, `proxy.rs:284`). Xray `transport/internet/xdrive/` polls Drive remotes. |
+| 71 | native HTTP/H2/H3 transport | — (config-driven) | refused | — | `TransportKind::Http` parses (`transport.rs:47`), never dialled (`is_dialled`, `transport.rs:56`). Even Xray refuses these now — `transport_internet.go` maps `h2`/`h3`/`http` to a removed-feature error pointing at XHTTP. |
+| 72 | VLESS `encryption=mlkem768x25519plus` | — | refused | — | Planned. ZeroNet `vless_encryption.rs` (`native`/`xorpub`/`random` x `1rtt`/`0rtt`); LxBox passes it through (task 335); sing-box-lx SPEC 032. The tree's only ML-KEM is the REALITY hybrid key-share group (`reality.rs:10`). |
+| 73 | `flow=xtls-rprx-vision-udp443` | — | refused | — | Planned. Xray accepts it outbound (`infra/conf/vless.go:329-334`); the tree knows only `xtls-rprx-vision`. |
+| 74 | REALITY client | planned — *"server rung landed, client unwired"* | refused | — | Server role complete (row 1); an outbound is accepted only with empty/`none` security (`proxy.rs:4262`). ZeroNet `reality.rs` (`reality_connect`) is the second implementation to read. |
+| 75 | TLS client from config | planned — *"core client exists, no config path"* | refused | — | The rustls client role exists (`tls/mod.rs:199`), exercised by core tests; no config path dials it (row 2). Xray `tls.go` and sing-box `common/tls/` are the shapes to match. |
+| 76 | uTLS fingerprints | — | refused | — | Nothing shapes a ClientHello (row 18; bench emits the `utls` object, `linkconfig.rs:235`, shaping none). Xray `tls.go:204-277` preset/modern/other prints; sing-box `common/tls/utls_client.go`. |
+| 77 | ECH | — | refused | — | Planned. Xray `ech.go` + `config.proto:80-86`; sing-box `common/tls/ech.go`; LxBox passes `tls.ech{}` through from JSON. Zero word-hits in `crates/`. |
 
 ### B — PattNG in full (what the fork wires)
 
@@ -229,15 +248,67 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 
 One day every box above is checked: a row keeps `planned` until its differential proof and its benchmark gate are green, exactly as rows 1–16 in table A already are — with the two gaps in that table named in place rather than rounded off.
 
+### J — engine: routing, balancing, DNS, management (xray-core `app/`)
+
+The config surface no link exercises: what sits around the protocols in a drop-in.
+
+| # | method | state | supported today by |
+| --- | --- | --- | --- |
+| 78 | Routing rules + geosite/geoip | planned | Xray `app/router/` + `app/geodata/`; sing-box `route/`; ZeroNet `zero-router`. No routing engine in `proxy.rs`: inbounds bind fixed ports, outbounds pick by protocol only. |
+| 79 | Balancers: leastPing/leastLoad/roundRobin/random + urltest/selector | planned | Xray `router/balancing.go` + `app/observatory/`; sing-box `protocol/group/`; ZeroNet `zero-observatory` ladder; LxBox round-robin urltest (task 208). |
+| 80 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns/`; sing-box `dns/`; ZeroNet `zero-dns` + `dns_oracle` tests. Row 64 is the outbound; this row is the resolver. |
+| 81 | Reverse tunnel bridge/portal | planned | Xray `app/reverse/`. |
+| 82 | Commander gRPC management API | planned | Xray `app/commander/`. |
+| 83 | Connection-planner ladder (ordered rungs, climb on failure, earned descent) | planned | ZeroNet `zero-observatory` (10-rung `ALL`: DirectReality through AmneziaWireguard, 3 access classes). |
+| 84 | Subnet scanner + server discovery | planned | ZeroNet `zero-scanner`, `zero-discovery` (feeds, link sort/probe, `warp.rs` account creation). |
+
+### K — sing-box-only protocols and transports
+
+What Xray has no equivalent of. Row H already covers Tor as a lane; the Hysteria2 carrier is row 19 — row 100 is only its missing options.
+
+| # | method | state | supported today by |
+| --- | --- | --- | --- |
+| 85 | mixed (HTTP + SOCKS) inbound | planned | sing-box `protocol/mixed/`. |
+| 86 | redirect + tproxy inbounds | planned | sing-box `protocol/redirect/`. Zero `tproxy`/`redirect` in `crates/`. |
+| 87 | NaïveProxy | planned | sing-box `protocol/naive/`; LxBox imports `naive+https://` (task 037F). Zero `naive` in `crates/`. |
+| 88 | AnyTLS | planned | sing-box `protocol/anytls/`; ZeroNet `anytls.rs`; LxBox imports `anytls://` (task 269). Row 21 is the link-type parse; this row is the auth + handshake. |
+| 89 | ShadowTLS | planned | sing-box `protocol/shadowtls/`. Zero `shadowtls` in `crates/`. |
+| 90 | Snell | planned | sing-box `protocol/snell/`. Zero `snell` in `crates/`. |
+| 91 | SSH outbound | planned | sing-box `protocol/ssh/`; LxBox imports `ssh://` (§6). Zero `ssh` in `crates/`. |
+| 92 | TUIC v5 over QUIC | planned | sing-box `protocol/tuic/`; ZeroNet `tuic.rs` + `quic_pool.rs`; LxBox imports `tuic://` (§9.5). Zero `tuic` in `crates/`. |
+| 93 | Tailscale endpoint (tsnet, MagicDNS, exit nodes) | planned | sing-box `protocol/tailscale/`; LxBox feature 030 (preset 945, NETWORKS tab). Zero `tailscale` in `crates/`. |
+| 94 | OpenConnect / OpenVPN endpoints | planned | sing-box `protocol/openconnect/`, `protocol/openvpn/` (each with `dns_transport.go`); LxBox passes `openvpn-client` through, no `.ovpn` (task 584F). |
+| 95 | cloudflared (Argo) inbound | planned | sing-box `protocol/cloudflare/`. |
+| 96 | Plain H2 + gRPC-lite transports | planned | sing-box `transport/v2rayhttp/`, `transport/v2raygrpclite/`. Tree has full gRPC only (row 10). |
+| 97 | simple-obfs (http/tls) | planned | sing-box `transport/simple-obfs/`. |
+| 98 | SIP003 plugin manager (obfs/v2ray-plugin) | planned | sing-box `transport/sip003/`. LxBox imports `plugin`/`plugin_opts` (§4) — carried nowhere yet. |
+| 99 | Mux variants smux/yamux/h2mux | planned | sing-box `common/mux/` + `option/multiplex.go`. Tree has mux-cool only (row 22). |
+| 100 | Hysteria2 salamander obfuscation + multiport | planned (salamander refused, row 19) | sing-box `protocol/hysteria2/`; LxBox §5 (`salamander`, `mport`/`server_ports`, gecko obfs). |
+
+### L — ZeroNet + LxBox client-side superset
+
+Reading copies for the lanes: WARP, Tailscale UX, detour shapes, DPI parameters, import formats, config building. Section G stays the chaining engine; row 104 names the reference shapes it must match.
+
+| # | method | state | supported today by |
+| --- | --- | --- | --- |
+| 101 | WARP: auto-race WireGuard vs MASQUE-H2/H3 + one-tap registration | planned | ZeroNet `warp.rs` + `warp/report.rs` (`WarpRoute::Auto`); LxBox feature 015 (on-device keys, `warp_endpoints.json`, SCAN generator). Row 28 is the carrier; this row is the account + race. |
+| 102 | AmneziaWG 1.0–3.1 parameter set (junk/masquerade/header-protection/timings) | planned | LxBox §8.5 + tasks 097F/112/421; ZeroNet `amnezia.rs`; amneziawg-go + amnezia-client pins. Row 29 stays the one-line pointer. |
+| 103 | Evasion on TCP/TLS (fragment, keepalive shaping, noise, fake-SNI) | planned | ZeroNet `zero-evasion/`; LxBox 016 (first-hop-only fragment, mixed-case SNI, REALITY pbk/sid validation). |
+| 104 | Detour graph + hop chains with cycle detection | planned (G is the engine sketch) | LxBox feature 006 (`type:chain`, detour-as-direction, fail-closed, culprits named); Xray `dialerProxy`, sing-box `detour`. |
+| 105 | Import superset: Xray JSON, sing-box JSON, WG INI, Amnezia `vpn://`, OpenVPN passthrough — with `.ovpn`, Clash YAML and hysteria-v1 as named gaps | planned | LxBox feature 002 + `PROTOCOLS.md` §§9–11 (gaps named in its Boundaries, not silently dropped). |
+| 106 | VLESS `flow`/`encryption` grammar + XHTTP full params (modes, padding, placements, `xmux`) | planned | LxBox 016 (`xhttp-params.md`, task 127F); ZeroNet `xhttp.rs` + `xhttp_request.rs` (stream-one/stream-up/packet-up). Tree: one xhttp mode (row 9), one flow (row 73 is the gap). |
+| 107 | Config template + contract registry (typed vars, schemas, build gate) | planned | LxBox features 024/025 (`build_config.dart`, `contract/registry/protocols/*.json`). |
+
 ### Conformance, per row
 
-The oracle names live in `upstream/pins.toml`, and `scripts/run-upstream-suite.sh` is the checker: it builds the named binary, refuses a pin whose rev does not read the seam it claims, injects the binary through that seam and rejects a green run that executed no test. Two pins are enabled — `zeronet` (8 named `xray_oracle` tests, seam `ZRAY_XRAY_BINARY`) and `xray-rust` (7 named `local_xray_interop_tests`, seam `XRAY_VLESS_FULL_BINARY`); the other ten print `SKIPPED` with the rung that would enable them. Those suites are run in CI only.
+The oracle names live in `upstream/pins.toml`, and `scripts/run-upstream-suite.sh` is the checker: it builds the named binary, refuses a pin whose rev does not read the seam it claims, injects the binary through that seam and rejects a green run that executed no test. Two pins are enabled — `zeronet` (8 named `xray_oracle` tests, seam `ZRAY_XRAY_BINARY`) and `xray-rust` (7 named `local_xray_interop_tests`, seam `XRAY_VLESS_FULL_BINARY`); the other eleven print `SKIPPED` with the rung that would enable them. Those suites are run in CI only.
 
-Twelve upstream pins, all resolving, all re-derivable by `scripts/fetch-upstream.sh`, all licence-clean for execution rather than copying:
-`xray-core` (`b26a91de`), `sing-box` (`c9922979`), `amneziawg-go` (`b5928efb`),
-`amnezia-client` (`94b51df2`), `xray-rust` (`7a4fb2dd`, `crates/`), `pattng` (`ad6f747c`, `V2rayNG/`),
-`zeronet` (`97a99734`, `crates/`), `mqvpn` (`b11a2f69`), `aether` (`21e7150a`),
-`zeptun` (`5620e57c`), `slipstream` (`397850b1`), `quiche` (`3fc9bc1c`, `quiche/`, `master`).
+Thirteen upstream pins, all resolving, all re-derivable by `scripts/fetch-upstream.sh`, all licence-clean for execution rather than copying:
+`xray-core` (`7da5dae6`), `sing-box` (`fe92ab3e`), `amneziawg-go` (`b5928efb`),
+`amnezia-client` (`3e9b70a5`), `xray-rust` (`f5aefca4`, `crates/`), `pattng` (`1ee7205c`, `V2rayNG/`),
+`zeronet` (`97a99734`, `crates/`), `mqvpn` (`078845ce`), `aether` (`6175b67d`),
+`zeptun` (`1bf81313`), `slipstream` (`397850b1`), `quiche` (`96e7dd51`, `quiche/`, `master`),
+`lxbox` (`15e4fcb8`, `app/`).
 Read but not pinned: `WhiteDNS/CottenDNS`, `masterking32/MasterDnsVPN`, `mlmvpn/mlmvpn_android`, local `configer`.
 
 ## Layout
