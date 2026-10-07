@@ -22,7 +22,3 @@ upstream/*
 __pycache__/
 *.pyc
 /.obsidian
-
-# Local-only notes, never reviewed.
-AGENTS.md
-README.md
