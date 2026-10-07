@@ -8710,6 +8710,9 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(back, [0, 0], "the accept survives the ferry");
+            pipe.client
+                .stream_send(stream, payload, false)
+                .expect("writes");
             let mut echo = Vec::new();
             let mut pending: Vec<u8> = Vec::new();
             let mut held_back = 0usize;
