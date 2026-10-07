@@ -4094,20 +4094,20 @@ pub(crate) fn read_exact(stream: &mut dyn Read, mut buf: &mut [u8]) -> std::io::
     Ok(())
 }
 
-pub(crate) fn header_value(head: &[u8], name: &str) -> Option<String> {
+pub(crate) fn header_value<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
     lines.next()?;
     for line in lines {
         let (key, value) = line.split_once(':')?;
         if key.trim().eq_ignore_ascii_case(name) {
-            return Some(value.trim().to_owned());
+            return Some(value.trim());
         }
     }
     None
 }
 
-pub(crate) fn request_path(head: &[u8]) -> Option<String> {
+pub(crate) fn request_path(head: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(head).ok()?;
     let line = text.split("\r\n").next()?;
     let mut parts = line.split_whitespace();
@@ -4115,12 +4115,7 @@ pub(crate) fn request_path(head: &[u8]) -> Option<String> {
         return None;
     }
     let target = parts.next()?;
-    Some(
-        target
-            .split_once('?')
-            .map_or(target, |(base, _)| base)
-            .to_owned(),
-    )
+    Some(target.split_once('?').map_or(target, |(base, _)| base))
 }
 
 pub(crate) fn write_all_two(stream: &mut TcpStream, first: &[u8], second: &[u8]) -> bool {

@@ -250,6 +250,13 @@ fn split(read: TcpStream, prefix: Vec<u8>) -> Option<(XhttpReader, XhttpWriter)>
     Some((reader, writer))
 }
 
+fn has_chunked(value: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"chunked"))
+}
+
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
     let (head, prefix) = read_head(&mut read)?;
@@ -262,8 +269,7 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, Xhtt
     if !path_covers(path, bare_path(target)) {
         return None;
     }
-    let chunked = crate::proxy::header_value(&head, "transfer-encoding")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let chunked = crate::proxy::header_value(&head, "transfer-encoding").is_some_and(has_chunked);
     if !chunked {
         return None;
     }
@@ -286,9 +292,7 @@ pub(crate) fn connect(
     if text.split("\r\n").next()? != "HTTP/1.1 200 OK" {
         return None;
     }
-    if !crate::proxy::header_value(&head, "transfer-encoding")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
-    {
+    if !crate::proxy::header_value(&head, "transfer-encoding").is_some_and(has_chunked) {
         return None;
     }
     split(read, prefix)
@@ -326,6 +330,25 @@ mod tests {
         assert!(path_covers("/service", "/service/session"));
         assert!(path_covers("/", "/anything"));
         assert!(!path_covers("/service", "/service-evil"));
+    }
+
+    #[test]
+    fn chunked_matches_case_insensitive_contains() {
+        for (value, want) in [
+            ("chunked", true),
+            ("Chunked", true),
+            ("CHUNKED", true),
+            ("gzip, chunked", true),
+            ("chunked, gzip", true),
+            ("mychunked", true),
+            ("chunkedx", true),
+            ("chu", false),
+            ("", false),
+            ("gzip", false),
+            ("identity", false),
+        ] {
+            assert_eq!(has_chunked(value), want, "{value}");
+        }
     }
 
     #[test]

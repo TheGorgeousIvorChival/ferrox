@@ -355,12 +355,12 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(WsReader, WsWrite
         return None;
     }
     let offered = crate::proxy::header_value(&head, "sec-websocket-protocol").unwrap_or_default();
-    let early = early_decode(&offered)
+    let early = early_decode(offered)
         .filter(|bytes| !bytes.is_empty())
         .unwrap_or_default();
     let mut response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
-        accept_key(&key)
+        accept_key(key)
     );
     if !early.is_empty() {
         let _ = write!(response, "Sec-WebSocket-Protocol: {offered}\r\n");
