@@ -59,7 +59,14 @@ pub fn chacha20_poly1305_decrypt_in_place(
     buf: &mut [u8],
     tag: &[u8; 16],
 ) -> Option<usize> {
-    let mut state = Poly1305::new(&poly_key(key, nonce));
+    // block zero is the one-time key and block one the first body block: one pass
+    // writes both, into the head and into a staging buffer the tag must clear first
+    let mut one_time = [0u8; 32];
+    let mut staged = [0u8; 64];
+    let first = buf.len().min(staged.len());
+    fill_exact_with_head(key, nonce, 0, &mut one_time, &mut staged[..first]);
+
+    let mut state = Poly1305::new(&one_time);
     mac(&mut state, aad, buf);
     let want = state.finish();
 
@@ -71,7 +78,13 @@ pub fn chacha20_poly1305_decrypt_in_place(
         return None;
     }
 
-    fill_exact(key, nonce, 1, buf);
+    let (staged_body, rest) = buf.split_at_mut(first);
+    for (byte, keystream) in staged_body.iter_mut().zip(staged.iter()) {
+        *byte ^= keystream;
+    }
+    if !rest.is_empty() {
+        fill_exact(key, nonce, 2, rest);
+    }
     Some(buf.len())
 }
 
