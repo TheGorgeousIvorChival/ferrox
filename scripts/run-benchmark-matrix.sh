@@ -70,7 +70,7 @@ for entry in $engine_list; do
     path="$source"
   else
     build_log="$(mktemp)"
-    if path="$(build "$source" >"$build_log" 2>&1)"; then
+    if path="$(build "$source" 2>"$build_log")"; then
       rm -f "$build_log"
     else
       echo "::warning::could not build $label from its pin on this host; log:" >&2
