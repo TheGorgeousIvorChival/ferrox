@@ -478,10 +478,7 @@ mod tests {
                 .expect("configures");
             let err = client.handshake().expect_err("wrong name must fail");
             // The detail names which of the certificate problems this is.
-        assert!(
-            err.to_string().contains("bad certificate"),
-            "{err}"
-        );
+            assert!(err.to_string().contains("bad certificate"), "{err}");
         });
     }
 

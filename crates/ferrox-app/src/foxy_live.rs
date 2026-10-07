@@ -22,6 +22,7 @@ use crate::foxy_account::{Account, Auth, Endpoint};
 use crate::foxy_challenge::Jar;
 use ferrox_core::foxy::Pass;
 use std::io::{Read, Write};
+use std::net::ToSocketAddrs as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -209,6 +210,20 @@ fn the_quic_lane_reaches_the_edge_over_udp_or_says_why_not() {
         port: edge.port,
         roots: None,
     };
+    // The same authority over TCP, so a failure names the protocol rather than
+    // the address: a host that answers CONNECT and ignores QUIC is a different
+    // answer from a host that answers neither.
+    let peer = format!("{}:{}", edge.host, edge.port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next());
+    let tcp = peer
+        .and_then(|peer| std::net::TcpStream::connect_timeout(&peer, Duration::from_secs(10)).ok());
+    println!(
+        "tcp to {}: {}",
+        edge.authority(),
+        if tcp.is_some() { "answered" } else { "refused" }
+    );
     match crate::quic::pooled_stream(&dial) {
         Some(_) => println!("h3 handshake completed with {}", edge.authority()),
         None => println!("no h3 handshake with {} over udp/{}", edge.host, edge.port),
