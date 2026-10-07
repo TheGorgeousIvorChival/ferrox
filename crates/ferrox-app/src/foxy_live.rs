@@ -33,9 +33,10 @@ const TRACE_PATH: &str = "/cdn-cgi/trace";
 const READ: Duration = Duration::from_secs(20);
 
 fn account() -> Option<Account> {
+    let roots = crate::quic::system_roots();
     Some(Account {
-        fxa: Endpoint::parse(ferrox_core::foxy::account::FXA_SERVER, Vec::new())?,
-        guardian: Endpoint::parse(ferrox_core::foxy::account::GUARDIAN_SERVER, Vec::new())?,
+        fxa: Endpoint::parse(ferrox_core::foxy::account::FXA_SERVER, roots.clone())?,
+        guardian: Endpoint::parse(ferrox_core::foxy::account::GUARDIAN_SERVER, roots)?,
         jar: std::sync::Arc::new(Mutex::new(Jar::default())),
         pending: std::sync::Arc::new(Mutex::new(None)),
         auth: std::sync::Arc::new(Mutex::new(Auth {

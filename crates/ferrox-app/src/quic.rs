@@ -321,7 +321,12 @@ pub(crate) fn pump_once(
             let _ = conn.recv(&mut buf[..n], info);
             flush_egress(conn, sock);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
             conn.on_timeout();
             flush_egress(conn, sock);
         }
@@ -427,14 +432,30 @@ pub(crate) fn stream_recv_exact(
 /// A lane that dials a pinned address with its own CA never needs these; a lane
 /// that talks to a publicly trusted host cannot work without them, because an
 /// empty root store is not "trust the platform" — it is trust nothing. The
-/// bundles are unix paths: on Windows the store is not a file, and `caCertFile`
-/// is where a Windows user names their anchors.
+/// bundles are file paths: on Windows the system store is not a file, so the
+/// Git-bundled PEMs are tried and `caCertFile` remains where a Windows user
+/// names their anchors outright. `SSL_CERT_FILE` is honoured everywhere
+/// because that is what OpenSSL-shaped tooling already promises.
 pub(crate) fn system_roots() -> Vec<Vec<u8>> {
-    const BUNDLES: [&str; 4] = [
+    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+        if let Ok(pem) = std::fs::read(&path) {
+            let roots = parse_ca_pem(&pem);
+            if !roots.is_empty() {
+                return roots;
+            }
+        }
+    }
+    const BUNDLES: [&str; 10] = [
         "/etc/ssl/cert.pem",
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
         "/etc/ssl/ca-bundle.pem",
+        "/opt/homebrew/etc/ca-certificates/cert.pem",
+        "/usr/local/etc/ca-certificates/cert.pem",
+        "C:/Program Files/Git/mingw64/ssl/certs/ca-bundle.crt",
+        "C:/Program Files/Git/usr/ssl/certs/ca-bundle.crt",
+        "C:/msys64/mingw64/ssl/certs/ca-bundle.crt",
+        "C:/msys64/usr/ssl/certs/ca-bundle.crt",
     ];
     for path in BUNDLES {
         if let Ok(pem) = std::fs::read(path) {
@@ -442,6 +463,24 @@ pub(crate) fn system_roots() -> Vec<Vec<u8>> {
             if !roots.is_empty() {
                 return roots;
             }
+        }
+    }
+    // Android keeps its anchors as one file per CA under this directory rather
+    // than a single bundle; either PEM or DER halves are accepted.
+    if let Ok(entries) = std::fs::read_dir("/system/etc/security/cacerts") {
+        let mut roots = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            if bytes.starts_with(b"-----BEGIN") {
+                roots.extend(parse_ca_pem(&bytes));
+            } else if !bytes.is_empty() {
+                roots.push(bytes);
+            }
+        }
+        if !roots.is_empty() {
+            return roots;
         }
     }
     Vec::new()
@@ -513,9 +552,40 @@ fn pump(
 ) {
     let mut ready: Vec<(u64, TcpStream)> = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut buf = [0u8; MAX_DATAGRAM];
     loop {
+        // The lock is for quiche calls only, never for the wait between them: a
+        // stalled peer must not stall the sessions sharing the connection.
+        let wait = {
+            let Ok(conn) = shared.lock() else {
+                return;
+            };
+            if conn.is_closed() {
+                return;
+            }
+            conn.timeout().map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
+        };
+        if sock
+            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+            .is_err()
+        {
+            return;
+        }
+        let incoming = match sock.recv_from(&mut buf) {
+            Ok(found) => Some(found),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                None
+            }
+            Err(_) => return,
+        };
         ready.clear();
         {
+            #[cfg(test)]
             let took = Instant::now();
             let Ok(mut conn) = shared.lock() else {
                 return;
@@ -525,14 +595,14 @@ fn pump(
             if conn.is_closed() {
                 return;
             }
-            let polled = Instant::now();
-            if !pump_once(&mut conn, sock, local, PUMP_POLL) {
-                #[cfg(test)]
-                qstage(format!("pump-gone {}ms", polled.elapsed().as_millis()));
-                return;
+            match incoming {
+                Some((n, from)) => {
+                    let info = quiche::RecvInfo { from, to: local };
+                    let _ = conn.recv(&mut buf[..n], info);
+                }
+                None => conn.on_timeout(),
             }
-            #[cfg(test)]
-            qstage(format!("pump-once {}ms", polled.elapsed().as_millis()));
+            flush_egress(&mut conn, sock);
             for id in conn.readable() {
                 let half = {
                     let Ok(table) = table.lock() else {
@@ -649,6 +719,7 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStr
     };
     let mut chunk = [0u8; 8192];
     loop {
+        #[cfg(test)]
         let read_at = Instant::now();
         match plain.read(&mut chunk) {
             Ok(0) | Err(_) => break,
@@ -663,6 +734,7 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStr
                 let mut rest = &chunk[..n];
                 let deadline = Instant::now() + SEND_WAIT;
                 let sent = loop {
+                    #[cfg(test)]
                     let waited = Instant::now();
                     let Ok(mut conn) = pooled.conn.lock() else {
                         #[cfg(test)]

@@ -60,6 +60,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: foxy-live
+      # The runner's bundle predates the Let's Encrypt intermediates the
+      # account host is issued from (YR1/YR2 in 2026), so refresh it before
+      # measuring: an UnknownIssuer from a stale runner is a measurement of
+      # the runner, not of the lane.
+      - name: Refresh the runner trust store
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ca-certificates
+          sudo update-ca-certificates || true
+          echo "runner bundle now:"
+          for bundle in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt; do
+            if [ -r "$bundle" ]; then
+              echo "$bundle: $(grep -c 'BEGIN CERTIFICATE' "$bundle") certificates"
+            fi
+          done
       # Signs in for real, mints for real, reads the catalogue, and reports which
       # carriers answered. Every output line is metadata; the pass is never
       # printed. This is the only check that can say whether QUIC works.
