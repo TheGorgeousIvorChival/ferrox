@@ -30,6 +30,8 @@ pub(crate) enum Denied {
     Quota,
     /// The edge is asking for a client it considers a bot. Named, not guessed.
     Challenged(u16),
+    /// The plane could not be reached at all, with the phase that gave up.
+    Unreachable(String),
     /// Anything else, with the status it came back as.
     Other(u16),
 }
@@ -42,6 +44,7 @@ impl std::fmt::Display for Denied {
             Self::Challenged(status) => {
                 write!(f, "the edge answered {status} and asked for a challenge")
             }
+            Self::Unreachable(why) => write!(f, "the account plane is unreachable: {why}"),
             Self::Other(status) => write!(f, "the account plane answered {status}"),
         }
     }
@@ -310,20 +313,26 @@ impl Endpoint {
         }
     }
 
-    fn connect(&self) -> Result<RustlsProvider<TcpStream>, Failure> {
+    /// The one place an account-plane failure is named rather than flattened: a
+    /// refused dial, an untrusted certificate and a read timeout are three
+    /// different problems, and a log that says only "io failed" names none.
+    fn connect(&self) -> Result<RustlsProvider<TcpStream>, String> {
         let peer = match self.address {
             Some(address) => address,
             None => format!("{}:{}", self.host, self.port)
                 .to_socket_addrs()
-                .map_err(|_| Failure::Io)?
+                .map_err(|why| format!("resolve {}: {why}", self.host))?
                 .next()
-                .ok_or(Failure::Io)?,
+                .ok_or_else(|| format!("{} resolves to nothing", self.host))?,
         };
-        let stream = TcpStream::connect_timeout(&peer, IO_TIMEOUT).map_err(|_| Failure::Io)?;
+        let stream = TcpStream::connect_timeout(&peer, IO_TIMEOUT)
+            .map_err(|why| format!("connect {peer}: {why}"))?;
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let mut tls = RustlsProvider::connect(&self.tls(), stream).map_err(|_| Failure::Io)?;
-        tls.handshake().map_err(|_| Failure::Io)?;
+        let mut tls = RustlsProvider::connect(&self.tls(), stream)
+            .map_err(|why| format!("tls {}: {why}", self.host))?;
+        tls.handshake()
+            .map_err(|why| format!("handshake {}: {why}", self.host))?;
         Ok(tls)
     }
 }
@@ -357,11 +366,12 @@ pub(crate) fn send(
     if let Some(cookie) = cookie.as_deref() {
         headers.push(("Cookie", cookie));
     }
-    let mut tls = endpoint.connect().map_err(|_| Denied::Other(0))?;
+    let mut tls = endpoint.connect().map_err(Denied::Unreachable)?;
     tls.write_all(&request(method, &endpoint.origin(), &url, &headers, body))
         .and_then(|()| tls.flush())
-        .map_err(|_| Denied::Other(0))?;
-    let reply = read_reply(&mut tls).map_err(|_| Denied::Other(0))?;
+        .map_err(|why| Denied::Unreachable(format!("writing {} {url}: {why}", endpoint.host)))?;
+    let reply = read_reply(&mut tls)
+        .map_err(|why| Denied::Unreachable(format!("reading {} {url}: {why}", endpoint.host)))?;
     if let Ok(mut jar) = jar.lock() {
         jar.absorb(&endpoint.host, &reply);
     }
