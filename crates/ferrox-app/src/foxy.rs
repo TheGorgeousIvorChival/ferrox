@@ -15,20 +15,28 @@ use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
-const DEFAULT_WINDOW: u32 = 65_535;
-const OUR_WINDOW: u32 = 1_048_576;
-const MAX_FRAME: usize = 65_536;
+const MAX_FRAME: usize = frames::MAX_FRAME as usize;
 const MAX_HEAD: usize = 8_192;
 const SEND_WAIT: Duration = Duration::from_secs(10);
-/// A QUIC connection's flow-control ceiling as the relay sees it: the lane
-/// advertises far more than a tunnel needs, so the window is never the limit.
-const MAX_WINDOW: i64 = i64::MAX / 2;
+/// The client's first unidirectional stream, which is where the SETTINGS that
+/// make this connection HTTP/3 go.
+const CONTROL_STREAM: u64 = 2;
+/// How much of the request stream is buffered before the lane starts dropping
+/// what it has already read, and the frame size one DATA frame may carry.
+const H3_WINDOW: usize = 256 * 1024;
+const H3_FRAME: usize = 16 * 1024;
 
+/// The carriers the lane can carry, in the order `auto` prefers them: QUIC
+/// first because one handshake carries every flow, HTTP/2 because the edge
+/// speaks it, HTTP/1.1 because every edge does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Carrier {
     H1,
     H2,
     H3,
+    /// Try each carrier in turn, so an edge that will not answer QUIC is a
+    /// slower tunnel rather than a refused one.
+    Auto,
 }
 
 impl Carrier {
@@ -38,7 +46,32 @@ impl Carrier {
             Self::H1 => b"http/1.1",
             Self::H2 => b"h2",
             Self::H3 => b"h3",
+            // An unexpanded `auto` offers nothing, so a dial that reaches here
+            // with one fails the handshake instead of quietly dialling HTTP/2.
+            Self::Auto => b"",
         }
+    }
+
+    /// The carriers to try, most preferred first, one entry when not `auto`.
+    #[must_use]
+    pub(crate) const fn order(self) -> [Self; 3] {
+        match self {
+            Self::Auto => [Self::H3, Self::H2, Self::H1],
+            Self::H3 => [Self::H3, Self::H3, Self::H3],
+            Self::H2 => [Self::H2, Self::H2, Self::H2],
+            Self::H1 => [Self::H1, Self::H1, Self::H1],
+        }
+    }
+}
+
+/// Reads a carrier from a config or a link: `auto` is a carrier, and anything
+/// the lane does not know is `auto` rather than a silent HTTP/2.
+pub(crate) fn carrier(name: &str) -> Carrier {
+    match name {
+        "h1" | "http/1.1" => Carrier::H1,
+        "h2" | "http/2" => Carrier::H2,
+        "h3" | "quic" => Carrier::H3,
+        _ => Carrier::Auto,
     }
 }
 
@@ -147,33 +180,37 @@ pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
     tls.handshake().map_err(|_| Failure::Io)?;
     negotiated(&tls, dial)?;
 
-    let empty = frames::H2Frame {
-        kind: frames::SETTINGS,
-        flags: 0,
-        stream: 0,
-        length: 0,
-    };
     let mut block = Vec::with_capacity(96 + dial.pass.token.len());
     hpack::hpack_connect(target, &dial.pass.token, &mut block);
-    let headers = frames::H2Frame {
-        kind: frames::HEADERS,
-        flags: 0x4,
-        stream: 1,
-        length: block.len() as u32,
-    };
-    tls.write_all(frames::PREFACE)
-        .and_then(|()| tls.write_all(&empty.header()))
-        .and_then(|()| tls.write_all(&headers.header()))
-        .and_then(|()| tls.write_all(&block))
-        .and_then(|()| tls.flush())
-        .map_err(|_| Failure::Io)?;
+    // The stream window arrives in the settings; the connection window only
+    // moves by a frame, so without this one the tunnel is paced by a round trip
+    // for its first 64 KiB however large the stream window is.
+    let mut opening = Vec::with_capacity(48 + block.len());
+    opening.extend_from_slice(frames::PREFACE);
+    h2_frame(
+        frames::SETTINGS,
+        0,
+        0,
+        &frames::client_settings(),
+        &mut opening,
+    );
+    h2_frame(
+        frames::WINDOW_UPDATE,
+        0,
+        0,
+        &(frames::WINDOW - frames::DEFAULT_WINDOW).to_be_bytes(),
+        &mut opening,
+    );
+    h2_frame(frames::HEADERS, 0x4, 1, &block, &mut opening);
+    tls.write_all(&opening).map_err(|_| Failure::Io)?;
 
     let mut lane = Tls2 {
         tls,
-        window: foxy::flow::Window::new(i64::from(DEFAULT_WINDOW), i64::from(DEFAULT_WINDOW)),
+        window: foxy::flow::Window::new(i64::from(frames::WINDOW), i64::from(frames::WINDOW)),
         max_frame: MAX_FRAME,
-        send_window: OUR_WINDOW,
         carry: Vec::new(),
+        at: 0,
+        out: Vec::new(),
         fin: false,
     };
     let status = lane.await_status()?;
@@ -199,78 +236,135 @@ pub(crate) struct Tls2 {
     tls: ferrox_core::tls::RustlsProvider<TcpStream>,
     window: foxy::flow::Window,
     max_frame: usize,
-    send_window: u32,
+    /// Bytes read from a DATA frame that the caller has not taken yet, and how
+    /// far into them it has got: a cursor rather than a drain, because draining
+    /// moves what is left on every call.
     carry: Vec<u8>,
+    at: usize,
+    /// The frame this lane writes, reused so a relay allocates nothing per frame.
+    out: Vec<u8>,
     fin: bool,
 }
 
+/// One frame off the wire: the header, and the payload in the buffer the caller
+/// owns, because a field cannot be borrowed and written in the same match.
+fn read_frame(
+    tls: &mut ferrox_core::tls::RustlsProvider<TcpStream>,
+    out: &mut Vec<u8>,
+    max_frame: usize,
+) -> Result<frames::H2Frame, Failure> {
+    let mut header = [0u8; frames::H2_HEADER];
+    read_exact(tls, &mut header).map_err(|()| Failure::Stream)?;
+    let frame = frames::H2Frame::parse(&header).ok_or(Failure::Frame)?;
+    out.clear();
+    out.resize((frame.length as usize).min(max_frame), 0);
+    read_exact(tls, out).map_err(|()| Failure::Stream)?;
+    Ok(frame)
+}
+
 impl Tls2 {
-    fn read_frame(&mut self) -> Result<(frames::H2Frame, Vec<u8>), Failure> {
-        let mut header = [0u8; frames::H2_HEADER];
-        read_exact(&mut self.tls, &mut header).map_err(|()| Failure::Stream)?;
-        let frame = frames::H2Frame::parse(&header).ok_or(Failure::Frame)?;
-        let len = (frame.length as usize).min(self.max_frame);
-        let mut payload = vec![0u8; len];
-        read_exact(&mut self.tls, &mut payload).map_err(|()| Failure::Stream)?;
-        Ok((frame, payload))
+    /// Reads one frame, hands it to `body` with the payload borrowed, and puts
+    /// the buffer back: the frame is handled while the lane owns it.
+    fn with_frame<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self, frames::H2Frame, &[u8]) -> R,
+    ) -> Result<R, Failure> {
+        let mut payload = std::mem::take(&mut self.out);
+        let frame = read_frame(&mut self.tls, &mut payload, self.max_frame);
+        let out = match frame {
+            Ok(frame) => body(self, frame, &payload),
+            Err(failure) => {
+                self.out = payload;
+                return Err(failure);
+            }
+        };
+        self.out = payload;
+        Ok(out)
+    }
+
+    /// The window this lane grants back as it reads, one update per frame: the
+    /// peer may not send faster than the tunnel is drained, and the connection
+    /// update is the one that would otherwise stop a relay in its tracks.
+    fn credit(&mut self, len: usize) -> Result<(), Failure> {
+        let increment = (len as u32).to_be_bytes();
+        let mut out = [0u8; 26];
+        for (slot, stream) in [(9usize, 1u32), (22, 0)] {
+            let frame = frames::H2Frame {
+                kind: frames::WINDOW_UPDATE,
+                flags: 0,
+                stream,
+                length: 4,
+            };
+            out[slot - 9..slot].copy_from_slice(&frame.header());
+            out[slot..slot + 4].copy_from_slice(&increment);
+        }
+        self.tls.write_all(&out).map_err(|_| Failure::Io)
+    }
+
+    fn ack(&mut self, kind: u8, payload: &[u8]) -> Result<(), Failure> {
+        self.out.clear();
+        h2_frame(kind, 0x1, 0, payload, &mut self.out);
+        self.tls.write_all(&self.out).map_err(|_| Failure::Io)
+    }
+
+    /// A push promise is refused by name, which is the only stream the lane
+    /// answers that is not the one stream it opened.
+    fn refuse_push(&mut self) -> Result<(), Failure> {
+        self.out.clear();
+        h2_frame(frames::RST_STREAM, 0, 1, &8u32.to_be_bytes(), &mut self.out);
+        self.tls.write_all(&self.out).map_err(|_| Failure::Io)
     }
 
     fn await_status(&mut self) -> Result<u16, Failure> {
         let deadline = Instant::now() + HEADER_TIMEOUT;
         let mut block = Vec::with_capacity(64);
-        loop {
-            if Instant::now() >= deadline {
-                return Err(Failure::Stream);
-            }
-            let (frame, payload) = self.read_frame()?;
-            match frames::h2_event(frame, &payload, 1) {
-                frames::H2Event::Headers { block: more, .. } => {
-                    block.extend_from_slice(more);
-                    return hpack::hpack_status(&block).ok_or(Failure::Frame);
-                }
-                frames::H2Event::Settings {
-                    ack: false,
-                    payload,
-                } => {
-                    let mut out = Vec::with_capacity(32);
-                    let mut at = 0usize;
-                    while let Some((id, value)) = frames::setting(payload, at) {
-                        match id {
-                            4 => self.window.reset_stream(value),
-                            5 => self.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
-                            _ => {}
-                        }
-                        at += 6;
+        while Instant::now() < deadline {
+            let status = self.with_frame(|lane, frame, payload| {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Headers { block: more, .. } => {
+                        block.extend_from_slice(more);
+                        hpack::hpack_status(&block).map(Some).ok_or(Failure::Frame)
                     }
-                    h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
-                    h2_frame(
-                        frames::WINDOW_UPDATE,
-                        0,
-                        0,
-                        &(self.send_window - DEFAULT_WINDOW).to_be_bytes(),
-                        &mut out,
-                    );
-                    self.tls.write_all(&out).map_err(|_| Failure::Io)?;
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut at = 0usize;
+                        while let Some((id, value)) = frames::setting(payload, at) {
+                            match id {
+                                4 => lane.window.reset_stream(value),
+                                5 => lane.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
+                                _ => {}
+                            }
+                            at += 6;
+                        }
+                        lane.ack(frames::SETTINGS, &[]).map(|()| None)
+                    }
+                    frames::H2Event::Ping { ack: false, .. } => {
+                        lane.ack(frames::PING, payload).map(|()| None)
+                    }
+                    frames::H2Event::Push => lane.refuse_push().map(|()| None),
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        Err(Failure::Stream)
+                    }
+                    _ => Ok(None),
                 }
-                frames::H2Event::Ping {
-                    ack: false,
-                    payload,
-                } => {
-                    let mut out = Vec::with_capacity(17);
-                    h2_frame(frames::PING, 0x1, 0, payload, &mut out);
-                    self.tls.write_all(&out).map_err(|_| Failure::Io)?;
-                }
-                frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
-                    return Err(Failure::Stream);
-                }
-                frames::H2Event::Push => {
-                    let mut out = Vec::with_capacity(13);
-                    h2_frame(frames::RST_STREAM, 0, 1, &8u32.to_be_bytes(), &mut out);
-                    self.tls.write_all(&out).map_err(|_| Failure::Io)?;
-                }
-                _ => {}
+            })??;
+            if let Some(status) = status {
+                return Ok(status);
             }
         }
+        Err(Failure::Stream)
+    }
+
+    /// Hands the caller what it asked for out of `carry` and moves the cursor:
+    /// a copy of the bytes only, never a move of what is left.
+    fn take(&mut self, buf: &mut [u8]) -> usize {
+        let take = buf.len().min(self.carry.len() - self.at);
+        buf[..take].copy_from_slice(&self.carry[self.at..self.at + take]);
+        self.at += take;
+        if self.at == self.carry.len() {
+            self.carry.clear();
+            self.at = 0;
+        }
+        take
     }
 }
 
@@ -285,9 +379,9 @@ impl Write for Tls2 {
         }
         self.window.take(frame);
         let frame = frame as usize;
-        let mut out = Vec::with_capacity(frames::H2_HEADER + frame);
-        h2_frame(frames::DATA, 0, 1, &buf[..frame], &mut out);
-        self.tls.write_all(&out)?;
+        self.out.clear();
+        h2_frame(frames::DATA, 0, 1, &buf[..frame], &mut self.out);
+        self.tls.write_all(&self.out)?;
         Ok(frame)
     }
 
@@ -299,54 +393,39 @@ impl Write for Tls2 {
 impl Read for Tls2 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            if !self.carry.is_empty() {
-                let take = buf.len().min(self.carry.len());
-                buf[..take].copy_from_slice(&self.carry[..take]);
-                self.carry.drain(..take);
-                return Ok(take);
+            if self.at < self.carry.len() {
+                return Ok(self.take(buf));
             }
             if self.fin {
                 return Ok(0);
             }
-            let (frame, payload) = self.read_frame().map_err(io)?;
-            match frames::h2_event(frame, &payload, 1) {
-                frames::H2Event::Data { payload, end } => {
-                    self.window.add_stream(payload.len() as u32);
-                    self.window.add_connection(payload.len() as u32);
-                    if !payload.is_empty() {
-                        let mut out = Vec::with_capacity(13 + payload.len());
-                        h2_frame(
-                            frames::WINDOW_UPDATE,
-                            0,
-                            1,
-                            &(payload.len() as u32).to_be_bytes(),
-                            &mut out,
-                        );
-                        h2_frame(
-                            frames::WINDOW_UPDATE,
-                            0,
-                            0,
-                            &(payload.len() as u32).to_be_bytes(),
-                            &mut out,
-                        );
-                        self.tls.write_all(&out)?;
-                        self.carry.extend_from_slice(payload);
+            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Data { payload, end } => {
+                        let len = payload.len();
+                        lane.carry.clear();
+                        lane.carry.extend_from_slice(payload);
+                        lane.at = 0;
+                        lane.window.add_stream(len as u32);
+                        lane.window.add_connection(len as u32);
+                        lane.fin = end;
+                        if len > 0 {
+                            lane.credit(len).map_err(io)?;
+                        }
+                        Ok(())
                     }
-                    self.fin = end;
+                    frames::H2Event::Ping { ack: false, .. } => {
+                        lane.ack(frames::PING, payload).map_err(io)?;
+                        Ok(())
+                    }
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        lane.fin = true;
+                        Ok(())
+                    }
+                    _ => Ok(()),
                 }
-                frames::H2Event::Ping {
-                    ack: false,
-                    payload,
-                } => {
-                    let mut out = Vec::with_capacity(17);
-                    h2_frame(frames::PING, 0x1, 0, payload, &mut out);
-                    self.tls.write_all(&out)?;
-                }
-                frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
-                    self.fin = true;
-                }
-                _ => {}
-            }
+            });
+            read.map_err(io)??;
         }
     }
 }
@@ -389,8 +468,14 @@ pub(crate) struct H3 {
     sock: std::sync::Arc<UdpSocket>,
     local: SocketAddr,
     stream: u64,
-    window: foxy::flow::Window,
+    /// The request's HEADERS frame and whatever followed it on the same stream,
+    /// plus the frame this lane writes: three buffers, none of them per frame.
+    head: Vec<u8>,
+    carried: usize,
     carry: Vec<u8>,
+    at: usize,
+    out: Vec<u8>,
+    inbox: Vec<u8>,
     fin: bool,
     deadline: Instant,
 }
@@ -403,8 +488,12 @@ impl H3 {
             sock,
             local,
             stream,
-            window: foxy::flow::Window::new(MAX_WINDOW, MAX_WINDOW),
+            head: Vec::with_capacity(256),
+            carried: 0,
             carry: Vec::new(),
+            at: 0,
+            out: Vec::new(),
+            inbox: Vec::new(),
             fin: false,
             deadline: Instant::now(),
         };
@@ -421,15 +510,24 @@ impl H3 {
         Some(out)
     }
 
-    /// The control stream is unidirectional stream 2, which is the first id QUIC
-    /// hands a client after its own 0; a SETTINGS frame on it is what the peer
-    /// waits for before it will answer anything.
+    /// The control stream is the client's first unidirectional stream, id 2, and
+    /// its SETTINGS are what the peer waits for before it answers anything.
+    ///
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL` is sent as zero on purpose: it says
+    /// this lane sends a classic CONNECT with no `:protocol`, which is the shape
+    /// the edge answers over HTTP/2, and a peer that believes otherwise reads
+    /// the request as one it may refuse.
     fn control(&mut self) -> Result<(), Failure> {
-        let mut settings = Vec::new();
-        frames::quic_varint(&mut settings, 0x04);
-        frames::quic_varint(&mut settings, 0);
-        self.send(2, &settings, false)?;
-        self.fin(2)?;
+        self.out.clear();
+        frames::quic_varint(&mut self.out, frames::H3_DATA);
+        frames::quic_varint(&mut self.out, 4);
+        frames::quic_varint(&mut self.out, 0x04);
+        frames::quic_varint(&mut self.out, 0);
+        let settings = std::mem::take(&mut self.out);
+        let sent = self.send(CONTROL_STREAM, &settings, false);
+        self.out = settings;
+        sent?;
+        self.fin(CONTROL_STREAM)?;
         Ok(())
     }
 
@@ -440,7 +538,7 @@ impl H3 {
         frames::quic_varint(&mut frame, frames::H3_HEADERS);
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(&block);
-        self.send(0, &frame, false)?;
+        self.send(self.stream, &frame, false)?;
         self.read_head()
     }
 
@@ -480,45 +578,70 @@ impl H3 {
         }
     }
 
+    /// Pulls the request stream until a whole HEADERS frame has arrived, then
+    /// reads the status out of it. Bytes read past that frame stay buffered,
+    /// because the first DATA frame the edge sends is the tunnel and not a
+    /// header the caller wants.
     fn read_head(&mut self) -> Result<u16, Failure> {
         self.deadline = Instant::now() + HEADER_TIMEOUT;
-        let mut head = Vec::with_capacity(64);
         while Instant::now() < self.deadline {
-            let id = self.stream;
-            let read = self.with_conn(|conn| {
-                let mut chunk = [0u8; 4096];
-                conn.stream_recv(id, &mut chunk).map(|read| (read, chunk))
-            });
-            let Some(read) = read else {
-                return Err(Failure::Io);
-            };
-            match read {
-                Ok(((n, fin), chunk)) => {
-                    head.extend_from_slice(&chunk[..n]);
-                    if fin {
-                        break;
-                    }
-                }
-                Err(quiche::Error::Done) => {
+            let at = self.carried;
+            if let Some(status) = Self::header_in(&self.head[at..])? {
+                return Ok(status);
+            }
+            self.fill()?;
+        }
+        Err(Failure::Stream)
+    }
+
+    /// The status of the first complete HEADERS frame in `bytes`, and how much
+    /// of it that frame was.
+    fn header_in(bytes: &[u8]) -> Result<Option<u16>, Failure> {
+        let mut at = 0usize;
+        let Some(frame) = frames::h3_frame(bytes, &mut at) else {
+            return Ok(None);
+        };
+        let Some(end) = at.checked_add(frame.length as usize) else {
+            return Err(Failure::Frame);
+        };
+        let Some(body) = bytes.get(at..end) else {
+            return Ok(None);
+        };
+        match frames::h3_event(frame, body) {
+            frames::H3Event::Headers { block, .. } => {
+                hpack::qpack_status(block).map(Some).ok_or(Failure::Frame)
+            }
+            frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => Err(Failure::Stream),
+            _ => Ok(None),
+        }
+    }
+
+    /// One read from the request stream into the head buffer, or a pump when
+    /// nothing has arrived: the same two answers a QUIC stream can give.
+    fn fill(&mut self) -> Result<(), Failure> {
+        let id = self.stream;
+        let room = H3_WINDOW - self.head.len();
+        let mut chunk = std::mem::take(&mut self.inbox);
+        chunk.resize(room.max(1), 0);
+        let read = self.with_conn(|conn| conn.stream_recv(id, &mut chunk).map(|r| (r, ())));
+        self.inbox = chunk;
+        let Some(Ok(((n, fin), ()))) = read else {
+            return match read {
+                Some(Err(quiche::Error::Done)) => {
                     if Instant::now() >= self.deadline {
                         return Err(Failure::Stream);
                     }
                     self.pump(Duration::from_millis(5));
+                    Ok(())
                 }
-                Err(_) => return Err(Failure::Stream),
-            }
-            let mut at = 0usize;
-            let Some(frame) = frames::h3_frame(&head, &mut at) else {
-                continue;
+                _ => Err(Failure::Io),
             };
-            let Some(body) = head.get(at..at + frame.length as usize) else {
-                continue;
-            };
-            if let frames::H3Event::Headers { block, .. } = frames::h3_event(frame, body) {
-                return hpack::qpack_status(block).ok_or(Failure::Frame);
-            }
+        };
+        self.head.extend_from_slice(&self.inbox[..n]);
+        if n == 0 && fin {
+            return Err(Failure::Stream);
         }
-        Err(Failure::Frame)
+        Ok(())
     }
 }
 
@@ -527,18 +650,19 @@ impl Write for H3 {
         if self.fin {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
-        let frame = foxy::flow::frame_size(buf.len(), 16_384).min(self.window.stream());
+        let frame = foxy::flow::frame_size(buf.len(), H3_FRAME);
         if frame == 0 {
             return Ok(0);
         }
-        self.window.take(frame);
-        let frame = frame as usize;
-        let mut out = Vec::with_capacity(8 + frame);
+        let mut out = std::mem::take(&mut self.out);
+        out.clear();
         frames::quic_varint(&mut out, frames::H3_DATA);
-        frames::quic_varint(&mut out, frame as u64);
-        out.extend_from_slice(&buf[..frame]);
-        self.send(self.stream, &out, false).map_err(io)?;
-        Ok(frame)
+        frames::quic_varint(&mut out, u64::from(frame));
+        out.extend_from_slice(&buf[..frame as usize]);
+        let sent = self.send(self.stream, &out, false);
+        self.out = out;
+        sent.map_err(io)?;
+        Ok(frame as usize)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -547,28 +671,68 @@ impl Write for H3 {
 }
 
 impl Read for H3 {
+    /// The tunnel, not the stream: what the caller gets is the payload of DATA
+    /// frames, because a frame header read as payload is a tunnel that carries
+    /// its own framing into every byte after it.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            if !self.carry.is_empty() {
-                let take = buf.len().min(self.carry.len());
-                buf[..take].copy_from_slice(&self.carry[..take]);
-                self.carry.drain(..take);
+            if self.at < self.carry.len() {
+                let take = buf.len().min(self.carry.len() - self.at);
+                buf[..take].copy_from_slice(&self.carry[self.at..self.at + take]);
+                self.at += take;
+                if self.at == self.carry.len() {
+                    self.carry.clear();
+                    self.at = 0;
+                }
                 return Ok(take);
             }
             if self.fin {
                 return Ok(0);
             }
-            let mut chunk = [0u8; 8192];
-            let id = self.stream;
-            let read = self
-                .with_conn(move |conn| conn.stream_recv(id, &mut chunk))
-                .ok_or_else(|| io(Failure::Io))?;
-            let (n, fin) = read.map_err(|_| io(Failure::Stream))?;
-            self.window.add_stream(n as u32);
-            self.window.add_connection(n as u32);
-            self.carry.extend_from_slice(&chunk[..n]);
-            if fin {
-                self.fin = true;
+            self.deadline = Instant::now() + HEADER_TIMEOUT;
+            let room = H3_WINDOW - self.head.len();
+            if room < 16 {
+                self.head.drain(..self.carried);
+                self.carried = 0;
+            }
+            self.fill().map_err(io)?;
+            self.take_frames().map_err(io)?;
+        }
+    }
+}
+
+impl H3 {
+    /// Walks the buffered frames, keeping a DATA payload for the caller and
+    /// leaving anything that is not tunnel bytes where the next read starts.
+    fn take_frames(&mut self) -> Result<(), Failure> {
+        loop {
+            let at = self.carried;
+            let mut head = 0usize;
+            let Some(frame) = frames::h3_frame(&self.head[at..], &mut head) else {
+                return Ok(());
+            };
+            let end = match at
+                .checked_add(head)
+                .and_then(|body| body.checked_add(frame.length as usize))
+            {
+                Some(end) if end <= self.head.len() => end,
+                _ => return Ok(()),
+            };
+            let body = at + head;
+            match frames::h3_event(frame, &self.head[body..end]) {
+                frames::H3Event::Data { payload, .. } => {
+                    self.carry.clear();
+                    self.carry.extend_from_slice(payload);
+                    self.at = 0;
+                    self.carried = end;
+                    return Ok(());
+                }
+                frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => {
+                    self.fin = true;
+                    self.carried = self.head.len();
+                    return Ok(());
+                }
+                _ => self.carried = end,
             }
         }
     }
@@ -619,6 +783,9 @@ impl Tunnel {
                 H3::open(dial, target, quic).map(|lane| Self::H3(Box::new(lane)))
             }
             (Carrier::H3, None) => Err(Failure::Stream),
+            // `auto` is expanded by the caller into the carriers it prefers; an
+            // unexpanded one here is a bug, and the answer is not a downgrade.
+            (Carrier::Auto, _) => Err(Failure::Frame),
         }
     }
 }
@@ -910,20 +1077,11 @@ mod loopback {
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(&server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
-            let mut head = vec![0u8; 24 + frames::H2_HEADER];
+            let mut head = vec![0u8; frames::PREFACE.len()];
             read_exact(&mut tls, &mut head).expect("reads the preface");
-            assert_eq!(&head[..24], frames::PREFACE);
-            let mut settings = Vec::new();
-            frames::H2Frame {
-                kind: frames::SETTINGS,
-                flags: 0,
-                stream: 0,
-                length: 0,
-            }
-            .header()
-            .to_vec();
+            assert_eq!(head, frames::PREFACE);
             let mut ack = Vec::new();
-            h2_frame(frames::SETTINGS, 0, 0, &[], &mut ack);
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
             tls.write_all(&ack).expect("acks");
             loop {
                 let mut header = [0u8; frames::H2_HEADER];
@@ -932,12 +1090,16 @@ mod loopback {
                 let mut payload = vec![0u8; frame.length as usize];
                 read_exact(&mut tls, &mut payload).expect("reads a payload");
                 match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
                     frames::H2Event::Headers { block, .. } => {
                         seen.send(block.to_vec()).expect("reports the block");
                         let mut out = Vec::new();
                         h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
                         tls.write_all(&out).expect("answers");
-                        settings.push(frame.stream);
                     }
                     frames::H2Event::Data { payload, .. } => {
                         let mut out = Vec::new();
@@ -1040,6 +1202,171 @@ mod loopback {
         });
         let dial = dial_for(roots, port, Carrier::H1, right);
         assert!(Tunnel::open(&dial, "example.com:443", None).is_ok());
+        edge.join().expect("joins");
+    }
+
+    /// The edge half of the QUIC carrier: a control stream, one HEADERS frame
+    /// with a QPACK status, and DATA frames echoed both ways.
+    ///
+    /// This is the proof the QUIC lane did not have: the request on the wire is
+    /// compared byte for byte with the block the lane wrote, the status is read
+    /// through the QPACK decoder, and the bytes that follow the head travel
+    /// through the tunnel. A codec test cannot answer any of those three.
+    fn h3_edge(
+        sock: UdpSocket,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let tag = format!("ferrox-foxy-h3-{}-{stamp}", std::process::id());
+            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+            std::fs::write(&cert_path, &cert_pem).expect("stages cert");
+            std::fs::write(&key_path, &key_pem).expect("stages key");
+            let mut config = crate::quic::server_config(crate::quic::ALPN);
+            config
+                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
+                .expect("loads chain");
+            config
+                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
+                .expect("loads key");
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&key_path);
+            let local = sock.local_addr().expect("addr");
+            let mut conn = crate::quic::server_accept(&sock, local, &mut config);
+            let mut buf = [0u8; 1350];
+            let mut out = [0u8; 1350];
+            // A server's own control stream is its first unidirectional stream,
+            // id 3, and the client's SETTINGS are answered on it.
+            let mut control = Vec::new();
+            frames::quic_varint(&mut control, frames::H3_DATA);
+            frames::quic_varint(&mut control, 0);
+            conn.stream_send(3, &control, true).expect("opens control");
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut request = None;
+            while request.is_none() {
+                assert!(std::time::Instant::now() < deadline, "the request arrives");
+                let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) else {
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                let ids: Vec<u64> = conn.readable().collect();
+                conn.recv(&mut buf[..n], info).expect("drives");
+                for id in ids {
+                    // The control stream is unidirectional and the request is
+                    // not, so the stream id itself tells them apart.
+                    if id % 4 != 0 {
+                        continue;
+                    }
+                    let piece = drain(&mut conn, id);
+                    if !piece.is_empty() {
+                        request = Some((id, piece));
+                        break;
+                    }
+                }
+                while let Ok((written, info)) = conn.send(&mut out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+            }
+            let (stream, raw) = request.expect("read");
+            let mut at = 0usize;
+            let frame = frames::h3_frame(&raw, &mut at).expect("a frame");
+            let block = raw[at..at + frame.length as usize].to_vec();
+            let _ = seen.send(block);
+
+            let mut reply = Vec::new();
+            frames::quic_varint(&mut reply, frames::H3_HEADERS);
+            frames::quic_varint(&mut reply, 3);
+            // `0xd9` is QPACK static index 25, which is `:status 200`: the
+            // indexed field line with a six-bit prefix, then the block's two
+            // required zero bytes.
+            reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
+            conn.stream_send(stream, &reply, false).expect("answers");
+            while let Ok((written, info)) = conn.send(&mut out) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut received: Vec<u8> = Vec::new();
+            let mut sent = 0usize;
+            while sent < PAYLOAD.len() {
+                assert!(std::time::Instant::now() < deadline, "the tunnel echoes");
+                if let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) {
+                    let info = quiche::RecvInfo { from, to: local };
+                    conn.recv(&mut buf[..n], info).expect("drives");
+                    let piece = drain(&mut conn, stream);
+                    let mut at = 0usize;
+                    while let Some(frame) = frames::h3_frame(&piece, &mut at) {
+                        let end = (at + frame.length as usize).min(piece.len());
+                        if let frames::H3Event::Data { payload, .. } =
+                            frames::h3_event(frame, &piece[at..end])
+                        {
+                            received.extend_from_slice(payload);
+                        }
+                        at = end;
+                    }
+                }
+                if received.len() > sent {
+                    let n = (received.len() - sent).min(16_384);
+                    let mut frame = Vec::new();
+                    frames::quic_varint(&mut frame, frames::H3_DATA);
+                    frames::quic_varint(&mut frame, n as u64);
+                    frame.extend_from_slice(&received[sent..sent + n]);
+                    conn.stream_send(stream, &frame, false).expect("echoes");
+                    sent += n;
+                }
+                while let Ok((written, info)) = conn.send(&mut out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+            }
+        })
+    }
+
+    /// Every byte a stream holds, read into a buffer that exists: a `Vec` handed
+    /// to `stream_recv` is a zero-length slice and never receives anything.
+    fn drain(conn: &mut quiche::Connection, id: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        out
+    }
+
+    #[test]
+    fn the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes() {
+        let (roots, server) = minted(b"h3");
+        let sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let port = sock.local_addr().expect("addr").port();
+        let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = h3_edge(
+            sock,
+            crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
+            key_pem,
+            seen_tx,
+        );
+
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("block");
+        let mut want = Vec::new();
+        hpack::qpack_connect("example.com:443", "the-pass", &mut want);
+        assert_eq!(block, want, "the edge reads the same block the lane wrote");
+        round_trip(&mut tunnel);
         edge.join().expect("joins");
     }
 }

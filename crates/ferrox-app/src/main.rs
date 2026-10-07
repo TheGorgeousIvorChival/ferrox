@@ -1,5 +1,9 @@
 mod foxy;
 mod foxy_account;
+mod foxy_catalog;
+mod foxy_challenge;
+#[cfg(test)]
+mod foxy_live;
 mod grpc;
 mod httpheader;
 mod httpupgrade;

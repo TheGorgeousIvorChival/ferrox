@@ -6,9 +6,11 @@
 //! the app crate, because that is where the runtime lives.
 
 pub mod account;
+pub mod catalog;
 pub mod flow;
 pub mod frames;
 pub mod hpack;
+pub mod link;
 pub mod pin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

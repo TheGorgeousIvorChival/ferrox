@@ -29,28 +29,33 @@ pub const HAWK_KEY_LEN: usize = 32;
 #[must_use]
 pub fn auth_pw(email: &str, password: &str) -> String {
     let mut quick = [0u8; STRETCH_LEN];
-    let salt = format!("{PROTOCOL}quickStretch:{email}");
+    let mut salt = Vec::with_capacity(PROTOCOL.len() + 14 + email.len());
+    salt.extend_from_slice(PROTOCOL.as_bytes());
+    salt.extend_from_slice(b"quickStretch:");
+    salt.extend_from_slice(email.as_bytes());
     pbkdf2::derive(
         pbkdf2::PBKDF2_HMAC_SHA256,
         core::num::NonZeroU32::new(STRETCH_ROUNDS).unwrap_or(core::num::NonZeroU32::MIN),
-        salt.as_bytes(),
+        &salt,
         password.as_bytes(),
         &mut quick,
     );
-    let info = format!("{PROTOCOL}authPW");
-    let prk = hkdf_extract(&quick, &[0u8; 32]);
-    hex_encode(&hkdf_expand(&prk, info.as_bytes(), 32))
+    let prk = hkdf_extract(&quick, &NO_SALT);
+    hex_encode(&hkdf_expand(&prk, AUTH_PW, 32))
 }
+
+const NO_SALT: [u8; 32] = [0u8; 32];
+const AUTH_PW: &[u8] = b"identity.mozilla.com/picl/v1/authPW";
+const SESSION_TOKEN: &[u8] = b"identity.mozilla.com/picl/v1/sessionToken";
 
 /// HKDF-SHA256 extract: one HMAC, because that is all it is.
 #[must_use]
 pub fn hkdf_extract(ikm: &[u8], salt: &[u8]) -> [u8; 32] {
     let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
-    hmac::sign(&key, ikm)
-        .as_ref()
-        .to_vec()
-        .try_into()
-        .unwrap_or([0; 32])
+    let tag = hmac::sign(&key, ikm);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(tag.as_ref());
+    out
 }
 
 /// The Hawk credentials a session token expands into: the id is the first half
@@ -61,9 +66,8 @@ pub fn hawk_credentials(session_token: &str) -> Option<(String, [u8; HAWK_KEY_LE
     if raw.len() < 32 {
         return None;
     }
-    let info = format!("{PROTOCOL}sessionToken");
-    let prk = hkdf_extract(&raw, &[0u8; 32]);
-    let expanded = hkdf_expand(&prk, info.as_bytes(), 64);
+    let prk = hkdf_extract(&raw, &NO_SALT);
+    let expanded = hkdf_expand(&prk, SESSION_TOKEN, 64);
     Some((
         hex_encode(&expanded[..32]),
         <[u8; 32]>::try_from(&expanded[32..64]).ok()?,
@@ -96,14 +100,23 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// HKDF-SHA256 expand: one HMAC per output block, chained.
 #[must_use]
 pub fn hkdf_expand(prk: &[u8], info: &[u8], want: usize) -> Vec<u8> {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, prk);
     let mut out = Vec::with_capacity(want);
-    let mut previous: Vec<u8> = Vec::new();
+    // `T(0)` is empty, not a block of zeros: only the blocks after the first
+    // carry the one before them.
+    let mut previous: [u8; 32] = [0; 32];
+    let mut chained = false;
+    let mut block = Vec::with_capacity(32 + info.len() + 1);
     while out.len() < want {
-        let mut block = previous.clone();
+        block.clear();
+        if chained {
+            block.extend_from_slice(&previous);
+        }
         block.extend_from_slice(info);
         block.push(u8::try_from(out.len() / 32 + 1).unwrap_or(255));
-        let key = hmac::Key::new(hmac::HMAC_SHA256, prk);
-        previous = hmac::sign(&key, &block).as_ref().to_vec();
+        let tag = hmac::sign(&key, &block);
+        previous.copy_from_slice(tag.as_ref());
+        chained = true;
         out.extend_from_slice(&previous);
     }
     out.truncate(want);
@@ -119,10 +132,11 @@ pub fn hawk_payload_hash(body: &[u8]) -> String {
     if body.is_empty() {
         return String::new();
     }
-    let mut preimage = b"hawk.1.payload\napplication/json\n".to_vec();
-    preimage.extend_from_slice(body);
-    preimage.push(b'\n');
-    b64::encode(digest::digest(&digest::SHA256, &preimage).as_ref())
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    ctx.update(b"hawk.1.payload\napplication/json\n");
+    ctx.update(body);
+    ctx.update(b"\n");
+    b64::encode(ctx.finish().as_ref())
 }
 
 /// The normalised string the MAC signs: ten lines, the last of them empty, and
@@ -137,11 +151,43 @@ pub fn hawk_normalised(
     timestamp: u64,
     nonce: &str,
 ) -> String {
-    format!(
-        "hawk.1.header\n{timestamp}\n{nonce}\n{}\n{path}\n{host}\n{port}\n{}\n\n",
-        method.to_ascii_uppercase(),
-        hawk_payload_hash(body)
-    )
+    let hash = hawk_payload_hash(body);
+    let mut out = String::with_capacity(
+        13 + 20 + nonce.len() + method.len() + path.len() + host.len() + hash.len() + 8,
+    );
+    out.push_str("hawk.1.header\n");
+    push_u64(&mut out, timestamp);
+    out.push('\n');
+    out.push_str(nonce);
+    out.push('\n');
+    out.push_str(&method.to_ascii_uppercase());
+    out.push('\n');
+    out.push_str(path);
+    out.push('\n');
+    out.push_str(host);
+    out.push('\n');
+    push_u64(&mut out, u64::from(port));
+    out.push('\n');
+    out.push_str(&hash);
+    out.push_str("\n\n");
+    out
+}
+
+fn push_u64(out: &mut String, value: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut left = value;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + u8::try_from(left % 10).unwrap_or(0);
+        left /= 10;
+        if left == 0 {
+            break;
+        }
+    }
+    for byte in &digits[at..] {
+        out.push(char::from(*byte));
+    }
 }
 
 /// One request's worth of what Hawk signs: where it went and what it carried.
@@ -199,6 +245,13 @@ pub fn login_body(email: &str, auth_pw: &str, verification_method: Option<&str>)
     ])
 }
 
+/// The two-factor body, the one call a username and a password cannot make on
+/// their own.
+#[must_use]
+pub fn code_body(code: &str) -> Vec<u8> {
+    body(&[("code", code)])
+}
+
 /// The token-exchange body, whose grant is what distinguishes a first login from
 /// a refresh: one is signed with Hawk, the other is not.
 #[must_use]
@@ -239,6 +292,20 @@ pub fn body(fields: &[(&str, &str)]) -> Vec<u8> {
     }
     out.push('}');
     out.into_bytes()
+}
+
+/// Escapes one value into a JSON string body, without the quotes: the same
+/// rules the writer in the app uses, kept here where the bodies are built.
+#[must_use]
+pub fn escape_json(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    escape_into(value, &mut out);
+    out
+}
+
+/// The escaped value written into an output that is already building JSON.
+pub fn escape_json_into(value: &str, out: &mut String) {
+    escape_into(value, out);
 }
 
 fn escape_into(value: &str, out: &mut String) {
@@ -400,6 +467,14 @@ mod tests {
         assert_eq!(
             two,
             r#"{"email":"a@b.c","authPW":"pw","verificationMethod":"email-2fa"}"#
+        );
+    }
+
+    #[test]
+    fn a_two_factor_body_carries_the_code_and_nothing_else() {
+        assert_eq!(
+            String::from_utf8(code_body("123456")).expect("ascii"),
+            r#"{"code":"123456"}"#
         );
     }
 

@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Json {
     Null,
@@ -43,6 +45,70 @@ impl Json {
         }
     }
 }
+
+/// Writes a value back out, so a request this tree builds has one writer rather
+/// than a string per shape. The output is the same JSON `parse` reads.
+pub(crate) fn write(value: &Json, out: &mut String) {
+    match value {
+        Json::Null => out.push_str("null"),
+        Json::Bool(true) => out.push_str("true"),
+        Json::Bool(false) => out.push_str("false"),
+        Json::Num(n) => {
+            if n.fract() == 0.0 && n.abs() < 9.007_199_254_740_992e15 {
+                let _ = write!(out, "{}", *n as i64);
+            } else {
+                let _ = write!(out, "{n}");
+            }
+        }
+        Json::Str(s) => write_string(s, out),
+        Json::Arr(items) => {
+            out.push('[');
+            for (at, item) in items.iter().enumerate() {
+                if at > 0 {
+                    out.push(',');
+                }
+                write(item, out);
+            }
+            out.push(']');
+        }
+        Json::Obj(pairs) => {
+            out.push('{');
+            for (at, (key, item)) in pairs.iter().enumerate() {
+                if at > 0 {
+                    out.push(',');
+                }
+                write_string(key, out);
+                out.push(':');
+                write(item, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_string(text: &str, out: &mut String) {
+    out.push('"');
+    for byte in text.bytes() {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x00..=0x1f => {
+                out.push_str("\\u00");
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            _ => out.push(byte as char),
+        }
+    }
+    out.push('"');
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 pub(crate) fn parse(text: &str) -> Result<Json, String> {
     let mut cursor = Cursor {
@@ -380,5 +446,37 @@ mod tests {
         assert_eq!(parse("null").expect("null"), Json::Null);
         assert_eq!(parse("  41234 ").expect("port").as_port(), Some(41234));
         assert!(parse("70000").expect("big").as_port().is_none());
+    }
+
+    #[test]
+    fn a_written_value_reads_back_as_the_same_value() {
+        for text in [
+            "{\"a\":\"x\",\"b\":[1,2,null],\"c\":{\"d\":true},\"e\":\"q\\\\n\"}",
+            r#"[{"ty":"pow"},{"ty":"pat"}]"#,
+            r#"{"v":2,"w":-3,"x":4.5}"#,
+            "[]",
+            "{}",
+        ] {
+            let value = parse(text).expect(text);
+            let mut out = String::new();
+            write(&value, &mut out);
+            assert_eq!(parse(&out).expect(&out), value, "{text} -> {out}");
+        }
+    }
+
+    #[test]
+    fn a_written_number_is_an_integer_when_it_is_one() {
+        let mut out = String::new();
+        write(&Json::Num(2.0), &mut out);
+        assert_eq!(out, "2");
+        out.clear();
+        write(&Json::Num(-3.0), &mut out);
+        assert_eq!(out, "-3");
+        out.clear();
+        write(&Json::Num(4.5), &mut out);
+        assert_eq!(out, "4.5");
+        out.clear();
+        write(&Json::Str("\u{1}\n\"".into()), &mut out);
+        assert_eq!(out, "\"\\u0001\\n\\\"\"");
     }
 }
