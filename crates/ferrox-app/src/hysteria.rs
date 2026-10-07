@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::frames;
@@ -18,6 +18,19 @@ const ROUTE_POLL: Duration = Duration::from_millis(100);
 const STREAM_POLL: Duration = Duration::from_millis(5);
 
 const SCID_LEN: usize = 16;
+
+// Datagram queue depth per QUIC connection, each way.
+const DGRAM_QUEUE: usize = 128;
+
+// Largest QUIC datagram this tree sends, mirroring the reference's
+// `MaxDatagramFrameSize`; larger UDP payloads fragment, never silently drop.
+const DGRAM_MAX: usize = 1200;
+
+// Idle UDP sessions are reaped after this, mirroring the reference default.
+const UDP_IDLE: Duration = Duration::from_secs(60);
+
+// Datagrams queued per session id; fuller sessions drop, never grow.
+const UDP_CHAN: usize = 64;
 
 pub(crate) struct Dial {
     pub(crate) host: String,
@@ -65,36 +78,6 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
         drop(conn);
         std::thread::sleep(STREAM_POLL);
     }
-}
-
-fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(want);
-    let mut chunk = [0u8; 8192];
-    while out.len() < want {
-        let end = (want - out.len()).min(chunk.len());
-        let read = {
-            let Ok(mut conn) = session.shared.lock() else {
-                return None;
-            };
-            match conn.stream_recv(stream, &mut chunk[..end]) {
-                Ok((n, _)) => Some(n),
-                Err(quiche::Error::Done) => None,
-                Err(_) => return None,
-            }
-        };
-        if let Some(n) = read {
-            out.extend_from_slice(&chunk[..n]);
-        } else {
-            if Instant::now() >= deadline {
-                return None;
-            }
-            let Ok(mut conn) = session.shared.lock() else {
-                return None;
-            };
-            crate::quic::pump_once(&mut conn, &session.sock, session.local, STREAM_POLL);
-        }
-    }
-    (out.len() == want).then_some(out)
 }
 
 fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Option<Vec<u8>> {
@@ -165,6 +148,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     getrandom::getrandom(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config = crate::quic::quiche_config(roots, Some(dial.config.cc.quiche_name()))?;
+    config.enable_dgram(true, DGRAM_QUEUE, DGRAM_QUEUE);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
         return None;
     };
@@ -181,6 +165,209 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         return None;
     }
     Some(session)
+}
+
+// The target as the request carries it: `host:port` text, never a header.
+pub(crate) fn addr_text(target: &SocketAddr) -> String {
+    target.to_string()
+}
+
+// Parses request address text back to a diallable target; domains resolve
+// here, on the app side, because the framing layer resolves nothing.
+pub(crate) fn parse_addr_text(text: &str) -> Option<SocketAddr> {
+    let (host, port) = text.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host.parse() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    (host, port).to_socket_addrs().ok()?.next()
+}
+
+fn random_padding(min: usize, max: usize) -> Vec<u8> {
+    let span = max - min + 1;
+    let mut one = [0u8; 1];
+    getrandom::getrandom(&mut one).ok();
+    let len = min + usize::from(one[0]) % span;
+    let mut padding = vec![0u8; len];
+    getrandom::getrandom(&mut padding).ok();
+    padding
+}
+
+fn recv_response(session: &Session, stream: u64, deadline: Instant) -> Option<bool> {
+    let mut head = Vec::with_capacity(256);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if head.len() >= hysteria::TCP_MSG_MAX + hysteria::TCP_PAD_MAX + 16
+            || Instant::now() >= deadline
+        {
+            return None;
+        }
+        if let Some((ok, _, _)) = hysteria::decode_tcp_response(&head) {
+            return Some(ok);
+        }
+        let read = {
+            let Ok(mut conn) = session.shared.lock() else {
+                return None;
+            };
+            match conn.stream_recv(stream, &mut chunk) {
+                Ok((n, _)) => Some(n),
+                Err(quiche::Error::Done) => None,
+                Err(_) => return None,
+            }
+        };
+        if let Some(n) = read {
+            head.extend_from_slice(&chunk[..n]);
+        } else {
+            let Ok(mut conn) = session.shared.lock() else {
+                return None;
+            };
+            crate::quic::pump_once(&mut conn, &session.sock, session.local, STREAM_POLL);
+        }
+    }
+}
+
+pub(crate) fn open_flow(session: &Session, target: &SocketAddr) -> Option<Flow> {
+    let text = addr_text(target);
+    let padding = random_padding(hysteria::REQ_PAD_MIN, hysteria::REQ_PAD_MAX);
+    let mut request = Vec::with_capacity(2 + text.len() + padding.len() + 16);
+    hysteria::tcp_prefix(&mut request);
+    if !hysteria::encode_tcp_request(&text, &padding, &mut request) {
+        return None;
+    }
+    if !send_all(session, FIRST_FLOW_STREAM, &request, false) {
+        return None;
+    }
+    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    if recv_response(session, FIRST_FLOW_STREAM, deadline) != Some(true) {
+        return None;
+    }
+    Some(Flow {
+        session: session.clone(),
+        stream: FIRST_FLOW_STREAM,
+        backlog: Vec::new(),
+        at: 0,
+    })
+}
+
+// Dials the target itself: the request carries the address, so no inner
+// protocol header exists and the identity the config names is not sent.
+pub(crate) fn dial_direct(client: &TcpStream, dial: &Dial, target: &SocketAddr) {
+    let Some(session) = connect(dial) else {
+        return;
+    };
+    let Some(flow) = open_flow(&session, target) else {
+        return;
+    };
+    relay(client, &flow);
+}
+
+// One UDP association: session ids demultiplex targets on one connection,
+// packet ids group fragments. Replies are matched by session id only.
+pub(crate) struct UdpLink {
+    session: Session,
+    next: u32,
+    packet: u16,
+    re: hysteria::Reassembler,
+    re_session: u32,
+}
+
+pub(crate) fn connect_udp(dial: &Dial) -> Option<UdpLink> {
+    connect(dial).map(|session| UdpLink {
+        session,
+        next: 1,
+        packet: 1,
+        re: hysteria::Reassembler::default(),
+        re_session: 0,
+    })
+}
+
+impl UdpLink {
+    pub(crate) fn next_session(&mut self) -> u32 {
+        let id = self.next;
+        self.next = self.next.wrapping_add(1).max(1);
+        id
+    }
+
+    // Sends one addressed payload, fragmenting past the datagram cap the way
+    // the reference fragments on `DatagramTooLarge` instead of dropping.
+    pub(crate) fn send(&mut self, session: u32, addr: &str, data: &[u8]) -> bool {
+        let headroom = hysteria::UDP_HEAD_LEN + addr.len() + 8;
+        if headroom >= DGRAM_MAX || addr.is_empty() || addr.len() > hysteria::TCP_ADDR_MAX {
+            return false;
+        }
+        let per = DGRAM_MAX - headroom;
+        let count = ((data.len() + per - 1) / per).max(1).min(255);
+        let number = if count == 1 {
+            0
+        } else {
+            let id = self.packet;
+            self.packet = self.packet.wrapping_add(1).max(1);
+            id
+        };
+        let locked = self.session.shared.lock();
+        let Ok(mut conn) = locked else {
+            return false;
+        };
+        for (frag, chunk) in data.chunks(per.max(1)).enumerate() {
+            let msg = hysteria::UdpMessage {
+                session,
+                packet: number,
+                frag: frag as u8,
+                count: count as u8,
+                addr,
+                data: chunk,
+            };
+            let mut wire = Vec::with_capacity(DGRAM_MAX);
+            if !hysteria::encode_udp_message(&msg, &mut wire) || wire.len() > DGRAM_MAX {
+                return false;
+            }
+            if conn.dgram_send(&wire).is_err() {
+                return false;
+            }
+        }
+        crate::quic::flush_egress(&mut conn, &self.session.sock);
+        true
+    }
+
+    // Receives one reassembled payload with its session id, waiting to the
+    // deadline; fragments for other sessions reset the reassembler.
+    pub(crate) fn recv(&mut self, deadline: Instant) -> Option<(u32, Vec<u8>)> {
+        let mut buf = [0u8; 1350];
+        loop {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let got = {
+                let Ok(mut conn) = self.session.shared.lock() else {
+                    return None;
+                };
+                match conn.dgram_recv(&mut buf) {
+                    Ok(n) => Some(n),
+                    Err(_) => None,
+                }
+            };
+            if let Some(n) = got {
+                if let Some(msg) = hysteria::decode_udp_message(&buf[..n]) {
+                    if msg.session != self.re_session {
+                        self.re = hysteria::Reassembler::default();
+                        self.re_session = msg.session;
+                    }
+                    if let Some(data) = self.re.feed(&msg) {
+                        return Some((msg.session, data));
+                    }
+                }
+                continue;
+            }
+            let Ok(mut conn) = self.session.shared.lock() else {
+                return None;
+            };
+            crate::quic::pump_once(&mut conn, &self.session.sock, self.session.local, STREAM_POLL);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -281,37 +468,6 @@ impl Write for Flow {
     }
 }
 
-pub(crate) fn open_flow(session: &Session, header: &[u8]) -> Option<Flow> {
-    let mut prefix = Vec::with_capacity(2 + header.len());
-    hysteria::tcp_prefix(&mut prefix);
-    prefix.extend_from_slice(header);
-    if !send_all(session, FIRST_FLOW_STREAM, &prefix, false) {
-        return None;
-    }
-    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
-    let reply = recv_exact(session, FIRST_FLOW_STREAM, 2, deadline)?;
-    if reply.as_slice() != [0, 0] {
-        return None;
-    }
-    Some(Flow {
-        session: session.clone(),
-        stream: FIRST_FLOW_STREAM,
-        backlog: Vec::new(),
-        at: 0,
-    })
-}
-
-pub(crate) fn dial_vless(client: &TcpStream, dial: &Dial, id: &[u8; 16], target: &SocketAddr) {
-    let Some(session) = connect(dial) else {
-        return;
-    };
-    let header = crate::proxy::vless_header(id, 1, target);
-    let Some(flow) = open_flow(&session, &header) else {
-        return;
-    };
-    relay(client, &flow);
-}
-
 pub(crate) fn relay(tcp: &TcpStream, flow: &Flow) {
     let Ok(tcp_read) = tcp.try_clone() else {
         return;
@@ -361,6 +517,7 @@ pub(crate) fn server_config(
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
     config.set_application_protos(&[crate::quic::ALPN]).ok()?;
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    config.enable_dgram(true, DGRAM_QUEUE, DGRAM_QUEUE);
     config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
     config.set_initial_max_data(crate::quic::MAX_DATA);
     config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
@@ -373,7 +530,75 @@ pub(crate) fn server_config(
     Some(config)
 }
 
-pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
+pub(crate) type Serve = Arc<dyn Fn(Flow, SocketAddr) + Send + Sync>;
+
+// What a UDP session hands the proxy: its destination text, a channel
+// carrying the first reassembled payload ahead of the rest, and a flow for
+// the replies.
+pub(crate) struct UdpCtx {
+    pub(crate) id: u32,
+    pub(crate) addr: String,
+    pub(crate) rx: mpsc::Receiver<Vec<u8>>,
+    pub(crate) flow: UdpFlow,
+}
+
+pub(crate) type ServeUdp = Arc<dyn Fn(UdpCtx) + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct UdpFlow {
+    session: Session,
+    id: u32,
+}
+
+impl UdpFlow {
+    // Replies with the session id this flow was opened under, fragmenting past
+    // the datagram cap; unfragmented replies carry packet zero like the
+    // reference server's.
+    pub(crate) fn send(&self, addr: &str, data: &[u8]) -> bool {
+        let headroom = hysteria::UDP_HEAD_LEN + addr.len() + 8;
+        if headroom >= DGRAM_MAX || addr.is_empty() || addr.len() > hysteria::TCP_ADDR_MAX {
+            return false;
+        }
+        let per = DGRAM_MAX - headroom;
+        let count = ((data.len() + per - 1) / per).max(1).min(255);
+        let number = if count == 1 {
+            0
+        } else {
+            let mut id = [0u8; 2];
+            getrandom::getrandom(&mut id).ok();
+            u16::from_be_bytes(id).max(1)
+        };
+        let Ok(mut conn) = self.session.shared.lock() else {
+            return false;
+        };
+        for (frag, chunk) in data.chunks(per.max(1)).enumerate() {
+            let msg = hysteria::UdpMessage {
+                session: self.id,
+                packet: number,
+                frag: frag as u8,
+                count: count as u8,
+                addr,
+                data: chunk,
+            };
+            let mut wire = Vec::with_capacity(DGRAM_MAX);
+            if !hysteria::encode_udp_message(&msg, &mut wire) || wire.len() > DGRAM_MAX {
+                return false;
+            }
+            if conn.dgram_send(&wire).is_err() {
+                return false;
+            }
+        }
+        crate::quic::flush_egress(&mut conn, &self.session.sock);
+        true
+    }
+}
+
+struct UdpEntry {
+    tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    re: hysteria::Reassembler,
+    re_session: u32,
+    last: Instant,
+}
 
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
@@ -381,6 +606,7 @@ struct Inbound {
     authed: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
+    udp: HashMap<u32, UdpEntry>,
 }
 
 fn answer_auth(conn: &mut quiche::Connection, ok: bool) -> bool {
@@ -403,6 +629,23 @@ fn drain_settings(conn: &mut quiche::Connection) {
         if n == 0 {
             break;
         }
+    }
+}
+
+fn answer_request(
+    shared: &Arc<Mutex<quiche::Connection>>,
+    sock: &Arc<UdpSocket>,
+    stream: u64,
+    ok: bool,
+) {
+    let padding = random_padding(hysteria::RESP_PAD_MIN, hysteria::RESP_PAD_MAX);
+    let mut out = Vec::with_capacity(256 + padding.len());
+    if !hysteria::encode_tcp_response(ok, "", &padding, &mut out) {
+        return;
+    }
+    if let Ok(mut conn) = shared.lock() {
+        let _ = conn.stream_send(stream, &out, true);
+        crate::quic::flush_egress(&mut conn, sock);
     }
 }
 
@@ -452,13 +695,47 @@ fn serve_stream(
             break consumed;
         }
     };
-    serve(Flow::from_parts(
-        Arc::clone(shared),
-        Arc::clone(sock),
-        local,
-        stream,
-        head[prefix..].to_vec(),
-    ));
+    let mut request = head[prefix..].to_vec();
+    let mut piece = [0u8; 1024];
+    let (addr, used) = loop {
+        if request.len() > hysteria::TCP_ADDR_MAX + hysteria::TCP_PAD_MAX + 16 {
+            return;
+        }
+        if let Some((addr, used)) = hysteria::decode_tcp_request(&request) {
+            break (addr.to_owned(), used);
+        }
+        let read = {
+            let Ok(mut conn) = shared.lock() else {
+                return;
+            };
+            match conn.stream_recv(stream, &mut piece) {
+                Ok((0, _)) | Err(quiche::Error::Done) => None,
+                Ok((n, _)) => Some(n),
+                Err(_) => return,
+            }
+        };
+        if let Some(n) = read {
+            request.extend_from_slice(&piece[..n]);
+        } else {
+            let Ok(mut conn) = shared.lock() else {
+                return;
+            };
+            if conn.is_closed() {
+                return;
+            }
+            crate::quic::pump_once(&mut conn, sock, local, STREAM_POLL);
+        }
+    };
+    let Some(target) = parse_addr_text(&addr) else {
+        answer_request(shared, sock, stream, false);
+        return;
+    };
+    answer_request(shared, sock, stream, true);
+    let backlog = request[used..].to_vec();
+    serve(
+        Flow::from_parts(Arc::clone(shared), Arc::clone(sock), local, stream, backlog),
+        target,
+    );
 }
 
 struct Router<'a> {
@@ -467,6 +744,7 @@ struct Router<'a> {
     out: [u8; 1350],
     config: &'a hysteria::Config,
     serve: &'a Serve,
+    serve_udp: &'a ServeUdp,
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
@@ -541,6 +819,7 @@ impl Router<'_> {
                 authed: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
+                udp: HashMap::new(),
             },
         );
     }
@@ -552,6 +831,7 @@ impl Router<'_> {
             out,
             config,
             serve,
+            serve_udp,
             local,
         } = self;
         let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
@@ -607,12 +887,69 @@ impl Router<'_> {
                 serve_stream(&thread_shared, &thread_sock, local, id, &thread_serve);
             });
         }
+        let arrivals = {
+            let Ok(mut conn) = shared.lock() else {
+                return;
+            };
+            let mut wire = [0u8; 1350];
+            let mut found = Vec::new();
+            while let Ok(n) = conn.dgram_recv(&mut wire) {
+                found.push(wire[..n].to_vec());
+            }
+            flush(sock, &mut conn, out);
+            found
+        };
+        let now = Instant::now();
+        let Some(inbound) = routes.get_mut(dcid) else {
+            return;
+        };
+        for wire in &arrivals {
+            let Some(msg) = hysteria::decode_udp_message(wire) else {
+                continue;
+            };
+            let entry = inbound.udp.entry(msg.session).or_insert_with(|| UdpEntry {
+                tx: None,
+                re: hysteria::Reassembler::default(),
+                re_session: msg.session,
+                last: now,
+            });
+            if msg.session != entry.re_session {
+                entry.re = hysteria::Reassembler::default();
+                entry.re_session = msg.session;
+            }
+            entry.last = now;
+            let Some(data) = entry.re.feed(&msg) else {
+                continue;
+            };
+            if let Some(tx) = &entry.tx {
+                let _ = tx.try_send(data);
+                continue;
+            }
+            let (tx, rx) = mpsc::sync_channel(UDP_CHAN);
+            let _ = tx.try_send(data);
+            entry.tx = Some(tx);
+            let flow = UdpFlow {
+                session: Session {
+                    shared: Arc::clone(&shared),
+                    sock: Arc::clone(sock),
+                    local: *local,
+                },
+                id: msg.session,
+            };
+            serve_udp(UdpCtx {
+                id: msg.session,
+                addr: msg.addr.to_owned(),
+                rx,
+                flow,
+            });
+        }
     }
 
     fn idle(&mut self) {
         let Self {
             routes, sock, out, ..
         } = self;
+        let now = Instant::now();
         let dead: Vec<Vec<u8>> = routes
             .iter()
             .filter(|(_, inbound)| inbound.conn.lock().is_ok_and(|conn| conn.is_closed()))
@@ -621,7 +958,8 @@ impl Router<'_> {
         for id in dead {
             routes.remove(&id);
         }
-        for inbound in routes.values() {
+        for inbound in routes.values_mut() {
+            inbound.udp.retain(|_, entry| now - entry.last < UDP_IDLE);
             let Ok(mut conn) = inbound.conn.lock() else {
                 continue;
             };
@@ -637,6 +975,7 @@ pub(crate) fn serve_loop(
     cert_path: &str,
     key_path: &str,
     serve: &Serve,
+    serve_udp: &ServeUdp,
 ) {
     let Some(bound) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return;
@@ -654,6 +993,7 @@ pub(crate) fn serve_loop(
         out: [0u8; 1350],
         config,
         serve,
+        serve_udp,
         routes: HashMap::new(),
     };
     let mut buf = [0u8; 1350];
@@ -707,5 +1047,15 @@ mod tests {
     fn server_config_refuses_without_a_chain_it_can_read() {
         let cc = hysteria::Congestion::Bbr;
         assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc).is_none());
+    }
+
+    #[test]
+    fn request_addresses_round_trip_through_text() {
+        let target: SocketAddr = "198.51.100.7:53".parse().expect("parses");
+        assert_eq!(parse_addr_text(&addr_text(&target)), Some(target));
+        assert_eq!(addr_text(&target), "198.51.100.7:53");
+        assert_eq!(parse_addr_text(""), None);
+        assert_eq!(parse_addr_text("no-port"), None);
+        assert_eq!(parse_addr_text("1.2.3.4:not-a-port"), None);
     }
 }
