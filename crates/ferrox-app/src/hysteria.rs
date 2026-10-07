@@ -641,7 +641,7 @@ pub(crate) fn serve_loop(
     let Some(bound) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return;
     };
-    let Ok(sock) = UdpSocket::bind(bound) else {
+    let Ok(sock) = crate::quic::bind_datagram(address) else {
         return;
     };
     let local = sock.local_addr().unwrap_or(bound);

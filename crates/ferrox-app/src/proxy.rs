@@ -9805,7 +9805,7 @@ mod tests {
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
         std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
         std::fs::write(&key_path, &key_pem).expect("stages key");
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
         let port = sock.local_addr().expect("addr").port();
         thread::spawn(move || {
             let mut config = hysteria_test_server_config(&cert_path, &key_path);
