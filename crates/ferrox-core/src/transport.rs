@@ -85,26 +85,6 @@ impl Security {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Mimic {
-    #[default]
-    Xray,
-    SingBox,
-    Zray,
-}
-
-impl Mimic {
-    #[must_use]
-    pub fn from_flag(flag: &str) -> Option<Self> {
-        match flag {
-            "xray" => Some(Self::Xray),
-            "sing-box" | "singbox" => Some(Self::SingBox),
-            "zray" | "zeronet" => Some(Self::Zray),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EarlyData {
     pub path: String,
@@ -114,18 +94,6 @@ pub struct EarlyData {
 impl EarlyData {
     #[must_use]
     pub fn split(path: &str) -> Self {
-        Self::split_mimic(path, Mimic::Xray)
-    }
-
-    #[must_use]
-    pub fn split_mimic(path: &str, mimic: Mimic) -> Self {
-        match mimic {
-            Mimic::Xray | Mimic::SingBox => Self::split_xray(path),
-            Mimic::Zray => Self::split_zray(path),
-        }
-    }
-
-    fn split_xray(path: &str) -> Self {
         let (head, fragment) = path
             .split_once('#')
             .map_or((path, None), |(h, f)| (h, Some(f)));
@@ -162,30 +130,6 @@ impl EarlyData {
             path: out,
             budget: atoi(first) as u32,
         }
-    }
-
-    fn split_zray(path: &str) -> Self {
-        let Some((base, query)) = path.split_once('?') else {
-            return Self {
-                path: path.to_owned(),
-                budget: 0,
-            };
-        };
-        let mut kept = Vec::new();
-        let mut budget = 0u32;
-        for pair in query.split('&') {
-            if let Some(value) = pair.strip_prefix("ed=") {
-                budget = value.parse::<u64>().unwrap_or(0) as u32;
-            } else if !pair.is_empty() {
-                kept.push(pair);
-            }
-        }
-        let mut out = base.to_owned();
-        if !kept.is_empty() {
-            out.push('?');
-            out.push_str(&kept.join("&"));
-        }
-        Self { path: out, budget }
     }
 }
 
@@ -364,41 +308,6 @@ mod tests {
                 "{path}"
             );
         }
-    }
-
-    #[test]
-    fn early_data_split_zray_takes_the_last_ed() {
-        for (path, budget, want) in [
-            ("/p", 0u32, "/p"),
-            ("/p?a=1&ed=2560&b=2", 2560, "/p?a=1&b=2"),
-            ("/interop-ws?ed=2048", 2048, "/interop-ws"),
-            ("/interop-ws?ed=2048&ed=9", 9, "/interop-ws"),
-            ("/interop-ws?ed=9&ed=2048", 2048, "/interop-ws"),
-            ("/interop-ws?ed=", 0, "/interop-ws"),
-            ("/interop-ws?ed=&ed=4", 4, "/interop-ws"),
-            ("/interop-ws?ed=4&ed=abc", 0, "/interop-ws"),
-            ("/interop-ws?ed=-1", 0, "/interop-ws"),
-            ("/interop-ws?ed", 0, "/interop-ws?ed"),
-            ("/p?ed=4294967296", 0, "/p"),
-            ("/p?ed=99999999999999999999", 0, "/p"),
-            ("/p?a=1&&b=2", 0, "/p?a=1&b=2"),
-        ] {
-            assert_eq!(
-                EarlyData::split_mimic(path, Mimic::Zray),
-                EarlyData {
-                    path: want.to_owned(),
-                    budget,
-                },
-                "{path}"
-            );
-        }
-        assert_eq!(Mimic::from_flag("xray"), Some(Mimic::Xray));
-        assert_eq!(Mimic::from_flag("sing-box"), Some(Mimic::SingBox));
-        assert_eq!(Mimic::from_flag("singbox"), Some(Mimic::SingBox));
-        assert_eq!(Mimic::from_flag("zray"), Some(Mimic::Zray));
-        assert_eq!(Mimic::from_flag("zeronet"), Some(Mimic::Zray));
-        assert_eq!(Mimic::from_flag("other"), None);
-        assert_eq!(Mimic::default(), Mimic::Xray);
     }
 
     #[test]

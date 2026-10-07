@@ -635,15 +635,8 @@ mod tests {
             serve_ws(stream, password, method, "/ss-ws", true);
         });
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, mut writer) = crate::ws::connect(
-            stream,
-            "127.0.0.1",
-            "/ss-ws",
-            0,
-            &[],
-            ferrox_core::transport::Mimic::Xray,
-        )
-        .expect("carries");
+        let (mut reader, mut writer) =
+            crate::ws::connect(stream, "127.0.0.1", "/ss-ws", 0, &[]).expect("carries");
         round_trip(&mut reader, &mut writer, &target);
         let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();

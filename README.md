@@ -7,7 +7,7 @@ A from-scratch proxy core, built to be **bit-identical to the implementations it
 ## Goals
 
 1. **Prove everything shipped is faster and leaner.** Bit-identical output, fewer operations, zero surviving copies, no allocation. Counts prove, durations suggest: instruction counts are gated exact, so a diff that removes one operation changes a number every runner reproduces.
-2. **Be a drop-in replacement for Xray-core and sing-box.** Not "implement their protocols" — run *their* pinned test suites unmodified against a Ferrox binary in CI. Today 2 of 12 pins, both of the two with a seam.
+2. **Be a drop-in replacement for Xray-core.** Not "implement its protocols" — run its pinned test suites unmodified against a Ferrox binary in CI, plus every suite with a seam to inject it through.
 3. **Be a drop-in replacement for zeptun**, the `tun2socks` engine: TUN to TCP/UDP/ICMP through a SOCKS5 or direct handler, `userspace` / `hybrid` / `system` stacks.
 4. **Be feature-complete in what quiche, slipstream and aether are ahead on.** QUIC and MASQUE, DNS-tunnel carriers, nested tunnels, multi-path schedulers, domain fronting. Libraries and product surfaces, read for the technique and implemented on Ferrox's terms.
 5. **Spoof SNI without root.** DPI circumvention by injecting a fake TLS ClientHello with an allowlisted SNI ahead of the real handshake. `VpnService` TUN plus a userspace TCP stack does it in user space. Nothing in CI checks this yet.

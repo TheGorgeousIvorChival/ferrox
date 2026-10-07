@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ferrox_core::transport::{early_decode, Mimic};
+use ferrox_core::transport::early_decode;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HEAD_LIMIT: usize = 16 * 1024;
@@ -402,11 +402,10 @@ pub(crate) fn connect(
     path: &str,
     budget: u32,
     first: &[u8],
-    mimic: Mimic,
 ) -> Option<(WsReader, WsWriter)> {
     let key = fresh_key()?;
     let mut read = stream;
-    let (handshake, unsent) = request_mimic(host, path, &key, budget, first, mimic);
+    let (handshake, early) = request(host, path, &key, budget, first);
     read.write_all(handshake.as_bytes()).ok()?;
     let head = read_head(&mut read)?;
     let text = std::str::from_utf8(&head).ok()?;
@@ -420,56 +419,24 @@ pub(crate) fn connect(
     let mut behind = Vec::new();
     behind.extend_from_slice(&head[at..]);
     let (reader, writer) = split(read, behind, true)?;
-    if !unsent.is_empty() && !writer.send(unsent) {
+    if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
     Some((reader, writer))
 }
 
-fn base_request(host: &str, path: &str, key: &str) -> String {
-    format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    )
-}
-
-fn push_early_line(request: &mut String, early: &[u8]) {
-    request.truncate(request.len() - 2);
-    request.push_str("Sec-WebSocket-Protocol: ");
-    ferrox_core::transport::early_encode_into(request, early);
-    request.push_str("\r\n\r\n");
-}
-
 fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (String, bool) {
-    let mut request = base_request(host, path, key);
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
     let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
     if early {
-        push_early_line(&mut request, first);
+        request.truncate(request.len() - 2);
+        request.push_str("Sec-WebSocket-Protocol: ");
+        ferrox_core::transport::early_encode_into(&mut request, first);
+        request.push_str("\r\n\r\n");
     }
     (request, early)
-}
-
-fn request_mimic<'a>(
-    host: &str,
-    path: &str,
-    key: &str,
-    budget: u32,
-    first: &'a [u8],
-    mimic: Mimic,
-) -> (String, &'a [u8]) {
-    match mimic {
-        Mimic::SingBox => {
-            let mut request = base_request(host, path, key);
-            let at = (budget as usize).min(first.len());
-            if at > 0 {
-                push_early_line(&mut request, &first[..at]);
-            }
-            (request, &first[at..])
-        }
-        Mimic::Xray | Mimic::Zray => {
-            let (request, early) = request(host, path, key, budget, first);
-            (request, if early { &[][..] } else { first })
-        }
-    }
 }
 
 fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsWriter)> {
@@ -585,15 +552,8 @@ mod tests {
         });
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let plain = EarlyData::split("/tunnel");
-        let (mut reader, _writer) = connect(
-            stream,
-            "127.0.0.1",
-            &plain.path,
-            plain.budget,
-            b"ping",
-            Mimic::Xray,
-        )
-        .expect("upgrades");
+        let (mut reader, _writer) =
+            connect(stream, "127.0.0.1", &plain.path, plain.budget, b"ping").expect("upgrades");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
@@ -632,34 +592,6 @@ mod tests {
                 "{payload:?} at {budget}"
             );
         }
-        for (payload, budget, early_len) in [
-            (&b"hello"[..], 5u32, 5usize),
-            (&b"hello"[..], 4, 4),
-            (&b"hello"[..], 0, 0),
-            (&b""[..], 2048, 0),
-        ] {
-            let (got, unsent) = request_mimic(
-                "example.com",
-                "/tunnel",
-                key,
-                budget,
-                payload,
-                Mimic::SingBox,
-            );
-            assert_eq!(unsent, &payload[early_len..], "{payload:?} at {budget}");
-            let mut line = String::from("Sec-WebSocket-Protocol: ");
-            ferrox_core::transport::early_encode_into(&mut line, &payload[..early_len]);
-            if early_len == 0 {
-                assert_eq!(got, plain, "{payload:?} at {budget}: no line at all");
-            } else {
-                line.push_str("\r\n");
-                assert_eq!(
-                    got,
-                    format!("{prefix}{line}\r\n"),
-                    "{payload:?} at {budget}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -684,27 +616,10 @@ mod tests {
                 &configured.path,
                 configured.budget,
                 b"ping",
-                Mimic::Xray,
             )
             .expect("upgrades");
             server.join().expect("joins");
         }
-    }
-
-    #[test]
-    fn singbox_sends_what_does_not_fit_after_the_101() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = listener.local_addr().expect("addr").port();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accepts");
-            let (mut reader, _writer) = accept(stream, "/tunnel").expect("upgrades");
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf).expect("reads");
-            assert_eq!(&buf, b"ping");
-        });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        connect(stream, "127.0.0.1", "/tunnel", 3, b"ping", Mimic::SingBox).expect("upgrades");
-        server.join().expect("joins");
     }
 
     #[test]

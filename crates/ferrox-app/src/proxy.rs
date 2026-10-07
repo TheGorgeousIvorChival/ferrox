@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Stage};
 use ferrox_core::tls::TlsProvider as _;
-use ferrox_core::transport::{EarlyData, Mimic};
+use ferrox_core::transport::EarlyData;
 
 pub(crate) fn print_version() {
     println!("ferrox-app {}", env!("CARGO_PKG_VERSION"));
@@ -23,13 +23,13 @@ pub(crate) fn print_x25519() {
     println!("Password (PublicKey): {public}");
 }
 
-pub(crate) fn serve_file(path: &str, mimic: Mimic) -> ! {
+pub(crate) fn serve_file(path: &str) -> ! {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|error| exit(&format!("cannot read {path}: {error}")));
     let root = crate::json::parse(&text)
         .unwrap_or_else(|error| exit(&format!("bad config {path}: {error}")));
     let freedom = has_protocol(&root, "outbounds", "freedom");
-    let outbound = find_outbound(&root, mimic);
+    let outbound = find_outbound(&root);
     let mut inbounds = 0;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
@@ -44,13 +44,13 @@ pub(crate) fn serve_file(path: &str, mimic: Mimic) -> ! {
             let address = format!("{listen}:{port}");
             match protocol {
                 "vless" => {
-                    if serve_vless_inbound(&address, inbound, freedom, path, mimic) {
+                    if serve_vless_inbound(&address, inbound, freedom, path) {
                         inbounds += 1;
                     }
                 }
                 "trojan" => {
                     let key = trojan_key(&inbound_password(inbound));
-                    let carrier = inbound_carrier(inbound, mimic);
+                    let carrier = inbound_carrier(inbound);
                     let address_clone = address.clone();
                     let role = Role::Trojan {
                         key,
@@ -62,7 +62,7 @@ pub(crate) fn serve_file(path: &str, mimic: Mimic) -> ! {
                 }
                 "vmess" => {
                     let id = inbound_id(inbound);
-                    let carrier = inbound_carrier(inbound, mimic);
+                    let carrier = inbound_carrier(inbound);
                     let address_clone = address.clone();
                     let role = Role::Vmess {
                         id,
@@ -75,7 +75,7 @@ pub(crate) fn serve_file(path: &str, mimic: Mimic) -> ! {
                 "shadowsocks" => {
                     let password = inbound_ss_password(inbound);
                     let method = inbound_method(inbound);
-                    let carrier = inbound_carrier(inbound, mimic);
+                    let carrier = inbound_carrier(inbound);
                     let address_clone = address.clone();
                     let udp_address = address.clone();
                     let udp_password = password.clone();
@@ -121,15 +121,9 @@ pub(crate) fn serve_file(path: &str, mimic: Mimic) -> ! {
     }
 }
 
-fn serve_vless_inbound(
-    address: &str,
-    inbound: &Json,
-    freedom: bool,
-    path: &str,
-    mimic: Mimic,
-) -> bool {
+fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
     let id = inbound_id(inbound);
-    let carrier = inbound_carrier(inbound, mimic);
+    let carrier = inbound_carrier(inbound);
     let sec = stream_security(inbound);
     match sec {
         "tls" => serve_vless_tls_inbound(address, inbound, &id, &carrier, freedom, path),
@@ -286,7 +280,7 @@ macro_rules! refused_carriers {
 #[derive(Debug, Clone)]
 enum Carrier {
     Raw,
-    Ws { path: String, ed: u32, mimic: Mimic },
+    Ws { path: String, ed: u32 },
     HttpUpgrade { path: String },
     Grpc { path: String },
     Xhttp { path: String },
@@ -1325,9 +1319,9 @@ pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u
 fn dial_vless(client: &TcpStream, mut uplink: TcpStream, vless: &VlessOut, target: &SocketAddr) {
     let header = vless_header(&vless.id, 1, target);
     match &vless.carrier {
-        Carrier::Ws { path, ed, mimic } => {
+        Carrier::Ws { path, ed } => {
             let Some((mut reader, writer)) =
-                crate::ws::connect(uplink, &vless.host, path, *ed, &header, *mimic)
+                crate::ws::connect(uplink, &vless.host, path, *ed, &header)
             else {
                 return;
             };
@@ -1793,15 +1787,13 @@ fn dial_vmess_ws(
     target: &SocketAddr,
     path: &str,
     ed: u32,
-    mimic: Mimic,
 ) {
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
         return;
     };
-    let Some((mut reader, writer)) =
-        crate::ws::connect(uplink, &vmess.host, path, ed, &request, mimic)
+    let Some((mut reader, writer)) = crate::ws::connect(uplink, &vmess.host, path, ed, &request)
     else {
         return;
     };
@@ -1822,9 +1814,7 @@ fn dial_vmess_ws(
 
 fn dial_vmess(client: &TcpStream, mut uplink: TcpStream, vmess: &VmessOut, target: &SocketAddr) {
     match &vmess.carrier {
-        Carrier::Ws { path, ed, mimic } => {
-            dial_vmess_ws(client, uplink, vmess, target, path, *ed, *mimic);
-        }
+        Carrier::Ws { path, ed } => dial_vmess_ws(client, uplink, vmess, target, path, *ed),
         Carrier::Xhttp { path } => {
             let Some((mut reader, writer)) = crate::xhttp::connect(uplink, &vmess.host, path)
             else {
@@ -1910,9 +1900,9 @@ fn trojan_header(key: &[u8; 56], cmd: u8, target: &SocketAddr) -> Vec<u8> {
 fn dial_trojan(client: &TcpStream, mut uplink: TcpStream, trojan: &TrojanOut, target: &SocketAddr) {
     let header = trojan_header(&trojan.key, 1, target);
     match &trojan.carrier {
-        Carrier::Ws { path, ed, mimic } => {
+        Carrier::Ws { path, ed } => {
             let Some((reader, writer)) =
-                crate::ws::connect(uplink, &trojan.host, path, *ed, &header, *mimic)
+                crate::ws::connect(uplink, &trojan.host, path, *ed, &header)
             else {
                 return;
             };
@@ -1986,8 +1976,8 @@ fn dial_shadowsocks(
             crate::shadowsocks::pump_relay(client, &uplink, send, recv);
         }
         refused_carriers!() => {}
-        Carrier::Ws { path, mimic, .. } => {
-            dial_ss_ws(client, uplink, ss, target, path, *mimic);
+        Carrier::Ws { path, .. } => {
+            dial_ss_ws(client, uplink, ss, target, path);
         }
         Carrier::HttpUpgrade { path } => {
             dial_ss_httpupgrade(client, uplink, ss, target, path);
@@ -2010,10 +2000,8 @@ fn dial_ss_ws(
     ss: &ShadowsocksOut,
     target: &SocketAddr,
     path: &str,
-    mimic: Mimic,
 ) {
-    let Some((reader, mut writer)) = crate::ws::connect(uplink, &ss.host, path, 0, &[], mimic)
-    else {
+    let Some((reader, mut writer)) = crate::ws::connect(uplink, &ss.host, path, 0, &[]) else {
         return;
     };
     let Some((send, recv)) =
@@ -3647,17 +3635,17 @@ fn inbound_password(inbound: &Json) -> String {
         .to_owned()
 }
 
-fn find_outbound(root: &Json, mimic: Mimic) -> Option<Outbound> {
-    if let Some(vless) = find_vless_outbound(root, mimic) {
+fn find_outbound(root: &Json) -> Option<Outbound> {
+    if let Some(vless) = find_vless_outbound(root) {
         return Some(Outbound::Vless(vless));
     }
-    if let Some(vmess) = find_vmess_outbound(root, mimic) {
+    if let Some(vmess) = find_vmess_outbound(root) {
         return Some(Outbound::Vmess(vmess));
     }
-    if let Some(trojan) = find_trojan_outbound(root, mimic) {
+    if let Some(trojan) = find_trojan_outbound(root) {
         return Some(Outbound::Trojan(trojan));
     }
-    find_shadowsocks_outbound(root, mimic)
+    find_shadowsocks_outbound(root)
         .map(Outbound::Shadowsocks)
         .or_else(|| is_freedom(root).then_some(Outbound::Freedom))
 }
@@ -3666,7 +3654,7 @@ fn is_freedom(root: &Json) -> bool {
     has_protocol(root, "outbounds", "freedom")
 }
 
-fn find_trojan_outbound(root: &Json, mimic: Mimic) -> Option<TrojanOut> {
+fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
     let empty = Vec::new();
     let outbounds = root
         .get("outbounds")
@@ -3686,7 +3674,7 @@ fn find_trojan_outbound(root: &Json, mimic: Mimic) -> Option<TrojanOut> {
         let port = server.get("port").and_then(Json::as_port)?;
         let password = server.get("password").and_then(Json::as_str)?;
         let key = trojan_key(password);
-        let (carrier, host) = outbound_carrier(outbound, &address, mimic);
+        let (carrier, host) = outbound_carrier(outbound, &address);
         return Some(TrojanOut {
             address,
             port,
@@ -3698,7 +3686,7 @@ fn find_trojan_outbound(root: &Json, mimic: Mimic) -> Option<TrojanOut> {
     None
 }
 
-fn find_shadowsocks_outbound(root: &Json, mimic: Mimic) -> Option<ShadowsocksOut> {
+fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
     let empty = Vec::new();
     let outbounds = root
         .get("outbounds")
@@ -3718,7 +3706,7 @@ fn find_shadowsocks_outbound(root: &Json, mimic: Mimic) -> Option<ShadowsocksOut
         let port = server.get("port").and_then(Json::as_port)?;
         let method = server.get("method").and_then(Json::as_str)?.to_owned();
         let password = server.get("password").and_then(Json::as_str)?.to_owned();
-        let (carrier, host) = outbound_carrier(outbound, &address, mimic);
+        let (carrier, host) = outbound_carrier(outbound, &address);
         return Some(ShadowsocksOut {
             address,
             port,
@@ -3731,7 +3719,7 @@ fn find_shadowsocks_outbound(root: &Json, mimic: Mimic) -> Option<ShadowsocksOut
     None
 }
 
-fn find_vless_outbound(root: &Json, mimic: Mimic) -> Option<VlessOut> {
+fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
     let empty = Vec::new();
     let outbounds = root
         .get("outbounds")
@@ -3766,7 +3754,7 @@ fn find_vless_outbound(root: &Json, mimic: Mimic) -> Option<VlessOut> {
             .and_then(|user| user.get("id"))
             .and_then(Json::as_str)
             .and_then(uuid_bytes)?;
-        let (carrier, host) = outbound_carrier(outbound, &address, mimic);
+        let (carrier, host) = outbound_carrier(outbound, &address);
         let mux = matches!(
             outbound.get("mux").and_then(|mux| mux.get("enabled")),
             Some(Json::Bool(true))
@@ -3796,7 +3784,7 @@ fn find_vless_outbound(root: &Json, mimic: Mimic) -> Option<VlessOut> {
     None
 }
 
-fn find_vmess_outbound(root: &Json, mimic: Mimic) -> Option<VmessOut> {
+fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
     let empty = Vec::new();
     let outbounds = root
         .get("outbounds")
@@ -3824,7 +3812,7 @@ fn find_vmess_outbound(root: &Json, mimic: Mimic) -> Option<VmessOut> {
                 .and_then(Json::as_str)
                 .unwrap_or("auto"),
         );
-        let (carrier, host) = outbound_carrier(outbound, &address, mimic);
+        let (carrier, host) = outbound_carrier(outbound, &address);
         return Some(VmessOut {
             address,
             port,
@@ -3837,21 +3825,20 @@ fn find_vmess_outbound(root: &Json, mimic: Mimic) -> Option<VmessOut> {
     None
 }
 
-fn stream_carrier(settings: Option<&Json>, mimic: Mimic) -> Carrier {
+fn stream_carrier(settings: Option<&Json>) -> Carrier {
     match settings
         .and_then(|s| s.get("network"))
         .and_then(Json::as_str)
     {
         Some("ws" | "websocket") => {
-            let early = EarlyData::split_mimic(&sub_path(settings, "wsSettings"), mimic);
+            let early = EarlyData::split(&sub_path(settings, "wsSettings"));
             Carrier::Ws {
                 path: early.path,
                 ed: early.budget,
-                mimic,
             }
         }
         Some("httpupgrade") => Carrier::HttpUpgrade {
-            path: EarlyData::split_mimic(&sub_path(settings, "httpupgradeSettings"), mimic).path,
+            path: EarlyData::split(&sub_path(settings, "httpupgradeSettings")).path,
         },
         Some("grpc") => Carrier::Grpc {
             path: grpc_path(settings),
@@ -3931,9 +3918,9 @@ fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
     Some("/".to_owned())
 }
 
-fn outbound_carrier(outbound: &Json, address: &str, mimic: Mimic) -> (Carrier, String) {
+fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
     let settings = outbound.get("streamSettings");
-    let carrier = stream_carrier(settings, mimic);
+    let carrier = stream_carrier(settings);
     let key = match &carrier {
         Carrier::Ws { .. } => "wsSettings",
         Carrier::HttpUpgrade { .. } => "httpupgradeSettings",
@@ -3956,8 +3943,8 @@ fn outbound_carrier(outbound: &Json, address: &str, mimic: Mimic) -> (Carrier, S
     (carrier, host)
 }
 
-fn inbound_carrier(inbound: &Json, mimic: Mimic) -> Carrier {
-    stream_carrier(inbound.get("streamSettings"), mimic)
+fn inbound_carrier(inbound: &Json) -> Carrier {
+    stream_carrier(inbound.get("streamSettings"))
 }
 
 fn stream_security(node: &Json) -> &str {
@@ -4559,14 +4546,14 @@ mod tests {
             "streamSettings": {"network": "tcp", "security": "reality"}}]}"#,
         )
         .expect("parses");
-        assert!(find_vless_outbound(&root, Mimic::Xray).is_none());
+        assert!(find_vless_outbound(&root).is_none());
         let root = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
             "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
             "streamSettings": {"network": "tcp"}}]}"#,
         )
         .expect("parses");
-        assert!(find_vless_outbound(&root, Mimic::Xray).is_some());
+        assert!(find_vless_outbound(&root).is_some());
     }
 
     #[test]
@@ -4591,7 +4578,7 @@ mod tests {
         )
         .expect("parses");
         assert!(matches!(
-            stream_carrier(xhttp.get("streamSettings"), Mimic::Xray),
+            stream_carrier(xhttp.get("streamSettings")),
             Carrier::Xhttp { path } if path == "/share"
         ));
         let legacy = crate::json::parse(
@@ -4599,7 +4586,7 @@ mod tests {
         )
         .expect("parses");
         assert!(matches!(
-            stream_carrier(legacy.get("streamSettings"), Mimic::Xray),
+            stream_carrier(legacy.get("streamSettings")),
             Carrier::Xhttp { path } if path == "/legacy"
         ));
         let camouflage = crate::json::parse(
@@ -4607,13 +4594,13 @@ mod tests {
         )
         .expect("parses");
         assert!(matches!(
-            stream_carrier(camouflage.get("streamSettings"), Mimic::Xray),
+            stream_carrier(camouflage.get("streamSettings")),
             Carrier::HttpHeader { path } if path == "/camouflage"
         ));
         let plain =
             crate::json::parse(r#"{"streamSettings": {"network": "tcp"}}"#).expect("parses");
         assert!(matches!(
-            stream_carrier(plain.get("streamSettings"), Mimic::Xray),
+            stream_carrier(plain.get("streamSettings")),
             Carrier::Raw
         ));
     }
@@ -4780,8 +4767,7 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) =
-                    crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[], Mimic::Xray)?;
+                let (reader, writer) = crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -4925,8 +4911,7 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) =
-                    crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[], Mimic::Xray)?;
+                let (reader, writer) = crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -4963,14 +4948,14 @@ mod tests {
             r#"{"outbounds": [{"protocol": "vmess", "settings": {"vnext": [{"address": "192.0.2.1", "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "security": "chacha20-poly1305"}]}]}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "host": "oracle.example"}}}]}"#,
         )
         .expect("parses");
-        let out = find_vmess_outbound(&root, Mimic::Xray).expect("finds");
+        let out = find_vmess_outbound(&root).expect("finds");
         assert!(matches!(out.carrier, Carrier::Xhttp { .. }));
         assert_eq!(out.host, "oracle.example");
         let plain = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vmess", "settings": {"vnext": [{"address": "192.0.2.1", "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}, "streamSettings": {"network": "tcp"}}]}"#,
         )
         .expect("parses");
-        let out = find_vmess_outbound(&plain, Mimic::Xray).expect("finds");
+        let out = find_vmess_outbound(&plain).expect("finds");
         assert!(matches!(out.carrier, Carrier::Raw));
         assert_eq!(out.host, "192.0.2.1");
     }
@@ -5043,14 +5028,14 @@ mod tests {
             r#"{"outbounds": [{"protocol": "trojan", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "password": "secret"}]}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tunnel", "host": "oracle.example"}}}]}"#,
         )
         .expect("parses");
-        let out = find_trojan_outbound(&root, Mimic::Xray).expect("finds");
+        let out = find_trojan_outbound(&root).expect("finds");
         assert!(matches!(out.carrier, Carrier::Ws { .. }));
         assert_eq!(out.host, "oracle.example");
         let plain = crate::json::parse(
             r#"{"outbounds": [{"protocol": "trojan", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "password": "secret"}]}, "streamSettings": {"network": "tcp"}}]}"#,
         )
         .expect("parses");
-        let out = find_trojan_outbound(&plain, Mimic::Xray).expect("finds");
+        let out = find_trojan_outbound(&plain).expect("finds");
         assert!(matches!(out.carrier, Carrier::Raw));
         assert_eq!(out.host, "192.0.2.1");
     }
@@ -5085,8 +5070,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let (mut reader, writer) =
-            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[], Mimic::Xray)
-                .expect("upgrades");
+            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[]).expect("upgrades");
         let mut header = Vec::new();
         header.extend_from_slice(&trojan_key("secret"));
         header.extend_from_slice(b"\r\n");
@@ -5173,7 +5157,6 @@ mod tests {
             Carrier::Ws {
                 path: "/ss-ws".to_owned(),
                 ed: 0,
-                mimic: Mimic::Xray,
             },
             crate::shadowsocks::serve_ws,
             "/ss-ws",
@@ -6165,8 +6148,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let (mut reader, writer) =
-            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[], Mimic::Xray)
-                .expect("upgrades");
+            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[]).expect("upgrades");
         let mut header = Vec::new();
         header.extend_from_slice(&trojan_key("wrong"));
         header.extend_from_slice(b"\r\n");
@@ -6215,7 +6197,6 @@ mod tests {
             carrier: Carrier::Ws {
                 path: "/tunnel".to_owned(),
                 ed: 0,
-                mimic: Mimic::Xray,
             },
             host: "127.0.0.1".to_owned(),
         });
@@ -6401,7 +6382,6 @@ mod tests {
             carrier: Carrier::Ws {
                 path: "/tunnel".to_owned(),
                 ed: 0,
-                mimic: Mimic::Xray,
             },
             host: "127.0.0.1".to_owned(),
         });
@@ -6672,18 +6652,12 @@ mod tests {
     #[test]
     fn quic_carrier_is_named_not_raw() {
         let plain = crate::json::parse(r#"{"network":"quic"}"#).expect("parses");
-        assert!(matches!(
-            stream_carrier(Some(&plain), Mimic::Xray),
-            Carrier::Quic
-        ));
+        assert!(matches!(stream_carrier(Some(&plain)), Carrier::Quic));
         let masked =
             crate::json::parse(r#"{"network":"quic","tcpSettings":{"header":{"type":"http"}}}"#)
                 .expect("parses");
-        assert!(matches!(
-            stream_carrier(Some(&masked), Mimic::Xray),
-            Carrier::Quic
-        ));
-        assert!(matches!(stream_carrier(None, Mimic::Xray), Carrier::Raw));
+        assert!(matches!(stream_carrier(Some(&masked)), Carrier::Quic));
+        assert!(matches!(stream_carrier(None), Carrier::Raw));
     }
 
     #[test]
@@ -6710,7 +6684,7 @@ mod tests {
         ];
         for (network, want) in cases {
             let doc = crate::json::parse(&format!(r#"{{"network":"{network}"}}"#)).expect("parses");
-            let got = stream_carrier(Some(&doc), Mimic::Xray);
+            let got = stream_carrier(Some(&doc));
             let tag = match &got {
                 Carrier::Raw => "Raw",
                 Carrier::Ws { .. } => "Ws",
@@ -7372,7 +7346,7 @@ mod tests {
                     "tlsSettings": {{"caCertFile": "{json_path}"}}}}}}]}}"#
         ))
         .expect("parses");
-        let out = find_vless_outbound(&root, Mimic::Xray).expect("finds quic+tls");
+        let out = find_vless_outbound(&root).expect("finds quic+tls");
         assert!(matches!(out.carrier, Carrier::Quic));
         let roots = out.quic_roots.expect("carries anchors");
         assert_ne!(roots, Vec::<Vec<u8>>::new());
@@ -7384,7 +7358,7 @@ mod tests {
                 "streamSettings": {"network": "quic", "security": "tls"}}]}"#,
         )
         .expect("parses");
-        let out = find_vless_outbound(&bare, Mimic::Xray).expect("finds anchorless quic");
+        let out = find_vless_outbound(&bare).expect("finds anchorless quic");
         assert!(out.quic_roots.is_none());
     }
     static QUIC_DIAL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
