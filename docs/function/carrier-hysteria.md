@@ -1,9 +1,13 @@
 # The Hysteria carrier
 
-Hysteria v2 is a **both-roles** row. This tree dials it from a SOCKS inbound
-without Mux and serves it from a `streamSettings` inbound that names a
-`tlsSettings.certificates[0]` chain, over quiche — the default QUIC stack for
-this rung, pinned at `upstream/quiche` for reading.
+Hysteria v2 is a **both-roles, both-shapes** row. As the transport it dials
+from a SOCKS inbound without Mux and serves a `streamSettings` inbound that
+names a `tlsSettings.certificates[0]` chain, carrying the inner protocol
+(VLESS) on each `0x401` stream. As the protocol it serves a
+`protocol: hysteria` inbound: the stream's request itself names the
+destination as a varint string, the server acknowledges before it dials, and
+a refused dial closes after the acknowledgement. Both run over quiche — the
+default QUIC stack for this rung, pinned at `upstream/quiche` for reading.
 
 The wire shape is small: every TCP flow is one client-bidirectional QUIC
 stream opening with the `0x401` varint, and the connection opens with an
@@ -21,7 +25,12 @@ Settings parse with guarded fallbacks — unknown congestion spellings pace as
 full path, dial plus auth plus one VLESS echo, is
 `hysteria_carries_vless_echo_over_loopback`, serialised on the shared QUIC
 mutex and retried like the other loopback socket tests, because a socket test
-that passes twice and fails the third is testing the scheduler.
+that passes twice and fails the third is testing the scheduler. The protocol
+shape's gate is the pinned one: `xray-rust-hysteria` in `upstream/pins.toml`
+runs the pinned client's wrong-password and failed-destination verdicts
+against `ferrox-app` in `scripts/run-upstream-suite.sh`, which is also where
+the server's SETTINGS-before-auth order is proven — the pinned client's H3
+stack posts its auth only once the server's SETTINGS arrive.
 
 ## Data path
 
@@ -33,6 +42,9 @@ graph TD
     F -- "[0, 0]" --> R["relay TCP both ways"]
     A -- else --> X["404, close, relay nothing"]
     H["serve: UDP socket + SCID routes"] --> A
+    P["protocol: hysteria inbound"] --> Q["stream 4: 0x401 + address + padding"]
+    Q -- "ok, then dial" --> T["freedom target, relay raw"]
+    Q -- "dial refused" --> C["close after the ack"]
 ```
 
 ## Measured
@@ -44,6 +56,7 @@ graph TD
 | tcp-flows-per-handshake | 1 | ferrox-app-proxy::tests::hysteria_carries_vless_echo_over_loopback |
 | wrong-password-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying |
 | non-v2-configs-carried | 0 | ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks |
+| pinned-hysteria-client-verdicts | 1 | scripts/run-upstream-suite.sh |
 <!-- counts:end -->
 
 ## Ops

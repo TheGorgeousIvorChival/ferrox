@@ -126,3 +126,4 @@ carrier-hysteria ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-hysteria tcp-flows-per-handshake 1 ferrox-app-proxy::tests::hysteria_carries_vless_echo_over_loopback
 carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
 carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
+carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh

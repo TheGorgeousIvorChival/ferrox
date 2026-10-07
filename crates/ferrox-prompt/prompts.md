@@ -683,7 +683,7 @@ Prove the new order with a loopback pair in each direction and name the conforma
 ## P32 · Carry Hysteria, the first transport the pinned Xray-core has and this tree knows only by name
 
 **When to use:** When a Hysteria row is next: `TransportKind::Hysteria` gives it a verdict in the link table and there is no implementation behind it, while the reference accepts `hysteria` and builds it on QUIC with its own congestion control.
-**Status:** todo
+**Status:** done
 **Leverage:** 3
 **Effort:** large
 **Gates:** `cargo test --workspace`; CI: `conformance.yml` green with a `hysteria` row executed against `ferrox-app`
@@ -698,6 +698,8 @@ The obstacle is structural and all three of these rungs meet it: `crates/ferrox-
 Report the rows this earns and the rows that stay refused, each with its reason. A refusal that names itself is a verdict; the refusal this slice replaces is a name with nothing behind it.
 
 What the lane measured once it existed: `hysteria_carries_vless_echo_over_loopback` parked the full 120s on the linux runner and nowhere else, and two mechanisms were named. UDP GRO was the first guess and was ruled out — `serve_loop` and the bisect server were bound plain and are now bound through `bind_datagram`, and the run stayed red (`b74938a`, ci 37682179836). The second was the pool hang's own shape: both hand-rolled peers, which drive quiche single-threaded, echoed green on linux, while the threaded `serve_loop` plus `dial_vless` failed at the first echo — the moment `relay` spawns a second contender on the connection mutex that `recv_exact` held across `pump_once`'s blocking recv. `4920ab2` gives every hysteria driver the lock-out-of-the-wait shape and takes the server-side readers off the routed socket; ci 37684624836 is green on all four jobs, with the linux workspace suite finishing in seconds where the hang used to cost twenty minutes.
+
+The report this slice owes, in three verdicts. Earned: the transport shape (`0x401` plus the inner protocol, VLESS over it) in both roles, and the protocol shape — `protocol: hysteria`, version 2, the request naming its destination, the server acknowledging before it dials — proven by `xray-rust-hysteria` in `conformance.yml`, where the pinned client rejects a wrong password and reads a failed destination's close against `ferrox-app` (run 37688873031). Refused, by name: UDP flows (the auth answer says `hysteria-udp: false` and the two pinned tests that need UDP name that refusal), salamander obfuscation, the masquerade site, and a custom brutal sender (`brutal` paces as quiche `bbr`). And the structural decision the slice asked for: hysteria writes its own listener — `serve_loop` with its SCID router is not shared with anything, quiche stays the only QUIC stack, and whether masque and xdrive share one listener is a question they answer when they exist, not one this slice should guess at. One thing the conformance proof cost that a reader should know: the pinned harness decides the server is ready by reading its log for the pinned Xray banner, so `ferrox-app` prints that token labeled as the harness's string; it is a readiness sentinel for one CI seam, not this binary's name.
 ```
 
 ## P33 · Carry MASQUE CONNECT-IP
