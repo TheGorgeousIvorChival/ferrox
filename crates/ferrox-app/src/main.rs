@@ -3,6 +3,7 @@ mod foxy_account;
 mod grpc;
 mod httpheader;
 mod httpupgrade;
+mod hysteria;
 mod json;
 mod proxy;
 mod quic;

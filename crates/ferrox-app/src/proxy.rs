@@ -106,6 +106,25 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                 thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
                 return true;
             }
+            if let Carrier::Hysteria(config) = carrier {
+                let config = config.clone();
+                let Some(settings) = inbound.get("streamSettings") else {
+                    eprintln!("unreadable hysteria identity in {path}: serves nothing");
+                    return false;
+                };
+                let Some((cert_path, key_path)) = tls_cert_paths(settings) else {
+                    eprintln!("unreadable hysteria identity in {path}: serves nothing");
+                    return false;
+                };
+                let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
+                let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+                    serve_vless_hysteria(flow, &id, freedom);
+                });
+                thread::spawn(move || {
+                    crate::hysteria::serve_loop(&owned, &config, &cert_path, &key_path, &serve);
+                });
+                return true;
+            }
             let role = Role::Vless {
                 id,
                 carrier,
@@ -126,7 +145,7 @@ fn dial(target: &SocketAddr) -> Result<TcpStream, Failure> {
     Ok(stream)
 }
 
-fn dial_or_report(target: &SocketAddr) -> Option<TcpStream> {
+pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<TcpStream> {
     match dial(target) {
         Ok(stream) => Some(stream),
         Err(failure) => {
@@ -255,13 +274,14 @@ struct VlessOut {
     host: String,
     mux: bool,
     quic_roots: Option<Vec<Vec<u8>>>,
+    hysteria_roots: Option<Vec<Vec<u8>>>,
 }
 
 macro_rules! refused_carriers {
     () => {
         Carrier::Quic
             | Carrier::Kcp(_)
-            | Carrier::Hysteria
+            | Carrier::Hysteria(_)
             | Carrier::Masque
             | Carrier::Xdrive
             | Carrier::Http
@@ -279,7 +299,7 @@ enum Carrier {
     HttpHeader { path: String },
     Quic,
     Kcp(ferrox_core::kcp::Config),
-    Hysteria,
+    Hysteria(ferrox_core::hysteria::Config),
     Masque,
     Xdrive,
     Http,
@@ -1670,6 +1690,35 @@ fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, id: &[u8; 16], free
     kcp_relay(&uplink, conn);
 }
 
+fn serve_vless_hysteria(mut flow: crate::hysteria::Flow, id: &[u8; 16], freedom: bool) {
+    let Some((got, _flow, cmd, target)) = decode_request(&mut flow) else {
+        return;
+    };
+    if got != *id || !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if flow.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    crate::hysteria::relay(&uplink, &flow);
+}
+
+fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &vless.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: vless.host.clone(),
+        address: vless.address.clone(),
+        port: vless.port,
+        config: config.clone(),
+        roots: vless.hysteria_roots.clone(),
+    })
+}
+
 fn dial_vless_kcp(
     client: &TcpStream,
     conn: &Arc<ferrox_core::kcp::Connection>,
@@ -2856,6 +2905,12 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
         if matches!(vless.carrier, Carrier::Kcp(_)) && !vless.mux {
             if let Some(session) = kcp_dial_session(&vless.carrier, &vless.address, vless.port) {
                 dial_vless_kcp(&client, &session, vless, &target);
+            }
+            return;
+        }
+        if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux {
+            if let Some(dial) = hysteria_dial_session(vless) {
+                crate::hysteria::dial_vless(&client, &dial, &vless.id, &target);
             }
             return;
         }
@@ -4240,7 +4295,7 @@ fn writev_loop(fd: std::os::fd::RawFd, iov: &mut [libc::iovec], mut left: usize)
     true
 }
 
-fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
+pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
     let mut prefix = [0u8; 2];
     read_exact(stream, &mut prefix).ok()?;
     let consumed = ferrox_core::vless::VlessLink::decode_response_header(&prefix).ok()?;
@@ -4254,7 +4309,7 @@ fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
 const MUX_TARGET: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 666);
 
-fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], String, u8, SocketAddr)> {
+pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], String, u8, SocketAddr)> {
     let mut head = [0u8; 18];
     read_exact(stream, &mut head).ok()?;
     if head[0] != 0 {
@@ -4966,17 +5021,13 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             outbound.get("mux").and_then(|mux| mux.get("enabled")),
             Some(Json::Bool(true))
         );
-        let quic_roots = if matches!(carrier, Carrier::Quic) {
-            outbound
-                .get("streamSettings")
-                .and_then(|s| s.get("tlsSettings"))
-                .and_then(|s| s.get("caCertFile"))
-                .and_then(Json::as_str)
-                .and_then(|path| std::fs::read(path).ok())
-                .map(|pem| crate::quic::parse_ca_pem(&pem))
-                .filter(|roots| !roots.is_empty())
-        } else {
-            None
+        let quic_roots = match &carrier {
+            Carrier::Quic => tls_ca_roots(outbound),
+            _ => None,
+        };
+        let hysteria_roots = match &carrier {
+            Carrier::Hysteria(_) => tls_ca_roots(outbound),
+            _ => None,
         };
         return Some(VlessOut {
             address,
@@ -4986,6 +5037,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             host,
             mux,
             quic_roots,
+            hysteria_roots,
         });
     }
     None
@@ -5030,6 +5082,17 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
         });
     }
     None
+}
+
+fn tls_ca_roots(outbound: &Json) -> Option<Vec<Vec<u8>>> {
+    outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|s| s.get("caCertFile"))
+        .and_then(Json::as_str)
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|pem| crate::quic::parse_ca_pem(&pem))
+        .filter(|roots| !roots.is_empty())
 }
 
 fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
@@ -5087,7 +5150,7 @@ fn stream_carrier(settings: Option<&Json>) -> Carrier {
         },
         Some("quic") => Carrier::Quic,
         Some("kcp" | "mkcp") => Carrier::Kcp(kcp_config(settings)),
-        Some("hysteria") => Carrier::Hysteria,
+        Some("hysteria") => hysteria_carrier(settings),
         Some("masque") => Carrier::Masque,
         Some("xdrive") => Carrier::Xdrive,
         Some("http" | "h2" | "h3") => Carrier::Http,
@@ -5097,6 +5160,34 @@ fn stream_carrier(settings: Option<&Json>) -> Carrier {
         },
         Some(_) => Carrier::Unknown,
     }
+}
+
+fn hysteria_carrier(settings: Option<&Json>) -> Carrier {
+    use ferrox_core::hysteria::{Config, Congestion};
+    let hy = settings.and_then(|s| s.get("hysteriaSettings"));
+    let version = hy
+        .and_then(|h| h.get("version"))
+        .and_then(Json::as_u32)
+        .or_else(|| {
+            hy.and_then(|h| h.get("version"))
+                .and_then(Json::as_str)
+                .and_then(|text| text.parse::<u32>().ok())
+        });
+    if version.is_some_and(|v| v != 2) {
+        return Carrier::Unknown;
+    }
+    Carrier::Hysteria(Config {
+        auth: hy
+            .and_then(|h| h.get("auth"))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        cc: Congestion::parse(
+            hy.and_then(|h| h.get("congestion"))
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ),
+    })
 }
 
 fn sub_path(settings: Option<&Json>, key: &str) -> String {
@@ -5169,7 +5260,7 @@ fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
         Carrier::HttpHeader { .. } => "tcpSettings",
         Carrier::Quic => "quicSettings",
         Carrier::Kcp(_) => "kcpSettings",
-        Carrier::Hysteria => "hysteriaSettings",
+        Carrier::Hysteria(_) => "hysteriaSettings",
         Carrier::Masque => "masqueSettings",
         Carrier::Xdrive => "xdriveSettings",
         Carrier::Unknown | Carrier::Raw | Carrier::Http => "",
@@ -6670,6 +6761,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -7404,6 +7496,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -7593,6 +7686,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8177,7 +8271,7 @@ mod tests {
                 Carrier::HttpHeader { .. } => "HttpHeader",
                 Carrier::Quic => "Quic",
                 Carrier::Kcp(_) => "Kcp",
-                Carrier::Hysteria => "Hysteria",
+                Carrier::Hysteria(_) => "Hysteria",
                 Carrier::Masque => "Masque",
                 Carrier::Xdrive => "Xdrive",
                 Carrier::Http => "Http",
@@ -8215,6 +8309,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            hysteria_roots: None,
         };
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let source = Arc::new(Mutex::new(None));
@@ -8442,7 +8537,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
-        let mut client_config = crate::quic::quiche_config(&roots).expect("configures");
+        let mut client_config = crate::quic::quiche_config(&roots, None).expect("configures");
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -8783,6 +8878,7 @@ mod tests {
             host: "localhost".to_owned(),
             mux: false,
             quic_roots: Some(roots),
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8825,6 +8921,7 @@ mod tests {
             host: "localhost".to_owned(),
             mux: true,
             quic_roots: None,
+            hysteria_roots: None,
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -9160,6 +9257,361 @@ mod tests {
         assert_eq!(cfg.tti, base.tti);
     }
 
+    #[test]
+    fn hysteria_settings_parse_with_guarded_fallbacks() {
+        let plain = crate::json::parse(r#"{"network":"hysteria"}"#).expect("parses");
+        let Carrier::Hysteria(cfg) = stream_carrier(Some(&plain)) else {
+            panic!("hysteria names Hysteria");
+        };
+        assert_eq!(cfg.auth, "");
+        assert_eq!(cfg.cc, ferrox_core::hysteria::Congestion::Bbr);
+        let full = crate::json::parse(
+            r#"{"network":"hysteria","hysteriaSettings":{"auth":"s3","congestion":"reno","version":2}}"#,
+        )
+        .expect("parses");
+        let Carrier::Hysteria(cfg) = stream_carrier(Some(&full)) else {
+            panic!("full settings parse");
+        };
+        assert_eq!(cfg.auth, "s3");
+        assert_eq!(cfg.cc, ferrox_core::hysteria::Congestion::Reno);
+        let brutal = crate::json::parse(
+            r#"{"network":"hysteria","hysteriaSettings":{"congestion":"force-brutal","version":"2"}}"#,
+        )
+        .expect("parses");
+        let Carrier::Hysteria(cfg) = stream_carrier(Some(&brutal)) else {
+            panic!("string version parses");
+        };
+        assert_eq!(cfg.cc, ferrox_core::hysteria::Congestion::Brutal);
+        let old = crate::json::parse(r#"{"network":"hysteria","hysteriaSettings":{"version":1}}"#)
+            .expect("parses");
+        assert!(matches!(stream_carrier(Some(&old)), Carrier::Unknown));
+    }
+
+    fn hysteria_loop_with(auth: &str, id: [u8; 16]) -> (u16, Vec<Vec<u8>>) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-test-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        assert_ne!(roots, Vec::<Vec<u8>>::new());
+        let address = format!("127.0.0.1:{port}");
+        let config = ferrox_core::hysteria::Config {
+            auth: auth.to_owned(),
+            cc: ferrox_core::hysteria::Congestion::Bbr,
+        };
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_vless_hysteria(flow, &id, true);
+        });
+        let (cert_path, key_path) = (
+            cert_path.to_str().expect("ascii").to_owned(),
+            key_path.to_str().expect("ascii").to_owned(),
+        );
+        thread::spawn(move || {
+            crate::hysteria::serve_loop(&address, &config, &cert_path, &key_path, &serve);
+        });
+        (port, roots)
+    }
+
+    fn hysteria_tcp_pair(
+        port: u16,
+        roots: Vec<Vec<u8>>,
+        auth: &str,
+        id: [u8; 16],
+        target: SocketAddr,
+    ) -> TcpStream {
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                auth: auth.to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+            },
+            roots: Some(roots),
+        };
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            crate::hysteria::dial_vless(&stream, &dial, &id, &target);
+        });
+        let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+    }
+
+    fn hysteria_test_server_config(
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
+    ) -> quiche::Config {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
+        config.set_initial_max_data(crate::quic::MAX_DATA);
+        config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
+        config.set_initial_max_stream_data_bidi_remote(crate::quic::MAX_STREAM_DATA);
+        config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
+        config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
+        config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
+        config
+            .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
+            .expect("loads chain");
+        config
+            .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
+            .expect("loads key");
+        config
+    }
+
+    fn hysteria_test_answer_auth(
+        conn: &mut quiche::Connection,
+        sock: &UdpSocket,
+        local: SocketAddr,
+        out: &mut [u8; 1350],
+    ) -> Vec<u8> {
+        let mut buf = [0u8; 1350];
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let mut head = Vec::new();
+        loop {
+            assert!(std::time::Instant::now() < deadline, "auth never arrives");
+            let Some((n, from)) = quic_server_poll(sock, &mut buf) else {
+                quic_server_idle(conn, sock, out);
+                continue;
+            };
+            let info = quiche::RecvInfo { from, to: local };
+            conn.recv(&mut buf[..n], info).expect("drives");
+            let mut piece = [0u8; 4096];
+            while let Ok((n, _)) = conn.stream_recv(0, &mut piece) {
+                head.extend_from_slice(&piece[..n]);
+            }
+            while let Ok((written, info)) = conn.send(out) {
+                sock.send_to(&out[..written], info.to).expect("answers");
+            }
+            let mut at = 0usize;
+            if let Some(frame) = ferrox_core::foxy::frames::h3_frame(&head, &mut at) {
+                if frame.kind == ferrox_core::foxy::frames::H3_HEADERS {
+                    if let Some(body) = head.get(at..at + frame.length as usize) {
+                        return body.to_vec();
+                    }
+                }
+            }
+        }
+    }
+
+    fn hysteria_test_read_prefix(
+        conn: &mut quiche::Connection,
+        sock: &UdpSocket,
+        local: SocketAddr,
+        out: &mut [u8; 1350],
+    ) -> Vec<u8> {
+        let mut buf = [0u8; 1350];
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let mut prefix = Vec::new();
+        loop {
+            assert!(std::time::Instant::now() < deadline, "flow never arrives");
+            let Some((n, from)) = quic_server_poll(sock, &mut buf) else {
+                quic_server_idle(conn, sock, out);
+                continue;
+            };
+            let info = quiche::RecvInfo { from, to: local };
+            conn.recv(&mut buf[..n], info).expect("drives");
+            let mut piece = [0u8; 4096];
+            while let Ok((n, _)) = conn.stream_recv(4, &mut piece) {
+                prefix.extend_from_slice(&piece[..n]);
+            }
+            while let Ok((written, info)) = conn.send(out) {
+                sock.send_to(&out[..written], info.to).expect("answers");
+            }
+            if prefix.len() >= 2 {
+                return prefix.split_off(2);
+            }
+        }
+    }
+
+    #[test]
+    fn hysteria_client_passes_a_hand_rolled_server() {
+        let _serial = quic_serial();
+        let echo_port = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-bisect-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = sock.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut config = hysteria_test_server_config(&cert_path, &key_path);
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&key_path);
+            let local = sock.local_addr().expect("addr");
+            let (mut conn, _) = quic_server_accept(&sock, local, &mut config);
+            let mut out = [0u8; 1350];
+            let body = hysteria_test_answer_auth(&mut conn, &sock, local, &mut out);
+            assert!(
+                ferrox_core::hysteria::verify_auth_request(&body, "bisect-auth"),
+                "auth verifies"
+            );
+            let mut block = Vec::new();
+            ferrox_core::hysteria::build_auth_response(&mut block);
+            let mut frame = Vec::new();
+            ferrox_core::foxy::frames::quic_varint(
+                &mut frame,
+                ferrox_core::foxy::frames::H3_HEADERS,
+            );
+            ferrox_core::foxy::frames::quic_varint(&mut frame, block.len() as u64);
+            frame.extend_from_slice(&block);
+            conn.stream_send(0, &frame, true).expect("answers");
+            while let Ok((written, info)) = conn.send(&mut out) {
+                sock.send_to(&out[..written], info.to).expect("answers");
+            }
+            let rest = hysteria_test_read_prefix(&mut conn, &sock, local, &mut out);
+            let flow = crate::hysteria::Flow::from_parts(
+                Arc::new(Mutex::new(conn)),
+                Arc::new(sock),
+                local,
+                4,
+                rest,
+            );
+            serve_vless_hysteria(flow, &id, true);
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                auth: "bisect-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+            },
+            roots: Some(roots),
+        };
+        let Some(session) = crate::hysteria::connect(&dial) else {
+            panic!("client connects");
+        };
+        let header = vless_header(&id, 1, &target);
+        let Some(mut flow) = crate::hysteria::open_flow(&session, &header) else {
+            panic!("flow opens");
+        };
+        flow.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        flow.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn hysteria_server_passes_a_hand_rolled_client() {
+        use ferrox_core::foxy::frames as h3;
+        let _serial = quic_serial();
+        let echo_port = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("bisect2-auth", id);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(30);
+        let mut settings = Vec::new();
+        h3::quic_varint(&mut settings, 0x04);
+        h3::quic_varint(&mut settings, 0);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 2, &settings, true, horizon
+        ));
+        let mut block = Vec::new();
+        ferrox_core::hysteria::build_auth_request("localhost", "bisect2-auth", &mut block);
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, true, horizon
+        ));
+        let mut head = Vec::new();
+        let body = loop {
+            let piece = crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 1, horizon)
+                .expect("reads");
+            head.extend_from_slice(&piece);
+            let mut at = 0usize;
+            if let Some(got) = h3::h3_frame(&head, &mut at) {
+                if got.kind == h3::H3_HEADERS {
+                    if let Some(body) = head.get(at..at + got.length as usize) {
+                        break body.to_vec();
+                    }
+                }
+            }
+        };
+        assert!(ferrox_core::hysteria::verify_auth_response(&body));
+        let header = vless_header(&id, 1, &target);
+        let mut prefix = Vec::with_capacity(2 + header.len());
+        ferrox_core::hysteria::tcp_prefix(&mut prefix);
+        prefix.extend_from_slice(&header);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 4, &prefix, false, horizon
+        ));
+        let reply = crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 2, horizon)
+            .expect("replies");
+        assert_eq!(reply.as_slice(), &[0, 0]);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 4, b"ping", false, horizon
+        ));
+        let back =
+            crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 4, horizon).expect("echoes");
+        assert_eq!(back.as_slice(), b"ping");
+    }
+
+    #[test]
+    fn hysteria_carries_vless_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = hysteria_tcp_pair(port, roots, "test-auth", id, target);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn hysteria_refuses_a_wrong_password_without_relaying() {
+        let _serial = quic_serial();
+        let echo_port = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = hysteria_tcp_pair(port, roots, "wrong-auth", id, target);
+        let mut probe = [0u8; 1];
+        assert_eq!(client.read(&mut probe).expect("reads"), 0);
+    }
+
     fn echo_once() -> u16 {
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
@@ -9231,6 +9683,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            hysteria_roots: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
