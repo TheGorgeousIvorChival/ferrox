@@ -267,7 +267,7 @@ impl Flow {
         }
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         if let Ok(mut conn) = self.session.shared.lock() {
             let _ = conn.stream_send(self.stream, &[], true);
             crate::quic::flush_egress(&mut conn, &self.session.sock);
@@ -362,6 +362,34 @@ pub(crate) fn open_flow(session: &Session, header: &[u8]) -> Option<Flow> {
     })
 }
 
+/// Reads a Hysteria v2 TCP request body off a flow whose `0x401` frame type is
+/// already consumed, leaving any payload that followed it in the backlog.
+pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String> {
+    let mut head: Vec<u8> = flow.backlog.split_off(flow.at);
+    flow.backlog.clear();
+    flow.at = 0;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match hysteria::decode_tcp_request_body(&head) {
+            Ok((address, used)) => {
+                flow.backlog = head[used..].to_vec();
+                return Some(address.to_owned());
+            }
+            Err(hysteria::RequestError::Invalid) => return None,
+            Err(hysteria::RequestError::Incomplete) => {
+                if head.len() >= HEAD_CAP || Instant::now() >= deadline {
+                    return None;
+                }
+                let n = flow.read(&mut chunk).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+        }
+    }
+}
+
 pub(crate) fn dial_vless(client: &TcpStream, dial: &Dial, id: &[u8; 16], target: &SocketAddr) {
     let Some(session) = connect(dial) else {
         return;
@@ -440,6 +468,7 @@ struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
     client_cid: Vec<u8>,
     authed: bool,
+    settings_sent: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
 }
@@ -529,7 +558,7 @@ struct Router<'a> {
     sock: Arc<UdpSocket>,
     local: SocketAddr,
     out: [u8; 1350],
-    config: &'a hysteria::Config,
+    auths: &'a [String],
     serve: &'a Serve,
     routes: HashMap<Vec<u8>, Inbound>,
 }
@@ -544,7 +573,7 @@ fn auth_exchange(
     sock: &UdpSocket,
     out: &mut [u8; 1350],
     conn: &mut quiche::Connection,
-    config: &hysteria::Config,
+    auths: &[String],
     inbound: &mut Inbound,
 ) -> Option<bool> {
     let mut chunk = [0u8; 4096];
@@ -563,7 +592,9 @@ fn auth_exchange(
         .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))
         .map(<[u8]>::to_vec);
     let body = ready?;
-    let ok = hysteria::verify_auth_request(&body, &config.auth);
+    let ok = auths
+        .iter()
+        .any(|auth| hysteria::verify_auth_request(&body, auth));
     if !answer_auth(conn, ok) {
         return None;
     }
@@ -603,6 +634,7 @@ impl Router<'_> {
                 conn: Arc::new(Mutex::new(conn)),
                 client_cid: client_cid.to_vec(),
                 authed: false,
+                settings_sent: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
             },
@@ -614,7 +646,7 @@ impl Router<'_> {
             routes,
             sock,
             out,
-            config,
+            auths,
             serve,
             local,
         } = self;
@@ -634,12 +666,25 @@ impl Router<'_> {
                 return;
             }
             drain_settings(&mut conn);
+            // The server's SETTINGS go out before its auth answer: a client
+            // whose H3 stack waits for them, as the pinned one does, posts
+            // its auth only after they arrive.
+            if routes.get(dcid).is_some_and(|i| !i.settings_sent) {
+                let mut settings = Vec::new();
+                frames::quic_varint(&mut settings, 0x04);
+                frames::quic_varint(&mut settings, 0);
+                let _ = conn.stream_send(3, &settings, true);
+                flush(sock, &mut conn, out);
+                if let Some(inbound) = routes.get_mut(dcid) {
+                    inbound.settings_sent = true;
+                }
+            }
             let authed = routes.get(dcid).is_some_and(|i| i.authed);
             if !authed {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
-                let Some(ok) = auth_exchange(sock, out, &mut conn, config, inbound) else {
+                let Some(ok) = auth_exchange(sock, out, &mut conn, auths, inbound) else {
                     return;
                 };
                 if !ok {
@@ -647,11 +692,6 @@ impl Router<'_> {
                     flush(sock, &mut conn, out);
                     return;
                 }
-                let mut settings = Vec::new();
-                frames::quic_varint(&mut settings, 0x04);
-                frames::quic_varint(&mut settings, 0);
-                let _ = conn.stream_send(3, &settings, true);
-                flush(sock, &mut conn, out);
             }
             conn.readable().collect()
         };
@@ -697,7 +737,8 @@ impl Router<'_> {
 
 pub(crate) fn serve_loop(
     address: &str,
-    config: &hysteria::Config,
+    auths: &[String],
+    cc: hysteria::Congestion,
     cert_path: &str,
     key_path: &str,
     serve: &Serve,
@@ -709,14 +750,14 @@ pub(crate) fn serve_loop(
         return;
     };
     let local = sock.local_addr().unwrap_or(bound);
-    let Some(mut template) = server_config(cert_path, key_path, config.cc) else {
+    let Some(mut template) = server_config(cert_path, key_path, cc) else {
         return;
     };
     let mut router = Router {
         sock: Arc::new(sock),
         local,
         out: [0u8; 1350],
-        config,
+        auths,
         serve,
         routes: HashMap::new(),
     };

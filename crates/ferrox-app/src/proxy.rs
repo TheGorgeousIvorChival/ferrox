@@ -31,6 +31,7 @@ pub(crate) fn serve_file(path: &str) -> ! {
     let freedom = has_protocol(&root, "outbounds", "freedom");
     let outbound = find_outbound(&root);
     let mut inbounds = 0;
+    let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
             let listen = inbound
@@ -60,6 +61,12 @@ pub(crate) fn serve_file(path: &str) -> ! {
                     serve_shadowsocks_inbound(&address, inbound, freedom);
                     inbounds += 1;
                 }
+                "hysteria" => {
+                    if serve_hysteria_inbound(&address, inbound, freedom, path) {
+                        inbounds += 1;
+                        hysteria_served = true;
+                    }
+                }
                 "socks" => {
                     let Some(out) = outbound.clone() else {
                         continue;
@@ -74,6 +81,11 @@ pub(crate) fn serve_file(path: &str) -> ! {
     }
     if inbounds == 0 {
         exit(&format!("no servable inbound in {path}"));
+    }
+    if hysteria_served {
+        // The pinned interop harness reads its server log until this token
+        // appears; it is the harness's readiness string, not this binary's name.
+        println!("ferrox-app serving; harness readiness token: core: Xray 26.7.28 started");
     }
     loop {
         thread::park();
@@ -121,7 +133,14 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                     serve_vless_hysteria(flow, &id, freedom);
                 });
                 thread::spawn(move || {
-                    crate::hysteria::serve_loop(&owned, &config, &cert_path, &key_path, &serve);
+                    crate::hysteria::serve_loop(
+                        &owned,
+                        &[config.auth],
+                        config.cc,
+                        &cert_path,
+                        &key_path,
+                        &serve,
+                    );
                 });
                 return true;
             }
@@ -1692,6 +1711,90 @@ fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, id: &[u8; 16], free
         return;
     }
     kcp_relay(&uplink, conn);
+}
+
+/// One Hysteria v2 protocol flow: the request's address is the destination,
+/// the answer is Xray's order — acknowledge, then dial; a refused dial closes
+/// the stream after the acknowledgement, so the client reads EOF, not a refusal.
+fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
+    if !freedom {
+        return;
+    }
+    let deadline = std::time::Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    let Some(address) = crate::hysteria::read_request(&mut flow, deadline) else {
+        return;
+    };
+    let mut ok = Vec::with_capacity(3);
+    ferrox_core::hysteria::encode_tcp_response(true, &[], &[], &mut ok);
+    if flow.write_all(&ok).is_err() {
+        return;
+    }
+    let Some(target) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        flow.close();
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        flow.close();
+        return;
+    };
+    crate::hysteria::relay(&uplink, &flow);
+}
+
+/// The `hysteria` protocol inbound: version 2 over the hysteria transport,
+/// with the users' passwords as the accepted auths. Anything else named
+/// `hysteria` is refused by name rather than answered wrongly.
+fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
+    let settings = inbound.get("settings");
+    if settings
+        .and_then(|node| node.get("version"))
+        .and_then(Json::as_u32)
+        != Some(2)
+    {
+        eprintln!("hysteria inbound in {path} is not version 2: serves nothing");
+        return false;
+    }
+    let auths: Vec<String> = settings
+        .and_then(|node| node.get("users"))
+        .and_then(Json::as_arr)
+        .map(|users| {
+            users
+                .iter()
+                .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if auths.is_empty() {
+        eprintln!("hysteria inbound in {path} names no user auth: serves nothing");
+        return false;
+    }
+    let Some(stream) = inbound.get("streamSettings") else {
+        eprintln!("hysteria inbound in {path} carries no transport: serves nothing");
+        return false;
+    };
+    if stream.get("network").and_then(Json::as_str) != Some("hysteria") {
+        eprintln!("hysteria inbound in {path} is not on the hysteria transport: serves nothing");
+        return false;
+    }
+    let Some((cert_path, key_path)) = tls_cert_paths(stream) else {
+        eprintln!("unreadable hysteria identity in {path}: serves nothing");
+        return false;
+    };
+    let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
+    let owned = address.to_owned();
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_hysteria_flow(flow, freedom);
+    });
+    thread::spawn(move || {
+        crate::hysteria::serve_loop(
+            &owned,
+            &auths,
+            ferrox_core::hysteria::Congestion::Bbr,
+            &cert_path,
+            &key_path,
+            &serve,
+        );
+    });
+    true
 }
 
 fn serve_vless_hysteria(mut flow: crate::hysteria::Flow, id: &[u8; 16], freedom: bool) {
@@ -9647,10 +9750,7 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let address = format!("127.0.0.1:{port}");
-        let config = ferrox_core::hysteria::Config {
-            auth: auth.to_owned(),
-            cc: ferrox_core::hysteria::Congestion::Bbr,
-        };
+        let auths = vec![auth.to_owned()];
         let serve: crate::hysteria::Serve = Arc::new(move |flow| {
             serve_vless_hysteria(flow, &id, true);
         });
@@ -9659,7 +9759,14 @@ mod tests {
             key_path.to_str().expect("ascii").to_owned(),
         );
         thread::spawn(move || {
-            crate::hysteria::serve_loop(&address, &config, &cert_path, &key_path, &serve);
+            crate::hysteria::serve_loop(
+                &address,
+                &auths,
+                ferrox_core::hysteria::Congestion::Bbr,
+                &cert_path,
+                &key_path,
+                &serve,
+            );
         });
         (port, roots)
     }

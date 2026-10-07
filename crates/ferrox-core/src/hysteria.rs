@@ -71,6 +71,73 @@ pub fn read_tcp_prefix(packet: &[u8]) -> Option<usize> {
     (frames::quic_read(packet, &mut at) == Some(TCP_FRAME)).then_some(at)
 }
 
+pub const MAX_ADDRESS_LENGTH: u64 = 2048;
+
+pub const MAX_PADDING_LENGTH: u64 = 4096;
+
+pub const MAX_MESSAGE_LENGTH: u64 = 2048;
+
+/// A framed field is still arriving; anything else is a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestError {
+    Incomplete,
+    Invalid,
+}
+
+fn bounded<'a>(packet: &'a [u8], at: &mut usize, limit: u64) -> Result<&'a [u8], RequestError> {
+    let len = frames::quic_read(packet, at).ok_or(RequestError::Incomplete)?;
+    if len > limit {
+        return Err(RequestError::Invalid);
+    }
+    let bytes = packet
+        .get(*at..*at + len as usize)
+        .ok_or(RequestError::Incomplete)?;
+    *at += len as usize;
+    Ok(bytes)
+}
+
+/// The body after the `0x401` frame type: a varint-string `host:port` and a
+/// varint-skip of padding, the shape `proxy/hysteria`'s `WriteTCPRequest` puts
+/// on every TCP stream.
+pub fn decode_tcp_request_body(packet: &[u8]) -> Result<(&str, usize), RequestError> {
+    let mut at = 0usize;
+    let raw = bounded(packet, &mut at, MAX_ADDRESS_LENGTH)?;
+    let address = std::str::from_utf8(raw).map_err(|_| RequestError::Invalid)?;
+    if address.is_empty() {
+        return Err(RequestError::Invalid);
+    }
+    bounded(packet, &mut at, MAX_PADDING_LENGTH)?;
+    Ok((address, at))
+}
+
+/// The full stream head: frame type, then the body.
+pub fn decode_tcp_request(packet: &[u8]) -> Result<(&str, usize), RequestError> {
+    let mut at = 0usize;
+    if frames::quic_read(packet, &mut at).ok_or(RequestError::Incomplete)? != TCP_FRAME {
+        return Err(RequestError::Invalid);
+    }
+    let (address, used) = decode_tcp_request_body(&packet[at..])?;
+    Ok((address, at + used))
+}
+
+pub fn encode_tcp_request(address: &str, padding: &[u8], out: &mut Vec<u8>) {
+    frames::quic_varint(out, TCP_FRAME);
+    frames::quic_varint(out, address.len() as u64);
+    out.extend_from_slice(address.as_bytes());
+    frames::quic_varint(out, padding.len() as u64);
+    out.extend_from_slice(padding);
+}
+
+/// Status byte, then varint-framed message and padding; `ok` is the only
+/// status a client continues on, matching `WriteTCPResponse(w, true, "")`.
+pub fn encode_tcp_response(ok: bool, message: &[u8], padding: &[u8], out: &mut Vec<u8>) {
+    out.push(u8::from(!ok));
+    frames::quic_varint(out, message.len() as u64);
+    out.extend_from_slice(message);
+    frames::quic_varint(out, padding.len() as u64);
+    out.extend_from_slice(padding);
+}
+
 pub fn wrap_dgram(session: u32, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&session.to_be_bytes());
     out.extend_from_slice(payload);
@@ -148,6 +215,51 @@ mod tests {
         assert_eq!(read_tcp_prefix(&[0x44]), None);
         assert_eq!(read_tcp_prefix(&[0x40, 0x01]), None);
         assert_eq!(read_tcp_prefix(&[0x44, 0x01, 0x00]), Some(2));
+    }
+
+    #[test]
+    fn a_tcp_request_is_frame_address_padding_on_the_wire() {
+        let mut out = Vec::new();
+        encode_tcp_request("127.0.0.1:8080", &[0xAB; 3], &mut out);
+        let mut want = vec![0x44, 0x01, 14];
+        want.extend_from_slice(b"127.0.0.1:8080");
+        want.extend_from_slice(&[3, 0xAB, 0xAB, 0xAB]);
+        assert_eq!(out, want);
+        assert_eq!(decode_tcp_request(&out), Ok(("127.0.0.1:8080", out.len())));
+        assert_eq!(
+            decode_tcp_request_body(&out[2..]),
+            Ok(("127.0.0.1:8080", out.len() - 2))
+        );
+        assert_eq!(decode_tcp_request(&out[..5]), Err(RequestError::Incomplete));
+        assert_eq!(decode_tcp_request(&out[..2]), Err(RequestError::Incomplete));
+        assert_eq!(decode_tcp_request(&[0x44]), Err(RequestError::Incomplete));
+        assert_eq!(
+            decode_tcp_request(&[0x41, 0x00]),
+            Err(RequestError::Invalid)
+        );
+        assert_eq!(
+            decode_tcp_request_body(&[5, b'a', b'b']),
+            Err(RequestError::Incomplete)
+        );
+        assert_eq!(decode_tcp_request_body(&[0]), Err(RequestError::Invalid));
+        let mut too_long = Vec::new();
+        frames::quic_varint(&mut too_long, MAX_ADDRESS_LENGTH + 1);
+        assert_eq!(
+            decode_tcp_request_body(&too_long),
+            Err(RequestError::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_tcp_response_is_status_message_padding_on_the_wire() {
+        let mut out = Vec::new();
+        encode_tcp_response(true, &[], &[], &mut out);
+        assert_eq!(out, vec![0, 0, 0]);
+        let mut refused = Vec::new();
+        encode_tcp_response(false, b"no route", &[7; 2], &mut refused);
+        assert_eq!(refused[0], 1);
+        assert_eq!(&refused[2..10], b"no route");
+        assert_eq!(&refused[10..], [2, 7, 7]);
     }
 
     #[test]

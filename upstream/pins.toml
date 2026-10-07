@@ -46,6 +46,17 @@ ferrox_binary = "ferrox-app"
 seam           = "XRAY_VLESS_FULL_BINARY"
 note          = "Rust VLESS core; 7 interop tests run against ferrox-app via XRAY_VLESS_FULL_BINARY, checked by conformance.yml; the other 16 stay out until their transports land. Suite fetches the Xray-core checkout the tests assert on because the harness clones only this repo"
 
+[sources.xray-rust-hysteria]
+repo          = "https://github.com/aimalygin/xray-rust"
+rev           = "f5aefca40b9f492e8095ba3c1620ae627ce331ee"
+default_branch = "main"
+path          = "crates"
+test_enabled  = true
+suite         = "cargo test -p xray-transport --test hysteria_interop_tests -- --ignored --exact pinned_reference_rejects_wrong_auth_and_closes_failed_tcp_destination"
+ferrox_binary = "ferrox-app"
+seam          = "XRAY_HYSTERIA_BINARY"
+note          = "the same core's Hysteria v2 client against ferrox-app's `protocol: hysteria` inbound: a wrong password is refused and a failed destination closes after the acknowledgement. UDP stays out — ferrox carries no UDP flows, and the two tests that need them name that refusal. The harness's readiness token is the pinned Xray banner; ferrox-app emits it labeled as the harness's string"
+
 [sources.pattng]
 repo          = "https://github.com/patterniha/PattNG"
 rev           = "1ee7205ce5673dd8458a46eeeeb9464086dae8d5"
