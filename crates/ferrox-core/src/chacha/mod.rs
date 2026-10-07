@@ -43,7 +43,7 @@ pub(crate) fn as_i32_bits(word: u32) -> i32 {
 const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
 #[cfg(target_arch = "x86_64")]
-const GROUP_STATES: usize = 4;
+const GROUP_STATES: usize = 3;
 #[cfg(target_arch = "aarch64")]
 const GROUP_STATES: usize = 8;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -344,8 +344,8 @@ pub const fn backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
         match (GROUP_STATES, GROUP_STATES * <avx2::A8 as Lanes>::CHUNKS) {
-            (4, 8) => {
-                "4-lane core: AVX2, 4 states in flight, 8 blocks per iteration, at runtime-detected width"
+            (3, 6) => {
+                "4-lane core: AVX2, 3 states in flight, 6 blocks per iteration, at runtime-detected width"
             }
             _ => "x86_64: a width this build does not have",
         }
@@ -369,9 +369,9 @@ pub const fn backend() -> &'static str {
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(GROUP_STATES * <Wide as Lanes>::CHUNKS == 8);
 #[cfg(target_arch = "x86_64")]
-const _: () = assert!(GROUP_STATES * <avx2::A8 as Lanes>::CHUNKS == 8);
+const _: () = assert!(GROUP_STATES * <avx2::A8 as Lanes>::CHUNKS == 6);
 #[cfg(target_arch = "x86_64")]
-const _: () = assert!(GROUP_STATES * <portable::U4 as Lanes>::CHUNKS == 4);
+const _: () = assert!(GROUP_STATES * <portable::U4 as Lanes>::CHUNKS == 3);
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const _: () = assert!(GROUP_STATES * <Wide as Lanes>::CHUNKS == 4);
 
