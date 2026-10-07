@@ -352,7 +352,11 @@ mod tests {
         assert_eq!(addr, "198.51.100.7:53");
         assert_eq!(used, out.len());
         assert!(!encode_tcp_request("", &[0u8; 64], &mut Vec::new()));
-        assert!(!encode_tcp_request("a:1", &[0u8; TCP_PAD_MAX + 1], &mut Vec::new()));
+        assert!(!encode_tcp_request(
+            "a:1",
+            &[0u8; TCP_PAD_MAX + 1],
+            &mut Vec::new()
+        ));
         assert_eq!(decode_tcp_request(&[0]), None);
     }
 
@@ -459,13 +463,21 @@ mod tests {
     fn an_auth_request_with_the_wrong_shape_is_refused() {
         let mut block = Vec::new();
         hpack::qpack_literal_many(
-            &[(":method", "GET"), (":path", "/auth"), (AUTH_HEADER, "s3cret")],
+            &[
+                (":method", "GET"),
+                (":path", "/auth"),
+                (AUTH_HEADER, "s3cret"),
+            ],
             &mut block,
         );
         assert!(!verify_auth_request(&block, "s3cret"));
         let mut block = Vec::new();
         hpack::qpack_literal_many(
-            &[(":method", "POST"), (":path", "/other"), (AUTH_HEADER, "s3cret")],
+            &[
+                (":method", "POST"),
+                (":path", "/other"),
+                (AUTH_HEADER, "s3cret"),
+            ],
             &mut block,
         );
         assert!(!verify_auth_request(&block, "s3cret"));

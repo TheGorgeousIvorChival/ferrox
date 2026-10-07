@@ -118,10 +118,10 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                 };
                 let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
                 let serve: crate::hysteria::Serve = Arc::new(move |flow, target| {
-                    serve_hysteria(flow, &target, freedom);
+                    serve_hysteria(&flow, &target, freedom);
                 });
                 let serve_udp: crate::hysteria::ServeUdp = Arc::new(move |ctx| {
-                    serve_hysteria_udp(ctx, freedom);
+                    serve_hysteria_udp(&ctx, freedom);
                 });
                 thread::spawn(move || {
                     crate::hysteria::serve_loop(
@@ -1699,24 +1699,28 @@ fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, id: &[u8; 16], free
     kcp_relay(&uplink, conn);
 }
 
-fn serve_hysteria(flow: crate::hysteria::Flow, target: &SocketAddr, freedom: bool) {
+fn serve_hysteria(flow: &crate::hysteria::Flow, target: &SocketAddr, freedom: bool) {
     if !freedom {
         return;
     }
     let Some(uplink) = dial_or_report(target) else {
         return;
     };
-    crate::hysteria::relay(&uplink, &flow);
+    crate::hysteria::relay(&uplink, flow);
 }
 
-fn serve_hysteria_udp(ctx: crate::hysteria::UdpCtx, freedom: bool) {
+fn serve_hysteria_udp(ctx: &crate::hysteria::UdpCtx, freedom: bool) {
     if !freedom {
         return;
     }
     let Some(target) = crate::hysteria::parse_addr_text(&ctx.addr) else {
         return;
     };
-    let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let bind = if target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let Ok(uplink) = UdpSocket::bind(bind) else {
         return;
     };
@@ -1730,14 +1734,9 @@ fn serve_hysteria_udp(ctx: crate::hysteria::UdpCtx, freedom: bool) {
     };
     let done = RelayPool::global().run(move || {
         let mut buf = vec![0u8; UDP_BUF];
-        loop {
-            match back.recv(&mut buf) {
-                Ok(n) => {
-                    if n == 0 || !answer.send(&addr, &buf[..n]) {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(n) = back.recv(&mut buf) {
+            if n == 0 || !answer.send(&addr, &buf[..n]) {
+                break;
             }
         }
     });
@@ -9754,10 +9753,10 @@ mod tests {
             cc: ferrox_core::hysteria::Congestion::Bbr,
         };
         let serve: crate::hysteria::Serve = Arc::new(move |flow, target| {
-            serve_hysteria(flow, &target, true);
+            serve_hysteria(&flow, &target, true);
         });
         let serve_udp: crate::hysteria::ServeUdp = Arc::new(move |ctx| {
-            serve_hysteria_udp(ctx, true);
+            serve_hysteria_udp(&ctx, true);
         });
         let (cert_path, key_path) = (
             cert_path.to_str().expect("ascii").to_owned(),
@@ -9771,7 +9770,12 @@ mod tests {
         (port, roots)
     }
 
-    fn hysteria_tcp_pair(port: u16, roots: Vec<Vec<u8>>, auth: &str, target: SocketAddr) -> TcpStream {
+    fn hysteria_tcp_pair(
+        port: u16,
+        roots: Vec<Vec<u8>>,
+        auth: &str,
+        target: SocketAddr,
+    ) -> TcpStream {
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let dial = crate::hysteria::Dial {
@@ -9940,8 +9944,13 @@ mod tests {
             let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
             assert_eq!(rest.0, target.to_string(), "address arrives as text");
             let mut answer = Vec::new();
-            assert!(ferrox_core::hysteria::encode_tcp_response(true, "", &[], &mut answer));
-            conn.stream_send(4, &answer, true).expect("answers");
+            assert!(ferrox_core::hysteria::encode_tcp_response(
+                true,
+                "",
+                &[],
+                &mut answer
+            ));
+            conn.stream_send(4, &answer, false).expect("answers");
             while let Ok((written, info)) = conn.send(&mut out) {
                 sock.send_to(&out[..written], info.to).expect("answers");
             }
@@ -9952,7 +9961,7 @@ mod tests {
                 4,
                 rest.1,
             );
-            serve_hysteria(flow, &target, true);
+            serve_hysteria(&flow, &target, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let dial = crate::hysteria::Dial {

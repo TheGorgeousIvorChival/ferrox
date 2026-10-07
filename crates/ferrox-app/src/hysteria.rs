@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::frames;
@@ -295,12 +295,23 @@ impl UdpLink {
     // Sends one addressed payload, fragmenting past the datagram cap the way
     // the reference fragments on `DatagramTooLarge` instead of dropping.
     pub(crate) fn send(&mut self, session: u32, addr: &str, data: &[u8]) -> bool {
-        let headroom = hysteria::UDP_HEAD_LEN + addr.len() + 8;
-        if headroom >= DGRAM_MAX || addr.is_empty() || addr.len() > hysteria::TCP_ADDR_MAX {
+        if addr.is_empty() || addr.len() > hysteria::TCP_ADDR_MAX {
             return false;
         }
-        let per = DGRAM_MAX - headroom;
-        let count = ((data.len() + per - 1) / per).max(1).min(255);
+        let locked = self.session.shared.lock();
+        let Ok(mut conn) = locked else {
+            return false;
+        };
+        let cap = conn
+            .dgram_max_writable_len()
+            .unwrap_or(DGRAM_MAX)
+            .min(DGRAM_MAX);
+        let headroom = hysteria::UDP_HEAD_LEN + addr.len() + 8;
+        if headroom >= cap {
+            return false;
+        }
+        let per = cap - headroom;
+        let count = data.len().div_ceil(per).clamp(1, 255);
         let number = if count == 1 {
             0
         } else {
@@ -308,11 +319,7 @@ impl UdpLink {
             self.packet = self.packet.wrapping_add(1).max(1);
             id
         };
-        let locked = self.session.shared.lock();
-        let Ok(mut conn) = locked else {
-            return false;
-        };
-        for (frag, chunk) in data.chunks(per.max(1)).enumerate() {
+        for (frag, chunk) in data.chunks(per).enumerate() {
             let msg = hysteria::UdpMessage {
                 session,
                 packet: number,
@@ -321,8 +328,8 @@ impl UdpLink {
                 addr,
                 data: chunk,
             };
-            let mut wire = Vec::with_capacity(DGRAM_MAX);
-            if !hysteria::encode_udp_message(&msg, &mut wire) || wire.len() > DGRAM_MAX {
+            let mut wire = Vec::with_capacity(cap);
+            if !hysteria::encode_udp_message(&msg, &mut wire) || wire.len() > cap {
                 return false;
             }
             if conn.dgram_send(&wire).is_err() {
@@ -345,10 +352,7 @@ impl UdpLink {
                 let Ok(mut conn) = self.session.shared.lock() else {
                     return None;
                 };
-                match conn.dgram_recv(&mut buf) {
-                    Ok(n) => Some(n),
-                    Err(_) => None,
-                }
+                conn.dgram_recv(&mut buf).ok()
             };
             if let Some(n) = got {
                 if let Some(msg) = hysteria::decode_udp_message(&buf[..n]) {
@@ -365,7 +369,12 @@ impl UdpLink {
             let Ok(mut conn) = self.session.shared.lock() else {
                 return None;
             };
-            crate::quic::pump_once(&mut conn, &self.session.sock, self.session.local, STREAM_POLL);
+            crate::quic::pump_once(
+                &mut conn,
+                &self.session.sock,
+                self.session.local,
+                STREAM_POLL,
+            );
         }
     }
 }
@@ -536,7 +545,6 @@ pub(crate) type Serve = Arc<dyn Fn(Flow, SocketAddr) + Send + Sync>;
 // carrying the first reassembled payload ahead of the rest, and a flow for
 // the replies.
 pub(crate) struct UdpCtx {
-    pub(crate) id: u32,
     pub(crate) addr: String,
     pub(crate) rx: mpsc::Receiver<Vec<u8>>,
     pub(crate) flow: UdpFlow,
@@ -555,12 +563,22 @@ impl UdpFlow {
     // the datagram cap; unfragmented replies carry packet zero like the
     // reference server's.
     pub(crate) fn send(&self, addr: &str, data: &[u8]) -> bool {
-        let headroom = hysteria::UDP_HEAD_LEN + addr.len() + 8;
-        if headroom >= DGRAM_MAX || addr.is_empty() || addr.len() > hysteria::TCP_ADDR_MAX {
+        if addr.is_empty() || addr.len() > hysteria::TCP_ADDR_MAX {
             return false;
         }
-        let per = DGRAM_MAX - headroom;
-        let count = ((data.len() + per - 1) / per).max(1).min(255);
+        let Ok(mut conn) = self.session.shared.lock() else {
+            return false;
+        };
+        let cap = conn
+            .dgram_max_writable_len()
+            .unwrap_or(DGRAM_MAX)
+            .min(DGRAM_MAX);
+        let headroom = hysteria::UDP_HEAD_LEN + addr.len() + 8;
+        if headroom >= cap {
+            return false;
+        }
+        let per = cap - headroom;
+        let count = data.len().div_ceil(per).clamp(1, 255);
         let number = if count == 1 {
             0
         } else {
@@ -568,10 +586,7 @@ impl UdpFlow {
             getrandom::getrandom(&mut id).ok();
             u16::from_be_bytes(id).max(1)
         };
-        let Ok(mut conn) = self.session.shared.lock() else {
-            return false;
-        };
-        for (frag, chunk) in data.chunks(per.max(1)).enumerate() {
+        for (frag, chunk) in data.chunks(per).enumerate() {
             let msg = hysteria::UdpMessage {
                 session: self.id,
                 packet: number,
@@ -580,8 +595,8 @@ impl UdpFlow {
                 addr,
                 data: chunk,
             };
-            let mut wire = Vec::with_capacity(DGRAM_MAX);
-            if !hysteria::encode_udp_message(&msg, &mut wire) || wire.len() > DGRAM_MAX {
+            let mut wire = Vec::with_capacity(cap);
+            if !hysteria::encode_udp_message(&msg, &mut wire) || wire.len() > cap {
                 return false;
             }
             if conn.dgram_send(&wire).is_err() {
@@ -644,7 +659,7 @@ fn answer_request(
         return;
     }
     if let Ok(mut conn) = shared.lock() {
-        let _ = conn.stream_send(stream, &out, true);
+        let _ = conn.stream_send(stream, &out, false);
         crate::quic::flush_egress(&mut conn, sock);
     }
 }
@@ -831,8 +846,8 @@ impl Router<'_> {
             out,
             config,
             serve,
-            serve_udp,
             local,
+            ..
         } = self;
         let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
             return;
@@ -887,6 +902,13 @@ impl Router<'_> {
                 serve_stream(&thread_shared, &thread_sock, local, id, &thread_serve);
             });
         }
+        self.ingest(dcid);
+    }
+
+    fn ingest(&mut self, dcid: &[u8]) {
+        let Some(shared) = self.routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
+            return;
+        };
         let arrivals = {
             let Ok(mut conn) = shared.lock() else {
                 return;
@@ -896,16 +918,16 @@ impl Router<'_> {
             while let Ok(n) = conn.dgram_recv(&mut wire) {
                 found.push(wire[..n].to_vec());
             }
-            flush(sock, &mut conn, out);
+            flush(&self.sock, &mut conn, &mut self.out);
             found
         };
         let now = Instant::now();
-        let Some(inbound) = routes.get_mut(dcid) else {
-            return;
-        };
         for wire in &arrivals {
             let Some(msg) = hysteria::decode_udp_message(wire) else {
                 continue;
+            };
+            let Some(inbound) = self.routes.get_mut(dcid) else {
+                return;
             };
             let entry = inbound.udp.entry(msg.session).or_insert_with(|| UdpEntry {
                 tx: None,
@@ -931,16 +953,15 @@ impl Router<'_> {
             let flow = UdpFlow {
                 session: Session {
                     shared: Arc::clone(&shared),
-                    sock: Arc::clone(sock),
-                    local: *local,
+                    sock: Arc::clone(&self.sock),
+                    local: self.local,
                 },
                 id: msg.session,
             };
-            serve_udp(UdpCtx {
-                id: msg.session,
-                addr: msg.addr.to_owned(),
-                rx,
-                flow,
+            let udp = Arc::clone(self.serve_udp);
+            let addr = msg.addr.to_owned();
+            std::thread::spawn(move || {
+                udp(UdpCtx { addr, rx, flow });
             });
         }
     }
@@ -1056,6 +1077,6 @@ mod tests {
         assert_eq!(addr_text(&target), "198.51.100.7:53");
         assert_eq!(parse_addr_text(""), None);
         assert_eq!(parse_addr_text("no-port"), None);
-        assert_eq!(parse_addr_text("1.2.3.4:not-a-port"), None);
+        assert_eq!(parse_addr_text("198.51.100.7:not-a-port"), None);
     }
 }
