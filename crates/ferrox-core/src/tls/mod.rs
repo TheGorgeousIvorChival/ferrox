@@ -1,3 +1,4 @@
+use crate::b64;
 use std::fmt;
 
 pub trait Stream: std::io::Read + std::io::Write {}
@@ -8,6 +9,10 @@ pub struct TlsConfig {
     pub server_name: String,
     pub alpn: Vec<Vec<u8>>,
     pub roots: Vec<Vec<u8>>,
+    /// Leaf keys to accept, checked after the chain has verified. Empty pins
+    /// nothing and refuses nothing, which is the default because a lane with no
+    /// pins is the ordinary case.
+    pub pins: crate::foxy::pin::Pins,
 }
 
 pub trait TlsProvider: std::io::Read + std::io::Write {
@@ -20,6 +25,13 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
     fn handshake(&mut self) -> Result<(), TlsError>;
 
     fn alpn(&self) -> Option<&[u8]>;
+
+    /// The leaf certificate the peer presented, once the handshake has
+    /// completed. A provider that cannot reach it answers `None` rather than
+    /// failing, because a lane with pins needs it and one without does not.
+    fn peer_leaf(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +94,9 @@ pub struct TlsServerConfig {
     pub cert_chain: Vec<Vec<u8>>,
     pub key_der: Vec<u8>,
     pub key_kind: ServerKeyKind,
+    /// The protocols to offer, in preference order. Empty means no ALPN, which
+    /// is what a server that only ever carries one protocol leaves it at.
+    pub alpn: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +121,7 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
     for (label, key_kind) in kinds {
         if let Some(key_der) = pem_blocks(key_pem, label).into_iter().next() {
             return Ok(TlsServerConfig {
+                alpn: Vec::new(),
                 cert_chain,
                 key_der,
                 key_kind,
@@ -129,65 +145,14 @@ fn pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
         let Some((body, tail)) = after.split_once(shut.as_str()) else {
             break;
         };
-        if let Ok(der) = base64_decode(body.as_bytes()) {
-            out.push(der);
-        }
+        let Some(der) = b64::decode(body.as_bytes()) else {
+            rest = tail;
+            continue;
+        };
+        out.push(der);
         rest = tail;
     }
     out
-}
-
-fn b64val(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-fn base64_decode(text: &[u8]) -> Result<Vec<u8>, TlsError> {
-    let bad = || TlsError::Other("base64 block is not standard base64".to_owned());
-    let clean: Vec<u8> = text
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    if clean.is_empty() || !clean.len().is_multiple_of(4) {
-        return Err(bad());
-    }
-    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for group in clean.as_chunks::<4>().0 {
-        let mut pad = 0usize;
-        let mut vals = [0u8; 4];
-        for (slot, &b) in vals.iter_mut().zip(group.iter()) {
-            if b == b'=' {
-                pad += 1;
-            } else {
-                if pad > 0 {
-                    return Err(bad());
-                }
-                *slot = b64val(b).ok_or_else(bad)?;
-            }
-        }
-        if pad > 2 {
-            return Err(bad());
-        }
-        let word = (u32::from(vals[0]) << 18)
-            | (u32::from(vals[1]) << 12)
-            | (u32::from(vals[2]) << 6)
-            | u32::from(vals[3]);
-        out.push((word >> 16) as u8);
-        if pad < 2 {
-            out.push((word >> 8) as u8);
-        }
-        if pad < 1 {
-            out.push(word as u8);
-        }
-    }
-    Ok(out)
 }
 
 mod rustls_backend;

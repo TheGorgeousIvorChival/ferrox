@@ -43,6 +43,7 @@ impl<S: Stream> RealityServer<S> {
         let (raw, hello) = read_client_hello(&mut replay)?;
         let auth_key = authenticate(cfg, &hello, now)?;
         let identity = super::TlsServerConfig {
+            alpn: Vec::new(),
             cert_chain: vec![bound_certificate(&auth_key, first_name(cfg))],
             key_der: ed25519_pkcs8(),
             key_kind: super::ServerKeyKind::Pkcs8,

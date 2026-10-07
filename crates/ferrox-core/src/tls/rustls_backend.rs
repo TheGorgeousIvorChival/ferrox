@@ -18,6 +18,63 @@ impl<S: Stream> std::fmt::Debug for RustlsProvider<S> {
     }
 }
 
+/// The stock chain verifier with a leaf-pin check bolted on the end, so pinning
+/// narrows what already verified rather than replacing it. `Debug` is derived
+/// because the crate denies its absence.
+#[derive(Debug)]
+struct Pinned {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    pins: crate::foxy::pin::Pins,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        if self.pins.holds(end_entity) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 impl<S: Stream> RustlsProvider<S> {
     fn config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError> {
         let mut roots = RootStore::empty();
@@ -26,16 +83,30 @@ impl<S: Stream> RustlsProvider<S> {
                 .add(rustls::pki_types::CertificateDer::from(der.as_slice()))
                 .map_err(|e| TlsError::BadCertificate.with_detail(format!("trust anchor: {e}")))?;
         }
+        let roots = Arc::new(roots);
 
-        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
-        .with_root_certificates(roots);
-
-        let mut config = builder.with_no_client_auth();
+        .with_root_certificates(roots.clone())
+        .with_no_client_auth();
         config.alpn_protocols.clone_from(&cfg.alpn);
+        if !cfg.pins.is_empty() {
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                roots,
+                Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
+            .map_err(|e| TlsError::BadCertificate.with_detail(format!("chain: {e}")))?;
+            config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(Pinned {
+                    inner: verifier,
+                    pins: cfg.pins.clone(),
+                }));
+        }
         Ok(Arc::new(config))
     }
 
@@ -79,6 +150,13 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
 
     fn alpn(&self) -> Option<&[u8]> {
         self.conn.alpn_protocol()
+    }
+
+    fn peer_leaf(&self) -> Option<&[u8]> {
+        self.conn
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .map(rustls::pki_types::CertificateDer::as_ref)
     }
 }
 
@@ -145,7 +223,7 @@ impl<S: Stream> RustlsServerProvider<S> {
                 rustls::pki_types::PrivatePkcs1KeyDer::from(cfg.key_der.clone()),
             ),
         };
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
@@ -153,6 +231,7 @@ impl<S: Stream> RustlsServerProvider<S> {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+        config.alpn_protocols.clone_from(&cfg.alpn);
         let conn = rustls::ServerConnection::new(Arc::new(config)).map_err(|e| map_error(&e))?;
         Ok(Self { conn, io })
     }
@@ -325,6 +404,7 @@ mod tests {
             server_name: name.to_owned(),
             alpn: alpn.iter().map(|p| p.to_vec()).collect(),
             roots: vec![ANCHOR.to_vec()],
+            pins: crate::foxy::pin::Pins::default(),
         }
     }
 

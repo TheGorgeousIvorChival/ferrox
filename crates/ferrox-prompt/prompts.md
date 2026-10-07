@@ -802,6 +802,45 @@ Two costs and one hang, in order of how much they cost a user. A pooled entry is
 P30 wants the pool proved under an adversarial packet layer. This slice is what that proof should be pointed at, because a share that cannot be released is not a share a test can schedule around.
 ```
 
+## P39 · Prove the Foxy QUIC lane over a socket, not over a codec
+
+**When to use:** When `foxy` with `carrier: h3` is selected and the only green checks are the header-block codec: the lane builds a QPACK CONNECT and reads a status, but nothing has carried a tunnel over a real QUIC connection.
+**Status:** doing
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test -p ferrox-app foxy`; `cargo run -p ferrox-prompt -- check`
+**Depends on:** P29
+**Touches:** crates/ferrox-app/src/foxy.rs
+**Random weight:** 1
+
+```text
+The lane's request half is already proven: `ferrox_core::foxy::hpack` reproduces the exact QPACK block the edge must read, byte for byte. What is not green is the response half — an in-process QUIC edge that answers one request stream has not yet got its `:status` back through `H3::read_head`, and a red test in this tree blocks every other slice.
+
+Take the loopback edge the way `quic.rs` takes its own: accept on a loopback UDP socket, drive the handshake, answer the request stream, echo what follows. Then the QUIC lane has the same three proofs the TCP carriers have — the block on the wire, a 2xx opening the tunnel, and the bytes after it — and the carrier stops being a claim.
+
+Do not widen this into a QUIC failover study. One connection, one stream, one status, one echo; anything the loopback exposes beyond that belongs to the next slice.
+```
+
+## P40 · Mint the Foxy pass: FxA login and the Guardian token
+
+**When to use:** When the Foxy lane is in tree but every pass is still pasted into the config: the dial is proven, the account that authorises it is not.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; `cargo run -p ferrox-prompt -- check`
+**Depends on:** P39
+**Touches:** +crates/ferrox-core/src/foxy/account.rs, crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+The lane takes a pass as input today and that is the whole gap. What a real client owes is the FxA login — the stretched password, the Hawk-signed requests, the the two-factor branch — and the Guardian call that turns an access token into a proxy pass with an expiry the renewal clock already knows how to read.
+
+The pinned references already say where every byte goes: `POST /account/login`, `POST /oauth/token` with `fxa-credentials` and then `refresh_token`, `GET /api/v1/fpn/token`, and the `406` challenge the edge answers with `/_fs-ch-` before it will serve an account. That challenge is a bot defence, not a protocol step: if the slice lands without it, the lane must refuse the `406` with the reason named rather than retrying blind, and the next slice can decide whether the defence is worth implementing.
+
+Nothing here may print a token, and the pinned upstream trees are for reading: learn the request shapes and write the smaller client.
+
+```
+
 ## Reading this file as a roadmap
 
 The graph is the point, and it is not a decoration: `ferrox-prompt next` ranks ready slices by leverage, breaks ties towards the smaller one, leaves out the ones waiting on a decision, and reports what each slice unblocks. `P21` waits on `P18`, which waits on `P17`, which waits on `P7` — the longest chain in the file, which is the kind of thing that is obvious once and invisible otherwise.

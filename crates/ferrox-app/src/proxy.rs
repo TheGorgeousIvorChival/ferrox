@@ -224,7 +224,25 @@ enum Outbound {
     Trojan(TrojanOut),
     Vmess(VmessOut),
     Shadowsocks(ShadowsocksOut),
+    Foxy(Box<FoxyOut>),
     Freedom,
+}
+
+/// The Foxy lane: an account's proxy pass over an edge in one pinned country,
+/// with the split-tunnel list that decides what does not go through it at all.
+#[derive(Debug, Clone)]
+struct FoxyOut {
+    country: String,
+    carrier: crate::foxy::Carrier,
+    candidates: Vec<ferrox_core::foxy::Candidate>,
+    stored: Option<ferrox_core::foxy::Candidate>,
+    roots: Vec<Vec<u8>>,
+    pins: ferrox_core::foxy::pin::Pins,
+    pass: ferrox_core::foxy::Pass,
+    edge_address: Option<SocketAddr>,
+    direct_ports: Vec<u16>,
+    direct_suffixes: Vec<String>,
+    exit_probe: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2786,18 +2804,24 @@ fn serve_trojan_httpheader(stream: TcpStream, key: &[u8; 56], path: &str, freedo
 }
 
 fn serve_socks(mut client: TcpStream, out: &Outbound) {
-    let Some((cmd, target)) = socks_handshake(&mut client) else {
+    let Some((cmd, asked)) = socks_target(&mut client) else {
         return;
     };
     if cmd == 3 {
         return serve_socks_udp(client, out);
     }
+    if let Outbound::Foxy(foxy) = out {
+        return serve_foxy(client, foxy, &asked);
+    }
+    let Some(target) = asked.socket() else {
+        return;
+    };
     let (address, port) = match out {
         Outbound::Vless(vless) => (vless.address.clone(), vless.port),
         Outbound::Vmess(vmess) => (vmess.address.clone(), vmess.port),
         Outbound::Trojan(trojan) => (trojan.address.clone(), trojan.port),
         Outbound::Shadowsocks(shadowsocks) => (shadowsocks.address.clone(), shadowsocks.port),
-        Outbound::Freedom => {
+        Outbound::Foxy(_) | Outbound::Freedom => {
             let Some(upstream) = dial_or_report(&target) else {
                 return;
             };
@@ -2872,7 +2896,124 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
         Outbound::Shadowsocks(shadowsocks) => {
             dial_shadowsocks(&client, uplink, shadowsocks, &target);
         }
-        Outbound::Freedom => {}
+        Outbound::Foxy(_) | Outbound::Freedom => {}
+    }
+}
+
+/// The split-tunnel list: the targets this lane does not carry. They leave by the
+/// plain dial, which is the whole meaning of a split tunnel here.
+fn foxy_splits(foxy: &FoxyOut, asked: &SocksTarget) -> bool {
+    foxy.direct_ports.contains(&asked.port())
+        || foxy
+            .direct_suffixes
+            .iter()
+            .any(|suffix| asked.host().to_ascii_lowercase().ends_with(suffix))
+}
+
+fn foxy_socks_reply(reply: u8) -> [u8; 10] {
+    [5, reply, 0, 1, 0, 0, 0, 0, 0, 0]
+}
+
+/// Opens the tunnel on the first edge that answers, and relays. Every edge of
+/// the pinned country is a candidate, so a refusal moves to the next one rather
+/// than to another country.
+fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
+    if foxy_splits(foxy, asked) {
+        let Some(target) = asked.socket() else { return };
+        let Some(upstream) = dial_or_report(&target) else {
+            return;
+        };
+        return relay(&client, &upstream);
+    }
+    let target = asked.authority();
+    let order =
+        ferrox_core::foxy::dial_order(&foxy.candidates, &foxy.country, foxy.stored.as_ref(), 3);
+    let mut refusals = ferrox_core::foxy::Refusals::new(256);
+    let key = target.clone();
+    if refusals.blocked(&key, 0) {
+        return;
+    }
+    let mut last = None;
+    for edge in order {
+        let dial = crate::foxy::FoxyDial {
+            host: edge.host.clone(),
+            port: edge.port,
+            address: foxy.edge_address,
+            carrier: foxy.carrier,
+            roots: foxy.roots.clone(),
+            pins: foxy.pins.clone(),
+            pass: foxy.pass.clone(),
+        };
+        let quic = match foxy.carrier {
+            crate::foxy::Carrier::H3 => crate::quic::pooled_stream(&foxy_quic_dial(foxy, &edge)),
+            _ => None,
+        };
+        let stream = quic.as_ref().map(|(_, _, _, id)| *id);
+        match crate::foxy::Tunnel::open(&dial, &target, quic) {
+            Ok(mut tunnel) => {
+                if client.write_all(&foxy_socks_reply(0)).is_err() {
+                    return;
+                }
+                if !foxy_exit_agrees(&mut tunnel, foxy) {
+                    return;
+                }
+                let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+                relay_tunnel(&client, &tunnel);
+                if let (Some(id), crate::foxy::Carrier::H3) = (stream, foxy.carrier) {
+                    crate::quic::release_stream(&foxy_quic_dial(foxy, &edge), id);
+                }
+                return;
+            }
+            Err(failure) => {
+                if let ferrox_core::foxy::Failure::Rejected(status) = failure {
+                    if ferrox_core::foxy::pass_is_rejected(status) {
+                        break;
+                    }
+                    if ferrox_core::foxy::target_is_unreachable(status) {
+                        refusals.remember(&key, now_secs() + 30);
+                    }
+                }
+                last = Some(failure);
+            }
+        }
+    }
+    let reply = last.map_or(0x01, crate::foxy::refusal_reply);
+    let _ = client.write_all(&foxy_socks_reply(reply));
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Asks the tunnel where it exits, through the tunnel, and refuses the flow when
+/// the answer is not the pinned country. A probe that cannot be answered is not
+/// evidence, and the lane is left serving.
+fn foxy_exit_agrees<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> bool {
+    let Some(probe) = foxy.exit_probe.as_deref() else {
+        return true;
+    };
+    let Some((host, path)) = probe.split_once('/') else {
+        return true;
+    };
+    let request = format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if tunnel.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    while !head.windows(2).any(|pair| pair == b"\n\n") && head.len() < 4096 {
+        match tunnel.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
+        }
+    }
+    match crate::foxy::exit_country(&head) {
+        Some(seen) => {
+            foxy.country.eq_ignore_ascii_case("REC") || seen == foxy.country.to_ascii_uppercase()
+        }
+        None => true,
     }
 }
 
@@ -3250,6 +3391,72 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
     if let Some(old) = uplink.take() {
         let _ = old.write.shutdown(Shutdown::Both);
         join(&old.done);
+    }
+}
+
+/// The relay a CONNECT lane uses: the same two directions, against a tunnel
+/// that is one stateful session rather than a socket, so both directions take
+/// the same lock and each holds it for one bounded copy.
+/// The QUIC dial a lane hands the pool: the edge's own name, not the address it
+/// was resolved to, so every flow of one country shares one connection.
+fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate::quic::QuicDial {
+    crate::quic::QuicDial {
+        id: [0; 16],
+        host: edge.host.clone(),
+        address: edge.host.clone(),
+        port: edge.port,
+        roots: Some(foxy.roots.clone()),
+    }
+}
+
+fn relay_tunnel(
+    client: &TcpStream,
+    tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
+) {
+    let Ok(mut client_read) = client.try_clone() else {
+        return;
+    };
+    let Ok(mut client_write) = client.try_clone() else {
+        return;
+    };
+    let forward_tunnel = std::sync::Arc::clone(tunnel);
+    let backward_tunnel = std::sync::Arc::clone(tunnel);
+    let forward = move || copy_locked(&mut client_read, &forward_tunnel, true);
+    let done = RelayPool::global().run(forward);
+    copy_locked(&mut client_write, &backward_tunnel, false);
+    let _ = client_write.shutdown(Shutdown::Write);
+    join(&done);
+}
+
+fn copy_locked(
+    socket: &mut TcpStream,
+    tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
+    forward: bool,
+) {
+    const CHUNK: usize = 16 * 1024;
+    let mut buf = [0u8; CHUNK];
+    loop {
+        let moved = if forward {
+            match socket.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => match tunnel.lock() {
+                    Ok(mut lane) => lane.write(&buf[..read]).unwrap_or(0),
+                    Err(_) => 0,
+                },
+            }
+        } else {
+            let Ok(mut lane) = tunnel.lock() else { break };
+            match lane.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => match socket.write_all(&buf[..read]) {
+                    Ok(()) => read,
+                    Err(_) => break,
+                },
+            }
+        };
+        if moved == 0 {
+            break;
+        }
     }
 }
 
@@ -4177,7 +4384,9 @@ fn trojan_key(password: &str) -> [u8; 56] {
     out
 }
 
-fn socks_handshake(client: &mut TcpStream) -> Option<(u8, SocketAddr)> {
+/// The same handshake, keeping the name the client sent. A CONNECT lane needs
+/// it: resolving here would hand the edge an address it cannot route.
+fn socks_target(client: &mut TcpStream) -> Option<(u8, SocksTarget)> {
     let mut head = [0u8; 2];
     read_exact(client, &mut head).ok()?;
     if head[0] != 5 {
@@ -4193,11 +4402,71 @@ fn socks_handshake(client: &mut TcpStream) -> Option<(u8, SocketAddr)> {
     if req[0] != 5 || (req[1] != 1 && req[1] != 3) {
         return None;
     }
-    let target = read_socks_addr_rest(client, req[3])?;
-    if req[1] == 1 && client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
+    let target = read_socks_named(client, req[3])?;
+    if req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
         return None;
     }
     Some((req[1], target))
+}
+
+fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<SocksTarget> {
+    match atyp {
+        3 => {
+            let mut len = [0u8; 1];
+            read_exact(stream, &mut len).ok()?;
+            let mut name = vec![0u8; usize::from(len[0])];
+            read_exact(stream, &mut name).ok()?;
+            let mut port = [0u8; 2];
+            read_exact(stream, &mut port).ok()?;
+            Some(SocksTarget::Name(
+                String::from_utf8(name).ok()?,
+                u16::from_be_bytes(port),
+            ))
+        }
+        _ => Some(SocksTarget::Address(read_socks_addr_rest(stream, atyp)?)),
+    }
+}
+
+/// What a SOCKS5 client asked for: a name the edge resolves itself, or an
+/// address. A CONNECT tunnel sends the name through untouched, so the address a
+/// plain dial would have resolved never exists for this front.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SocksTarget {
+    Name(String, u16),
+    Address(SocketAddr),
+}
+
+impl SocksTarget {
+    fn authority(&self) -> String {
+        match self {
+            Self::Name(host, port) => ferrox_core::foxy::authority(host, *port),
+            Self::Address(address) => address.to_string(),
+        }
+    }
+
+    fn socket(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Address(address) => Some(*address),
+            Self::Name(host, port) => format!("{host}:{port}")
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addrs| addrs.next()),
+        }
+    }
+
+    fn host(&self) -> String {
+        match self {
+            Self::Name(host, _) => host.clone(),
+            Self::Address(address) => address.ip().to_string(),
+        }
+    }
+
+    fn port(&self) -> u16 {
+        match self {
+            Self::Name(_, port) => *port,
+            Self::Address(address) => address.port(),
+        }
+    }
 }
 
 fn read_socks_addr(stream: &mut dyn Read) -> Option<SocketAddr> {
@@ -4296,6 +4565,9 @@ fn inbound_password(inbound: &Json) -> String {
 }
 
 fn find_outbound(root: &Json) -> Option<Outbound> {
+    if let Some(foxy) = find_foxy_outbound(root) {
+        return Some(Outbound::Foxy(Box::new(foxy)));
+    }
     if let Some(vless) = find_vless_outbound(root) {
         return Some(Outbound::Vless(vless));
     }
@@ -4312,6 +4584,134 @@ fn find_outbound(root: &Json) -> Option<Outbound> {
 
 fn is_freedom(root: &Json) -> bool {
     has_protocol(root, "outbounds", "freedom")
+}
+
+fn foxy_carrier(settings: Option<&Json>) -> crate::foxy::Carrier {
+    match settings
+        .and_then(|s| s.get("carrier"))
+        .and_then(Json::as_str)
+    {
+        Some("h1" | "http/1.1") => crate::foxy::Carrier::H1,
+        Some("h3" | "quic") => crate::foxy::Carrier::H3,
+        _ => crate::foxy::Carrier::H2,
+    }
+}
+
+fn foxy_strings(value: Option<&Json>) -> Vec<String> {
+    value
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Json::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn foxy_ports(value: Option<&Json>) -> Vec<u16> {
+    value
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Json::as_port)
+        .collect()
+}
+
+fn foxy_edge(outbound: &Json, country: &str, city: &str) -> Option<ferrox_core::foxy::Candidate> {
+    let edges = outbound
+        .get("settings")
+        .and_then(|s| s.get("servers"))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[]);
+    let first = edges.iter().find(|edge| {
+        let in_country = edge
+            .get("country")
+            .and_then(Json::as_str)
+            .is_none_or(|code| code.eq_ignore_ascii_case(country));
+        let in_city = edge
+            .get("city")
+            .and_then(Json::as_str)
+            .is_none_or(|name| name == city);
+        in_country && in_city
+    })?;
+    let host = first.get("host").and_then(Json::as_str)?.to_owned();
+    let port = first.get("port").and_then(Json::as_port)?;
+    Some(ferrox_core::foxy::Candidate {
+        host,
+        port,
+        country: country.to_owned(),
+        city: city.to_owned(),
+    })
+}
+
+fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("foxy") {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        let pass = settings
+            .and_then(|s| s.get("pass"))
+            .and_then(Json::as_str)?
+            .to_owned();
+        if pass.is_empty() {
+            continue;
+        }
+        let country = settings
+            .and_then(|s| s.get("country"))
+            .and_then(Json::as_str)
+            .unwrap_or("US")
+            .to_owned();
+        let city = settings
+            .and_then(|s| s.get("city"))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let roots = settings
+            .and_then(|s| s.get("caCertFile"))
+            .and_then(Json::as_str)
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|pem| crate::quic::parse_ca_pem(&pem))
+            .unwrap_or_default();
+        let pins = ferrox_core::foxy::pin::Pins::parse(foxy_strings(
+            settings.and_then(|s| s.get("spkiPins")),
+        ));
+        let edge_address = settings
+            .and_then(|s| s.get("edgeAddress"))
+            .and_then(Json::as_str)
+            .and_then(|host| {
+                format!("{host}:443")
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut addrs| addrs.next())
+            });
+        return Some(FoxyOut {
+            candidates: foxy_edge(outbound, &country, &city).into_iter().collect(),
+            stored: None,
+            country,
+            carrier: foxy_carrier(settings),
+            roots,
+            pins,
+            pass: ferrox_core::foxy::Pass {
+                token: pass,
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+            edge_address,
+            direct_ports: foxy_ports(settings.and_then(|s| s.get("directPorts"))),
+            direct_suffixes: foxy_strings(settings.and_then(|s| s.get("directDomains"))),
+            exit_probe: settings
+                .and_then(|s| s.get("exitProbe"))
+                .and_then(Json::as_str)
+                .map(str::to_owned),
+        });
+    }
+    None
 }
 
 fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
@@ -5540,6 +5940,7 @@ mod tests {
         ferrox_core::tls::TlsConfig,
     ) {
         let server = std::sync::Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: Vec::new(),
             cert_chain: vec![CARRIER_CERT.to_vec()],
             key_der: CARRIER_KEY.to_vec(),
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
@@ -5548,6 +5949,7 @@ mod tests {
             server_name: "carrier.test".to_owned(),
             alpn: Vec::new(),
             roots: vec![CARRIER_CERT.to_vec()],
+            pins: ferrox_core::foxy::pin::Pins::default(),
         };
         (server, client)
     }
