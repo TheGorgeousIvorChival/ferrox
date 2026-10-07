@@ -513,6 +513,9 @@ fn planned_reason(link: &VlessLink) -> &'static str {
             "vless-httpupgrade: carrier dials; the security above is what is missing"
         }
         TransportKind::Kcp => "vless-kcp: carrier dials; the security above is what is missing",
+        TransportKind::Http => {
+            "http/h2/h3: removed by Xray-core in favour of xhttp; parses, no transport"
+        }
         TransportKind::Hysteria => {
             "vless-hysteria: parses, dial needs its own QUIC stack and congestion glue"
         }
