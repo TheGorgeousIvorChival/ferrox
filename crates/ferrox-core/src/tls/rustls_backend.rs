@@ -319,10 +319,15 @@ fn recover(e: std::io::Error) -> TlsError {
 fn map_error(e: &rustls::Error) -> TlsError {
     use rustls::Error as E;
     match e {
-        E::InvalidCertificate(_)
-        | E::InvalidCertRevocationList(_)
-        | E::NoCertificatesPresented
-        | E::UnsupportedNameType => TlsError::BadCertificate,
+        // An untrusted chain, a name that does not match and an expired
+        // certificate are three different problems and the caller can act on
+        // each; one variant with no detail is none of them.
+        E::InvalidCertificate(why) => TlsError::BadCertificate.with_detail(format!("{why:?}")),
+        E::InvalidCertRevocationList(why) => {
+            TlsError::BadCertificate.with_detail(format!("{why:?}"))
+        }
+        E::NoCertificatesPresented => TlsError::BadCertificate.with_detail("no certificate"),
+        E::UnsupportedNameType => TlsError::BadCertificate.with_detail("unsupported name type"),
 
         E::NoApplicationProtocol
         | E::AlertReceived(rustls::AlertDescription::NoApplicationProtocol)
@@ -472,7 +477,11 @@ mod tests {
             let mut client = crate::tls::connect(&client("wrong.test", &[b"test-only"]), stream)
                 .expect("configures");
             let err = client.handshake().expect_err("wrong name must fail");
-            assert!(matches!(err, TlsError::BadCertificate));
+            // The detail names which of the certificate problems this is.
+        assert!(
+            err.to_string().contains("bad certificate"),
+            "{err}"
+        );
         });
     }
 

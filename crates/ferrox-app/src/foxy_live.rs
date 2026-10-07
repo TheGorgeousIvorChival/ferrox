@@ -141,6 +141,7 @@ fn the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers() {
     );
     assert!(!password.is_empty(), "FOXY_PASS is its password");
 
+    println!("trust anchors read: {}", crate::quic::system_roots().len());
     let Some(account) = account() else {
         panic!("the account plane URLs are not the ones this tree knows");
     };
