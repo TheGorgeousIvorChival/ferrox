@@ -2319,18 +2319,20 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
         }
     };
     if let Outbound::Vless(vless) = out {
-        if matches!(vless.carrier, Carrier::Quic) && !vless.mux {
-            crate::quic::dial_pooled(
-                &client,
-                &crate::quic::QuicDial {
-                    id: vless.id,
-                    host: vless.host.clone(),
-                    address: vless.address.clone(),
-                    port: vless.port,
-                    roots: vless.quic_roots.clone(),
-                },
-                &target,
-            );
+        if matches!(vless.carrier, Carrier::Quic) {
+            if !vless.mux {
+                crate::quic::dial_pooled(
+                    &client,
+                    &crate::quic::QuicDial {
+                        id: vless.id,
+                        host: vless.host.clone(),
+                        address: vless.address.clone(),
+                        port: vless.port,
+                        roots: vless.quic_roots.clone(),
+                    },
+                    &target,
+                );
+            }
             return;
         }
     }
@@ -7350,6 +7352,51 @@ mod tests {
         assert_eq!(&back, b"ping");
         drop(client);
         server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_quic_carrier_with_mux_never_dials_the_server_tcp_port() {
+        let _serial = quic_serial();
+        let id = uuid_bytes("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").expect("id");
+        let server_tcp = TcpListener::bind("127.0.0.1:0").expect("binds");
+        server_tcp.set_nonblocking(true).expect("nonblocking");
+        let server_port = server_tcp.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_port,
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            mux: true,
+            quic_roots: None,
+        });
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let (handed_back, done) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+            let _ = handed_back.send(());
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&9u16.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        done.recv_timeout(QUIC_TEST_TIMEOUT)
+            .expect("the proxy gave up on the carrier");
+        assert_eq!(
+            server_tcp
+                .accept()
+                .expect_err("nothing dials the tcp port")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
