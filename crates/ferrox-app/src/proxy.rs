@@ -8458,7 +8458,10 @@ mod tests {
             }
             assert_eq!(seen, expected_header);
             assert_eq!(conn.application_proto(), crate::quic::ALPN);
-            conn.stream_send(0, &[0, 0], false).expect("accepts");
+            assert!(
+                crate::quic::stream_send_all(&mut conn, &sock, 0, &[0, 0], false, stream_deadline),
+                "the accept goes out"
+            );
             while let Ok((written, info)) = conn.send(&mut out) {
                 sock.send_to(&out[..written], info.to).expect("answers");
             }
@@ -8479,7 +8482,17 @@ mod tests {
                 let mut piece = [0u8; 8192];
                 while let Ok((n, fin)) = conn.stream_recv(0, &mut piece) {
                     if n > 0 {
-                        conn.stream_send(0, &piece[..n], false).expect("echoes");
+                        assert!(
+                            crate::quic::stream_send_all(
+                                &mut conn,
+                                &sock,
+                                0,
+                                &piece[..n],
+                                false,
+                                echo_deadline
+                            ),
+                            "the echo goes out"
+                        );
                     }
                     if fin {
                         let _ = conn.close(false, 0, b"done");
@@ -8492,45 +8505,247 @@ mod tests {
         })
     }
 
-    fn quic_ferry(
-        a: &mut quiche::Connection,
-        a_addr: SocketAddr,
-        b: &mut quiche::Connection,
-        b_addr: SocketAddr,
-    ) {
-        let mut buf = [0u8; 1350];
-        for _ in 0..1000 {
-            let mut moved_any = false;
-            while let Ok((n, _)) = a.send(&mut buf) {
-                moved_any = true;
-                let info = quiche::RecvInfo {
-                    from: a_addr,
-                    to: b_addr,
-                };
-                b.recv(&mut buf[..n], info).expect("ferries");
-            }
-            while let Ok((n, _)) = b.send(&mut buf) {
-                moved_any = true;
-                let info = quiche::RecvInfo {
-                    from: b_addr,
-                    to: a_addr,
-                };
-                a.recv(&mut buf[..n], info).expect("ferries");
-            }
-            if !moved_any {
-                return;
-            }
-        }
-        panic!("quic ferry made no progress");
+    /// How often the ferry misbehaves, counted over the packets it carries.
+    /// Zero disables a fault, so the faithful case is the same code path.
+    #[derive(Clone, Copy, PartialEq)]
+    struct FerryFaults {
+        drop_every: usize,
+        duplicate_every: usize,
+        hold_every: usize,
     }
 
-    fn quic_pipe_endpoints() -> (
-        quiche::Connection,
-        quiche::Connection,
-        SocketAddr,
-        SocketAddr,
-        Vec<u8>,
-    ) {
+    const FAITHFUL: FerryFaults = FerryFaults {
+        drop_every: 0,
+        duplicate_every: 0,
+        hold_every: 0,
+    };
+
+    /// The loss a loopback socket cannot be asked for on demand: one packet in
+    /// four dropped, one in seven doubled, one in five held back a round.
+    const LOSSY: FerryFaults = FerryFaults {
+        drop_every: 4,
+        duplicate_every: 7,
+        hold_every: 5,
+    };
+
+    /// The two ends and the addresses they name each other by, so a ferry and
+    /// its tests pass one value around instead of four.
+    struct Pipe {
+        client: quiche::Connection,
+        server: quiche::Connection,
+        client_addr: SocketAddr,
+        server_addr: SocketAddr,
+        header: Vec<u8>,
+    }
+
+    /// Carries packets between the two ends in process. The socket test proves
+    /// the real sockets, this proves the protocol, and neither is asked to
+    /// prove the other's half.
+    struct Ferry {
+        faults: FerryFaults,
+        carried: usize,
+        dropped: usize,
+        duplicated: usize,
+        reordered: usize,
+    }
+
+    impl Ferry {
+        fn new(faults: FerryFaults) -> Self {
+            Self {
+                faults,
+                carried: 0,
+                dropped: 0,
+                duplicated: 0,
+                reordered: 0,
+            }
+        }
+
+        fn deliver(&mut self, pipe: &mut Pipe, bytes: &[u8], to_server: bool) {
+            let Pipe {
+                client,
+                server,
+                client_addr,
+                server_addr,
+                ..
+            } = pipe;
+            let info = quiche::RecvInfo {
+                from: if to_server {
+                    *client_addr
+                } else {
+                    *server_addr
+                },
+                to: if to_server {
+                    *server_addr
+                } else {
+                    *client_addr
+                },
+            };
+            let mut buf = bytes.to_vec();
+            let outcome = if to_server {
+                server.recv(&mut buf, info)
+            } else {
+                client.recv(&mut buf, info)
+            };
+            // A faithful ferry must never fail to hand a packet over; an
+            // adversarial one may, because a dropped or reordered packet is
+            // exactly what the protocol has to survive.
+            if outcome.is_err() && self.faults == FAITHFUL {
+                panic!("quic ferry could not deliver {} bytes", buf.len());
+            }
+        }
+
+        /// One packet through the faults. A held packet waits in `held` and
+        /// `run` delivers it after the rest of the round, so it arrives late.
+        fn pass(
+            &mut self,
+            pipe: &mut Pipe,
+            bytes: Vec<u8>,
+            to_server: bool,
+            held: &mut Vec<(Vec<u8>, bool)>,
+        ) {
+            self.carried += 1;
+            let seen = self.carried;
+            let hits = |every: usize| every > 0 && seen % every == 0;
+            if hits(self.faults.drop_every) {
+                self.dropped += 1;
+                return;
+            }
+            if hits(self.faults.hold_every) {
+                held.push((bytes, to_server));
+                return;
+            }
+            let twice = hits(self.faults.duplicate_every);
+            self.deliver(pipe, &bytes, to_server);
+            if twice {
+                self.duplicated += 1;
+                self.deliver(pipe, &bytes, to_server);
+            }
+        }
+
+        /// Carry everything both ends want to send, then release what was held,
+        /// then offer the timers. The timers matter under loss: a round that
+        /// carried only acknowledgements is still the round whose dropped
+        /// packet may be due for retransmission.
+        fn run(&mut self, pipe: &mut Pipe) {
+            let mut buf = [0u8; 1350];
+            let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
+            {
+                let Pipe { client, server, .. } = pipe;
+                for to_server in [true, false] {
+                    loop {
+                        let sent = if to_server {
+                            client.send(&mut buf)
+                        } else {
+                            server.send(&mut buf)
+                        };
+                        let Ok((n, _)) = sent else { break };
+                        out.push((buf[..n].to_vec(), to_server));
+                    }
+                }
+            }
+            let mut held: Vec<(Vec<u8>, bool)> = Vec::new();
+            for (bytes, to_server) in out {
+                self.pass(pipe, bytes, to_server, &mut held);
+            }
+            let late = std::mem::take(&mut held);
+            self.reordered += late.len();
+            for (bytes, to_server) in late {
+                self.deliver(pipe, &bytes, to_server);
+            }
+            let Pipe { client, server, .. } = pipe;
+            client.on_timeout();
+            server.on_timeout();
+        }
+
+        /// One tunnel over one stream: the vless header out, `[0, 0]` back, the
+        /// payload echoed. Every packet between here passes the faults.
+        fn tunnel(&mut self, pipe: &mut Pipe, stream: u64, payload: &[u8]) {
+            let want = pipe.header.len();
+            let header = pipe.header.clone();
+            pipe.client
+                .stream_send(stream, &header, false)
+                .expect("opens");
+            let mut piece = [0u8; 8192];
+            let mut seen = Vec::new();
+            for _ in 0..10_000 {
+                self.run(pipe);
+                {
+                    let Pipe { server, .. } = pipe;
+                    while let Ok((n, _)) = server.stream_recv(stream, &mut piece) {
+                        if n == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(&piece[..n]);
+                    }
+                }
+                if seen.len() >= want {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(seen, pipe.header, "the header survives the ferry");
+            let mut back = Vec::new();
+            let mut offered = false;
+            for _ in 0..10_000 {
+                self.run(pipe);
+                if !offered {
+                    let Pipe { server, .. } = pipe;
+                    offered = server.stream_send(stream, &[0, 0], false).is_ok();
+                }
+                {
+                    let Pipe { client, .. } = pipe;
+                    while let Ok((n, _)) = client.stream_recv(stream, &mut piece) {
+                        if n == 0 {
+                            break;
+                        }
+                        back.extend_from_slice(&piece[..n]);
+                    }
+                }
+                if back.len() >= 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(back, [0, 0], "the accept survives the ferry");
+            let mut echo = Vec::new();
+            let mut pending: Vec<u8> = Vec::new();
+            let mut held_back = 0usize;
+            for _ in 0..10_000 {
+                self.run(pipe);
+                {
+                    let Pipe { server, .. } = pipe;
+                    while let Ok((n, _)) = server.stream_recv(stream, &mut piece) {
+                        if n == 0 {
+                            break;
+                        }
+                        pending.extend_from_slice(&piece[..n]);
+                    }
+                    while held_back < pending.len() {
+                        match server.stream_send(stream, &pending[held_back..], false) {
+                            Ok(written) if written > 0 => held_back += written,
+                            _ => break,
+                        }
+                    }
+                }
+                {
+                    let Pipe { client, .. } = pipe;
+                    while let Ok((n, _)) = client.stream_recv(stream, &mut piece) {
+                        if n == 0 {
+                            break;
+                        }
+                        echo.extend_from_slice(&piece[..n]);
+                    }
+                }
+                if echo.len() >= payload.len() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(echo, payload, "the echo survives the ferry");
+        }
+    }
+
+    fn quic_pipe_endpoints() -> Pipe {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let minted =
@@ -8593,116 +8808,59 @@ mod tests {
             to: server_addr,
         };
         server.recv(&mut first[..n], info).expect("ingests");
+        let mut pipe = Pipe {
+            client,
+            server,
+            client_addr,
+            server_addr,
+            header: vless_header(&id, 1, &target),
+        };
+        let mut ferry = Ferry::new(FAITHFUL);
         for _ in 0..1000 {
-            quic_ferry(&mut client, client_addr, &mut server, server_addr);
-            if client.is_established() && server.is_established() {
+            ferry.run(&mut pipe);
+            if pipe.client.is_established() && pipe.server.is_established() {
                 break;
             }
         }
-        assert!(client.is_established() && server.is_established());
-        let header = vless_header(&id, 1, &target);
-        (client, server, client_addr, server_addr, header)
-    }
-
-    fn quic_pipe_exchange(
-        client: &mut quiche::Connection,
-        client_addr: SocketAddr,
-        server: &mut quiche::Connection,
-        server_addr: SocketAddr,
-        stream: u64,
-        header: &[u8],
-        payload: &[u8],
-    ) {
-        client.stream_send(stream, header, false).expect("opens");
-        let mut seen = Vec::new();
-        let mut piece = [0u8; 8192];
-        for _ in 0..1000 {
-            quic_ferry(client, client_addr, server, server_addr);
-            while let Ok((n, _)) = server.stream_recv(stream, &mut piece) {
-                if n == 0 {
-                    break;
-                }
-                seen.extend_from_slice(&piece[..n]);
-            }
-            if seen.len() >= header.len() {
-                break;
-            }
-        }
-        assert_eq!(seen, header);
-        server.stream_send(stream, &[0, 0], false).expect("accepts");
-        let mut back = Vec::new();
-        for _ in 0..1000 {
-            quic_ferry(client, client_addr, server, server_addr);
-            while let Ok((n, _)) = client.stream_recv(stream, &mut piece) {
-                if n == 0 {
-                    break;
-                }
-                back.extend_from_slice(&piece[..n]);
-            }
-            if back.len() >= 2 {
-                break;
-            }
-        }
-        assert_eq!(back, [0, 0]);
-        client.stream_send(stream, payload, false).expect("writes");
-        let mut echo = Vec::new();
-        for _ in 0..1000 {
-            quic_ferry(client, client_addr, server, server_addr);
-            while let Ok((n, _)) = server.stream_recv(stream, &mut piece) {
-                if n == 0 {
-                    break;
-                }
-                server
-                    .stream_send(stream, &piece[..n], false)
-                    .expect("echoes");
-            }
-            while let Ok((n, _)) = client.stream_recv(stream, &mut piece) {
-                if n == 0 {
-                    break;
-                }
-                echo.extend_from_slice(&piece[..n]);
-            }
-            if echo.len() >= payload.len() {
-                break;
-            }
-        }
-        assert_eq!(echo, payload);
+        assert!(pipe.client.is_established() && pipe.server.is_established());
+        pipe
     }
 
     #[test]
     fn quic_pipe_carries_vless_header_and_close() {
-        let (mut client, mut server, client_addr, server_addr, header) = quic_pipe_endpoints();
-        quic_pipe_exchange(
-            &mut client,
-            client_addr,
-            &mut server,
-            server_addr,
-            0,
-            &header,
-            b"ping",
-        );
-        quic_pipe_exchange(
-            &mut client,
-            client_addr,
-            &mut server,
-            server_addr,
-            4,
-            &header,
-            b"pong",
-        );
-        client.stream_send(0, &[], true).expect("ends");
-        let _ = client.close(false, 0, b"done");
+        let mut pipe = quic_pipe_endpoints();
+        let mut ferry = Ferry::new(FAITHFUL);
+        ferry.tunnel(&mut pipe, 0, b"ping");
+        ferry.tunnel(&mut pipe, 4, b"pong");
+        pipe.client.stream_send(0, &[], true).expect("ends");
+        let _ = pipe.client.close(false, 0, b"done");
         for _ in 0..10_000 {
-            quic_ferry(&mut client, client_addr, &mut server, server_addr);
-            client.on_timeout();
-            server.on_timeout();
-            if client.is_closed() && server.is_closed() {
-                assert!(!client.is_timed_out() && !server.is_timed_out());
+            ferry.run(&mut pipe);
+            if pipe.client.is_closed() && pipe.server.is_closed() {
+                assert!(!pipe.client.is_timed_out() && !pipe.server.is_timed_out());
                 return;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("quic pipe never closed");
+    }
+
+    /// The gate P30 asks for: two tunnels sharing one handshake must both
+    /// complete while the ferry drops, doubles and holds packets underneath
+    /// them, and the counters prove the faults actually fired rather than the
+    /// run quietly avoiding them.
+    #[test]
+    fn quic_pipe_shares_a_handshake_through_a_lossy_ferry() {
+        let mut pipe = quic_pipe_endpoints();
+        let mut ferry = Ferry::new(LOSSY);
+        ferry.tunnel(&mut pipe, 0, b"ping");
+        ferry.tunnel(&mut pipe, 4, b"pong");
+        assert!(
+            ferry.dropped > 0,
+            "the ferry dropped nothing, so it proved nothing"
+        );
+        assert!(ferry.duplicated > 0, "the ferry doubled nothing");
+        assert!(ferry.reordered > 0, "the ferry held nothing back");
     }
 
     #[allow(clippy::too_many_lines)] // Temporary: timestamp stages for the Linux diagnosis.
@@ -8811,7 +8969,17 @@ mod tests {
                             assert_eq!(head, &expected_header, "stream opens with VLESS");
                             opening.remove(&id);
                             streams.push(id);
-                            conn.stream_send(id, &[0, 0], false).expect("accepts");
+                            assert!(
+                                crate::quic::stream_send_all(
+                                    &mut conn,
+                                    &sock,
+                                    id,
+                                    &[0, 0],
+                                    false,
+                                    echo_deadline
+                                ),
+                                "the accept goes out"
+                            );
                             crate::quic::qstage(format!(
                                 "{} t={} srv-accept {id}",
                                 local.port(),
@@ -8825,7 +8993,17 @@ mod tests {
                             break;
                         }
                         if n > 0 {
-                            conn.stream_send(id, &piece[..n], false).expect("echoes");
+                            assert!(
+                                crate::quic::stream_send_all(
+                                    &mut conn,
+                                    &sock,
+                                    id,
+                                    &piece[..n],
+                                    false,
+                                    echo_deadline
+                                ),
+                                "the echo goes out"
+                            );
                             crate::quic::qstage(format!(
                                 "{} t={} srv-echo {id} {n}",
                                 local.port(),
