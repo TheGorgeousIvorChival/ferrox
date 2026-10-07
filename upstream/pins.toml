@@ -1,6 +1,6 @@
 [sources.xray-core]
 repo          = "https://github.com/XTLS/Xray-core"
-rev           = "b26a91de4f3294e26a0ad0a970b81a386a41f789"
+rev           = "7da5dae6502b787fc6d903863e9a6c5043d107a2"
 default_branch = "main"
 path          = "common/crypto"
 test_enabled  = false
@@ -10,7 +10,7 @@ note          = "Xray-core at this pin. Disabled: in-process Go suite with no se
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
-rev           = "c992297988288565a24a6d36e2cf4d77cb835fcd"
+rev           = "fe92ab3e78a9bb7d448c155ef6906218e2ca5453"
 default_branch = "testing"
 path          = "protocol/shadowsocks"
 test_enabled  = false
@@ -28,7 +28,7 @@ note          = "hand-rolled ChaCha20 in the WireGuard data path"
 
 [sources.amnezia-client]
 repo          = "https://github.com/amnezia-vpn/amnezia-client"
-rev           = "94b51df24790bf52427afe82d81c87a95460bdfd"
+rev           = "3e9b70a5f1dd939b0df062881ac404536c678846"
 default_branch = "dev"
 path          = "common/crypto"
 test_enabled  = false
@@ -37,7 +37,7 @@ note          = "the C++ Amnezia core; the second implementation of the same wir
 
 [sources.xray-rust]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "7a4fb2dd382b8041d6d997b0185397045c8da463"
+rev           = "f5aefca40b9f492e8095ba3c1620ae627ce331ee"
 default_branch = "main"
 path          = "crates"
 test_enabled  = true
@@ -48,7 +48,7 @@ note          = "Rust VLESS core; 7 interop tests run against ferrox-app via XRA
 
 [sources.pattng]
 repo          = "https://github.com/patterniha/PattNG"
-rev           = "ad6f747ca50cec4b2427c9c0b5d0465f0eff5932"
+rev           = "1ee7205ce5673dd8458a46eeeeb9464086dae8d5"
 default_branch = "my-releases"
 path          = "V2rayNG"
 test_enabled  = false
@@ -69,7 +69,7 @@ note          = "MIT Zray core; 8 oracle tests run against ferrox-app via ZRAY_X
 
 [sources.mqvpn]
 repo          = "https://github.com/mp0rta/mqvpn"
-rev           = "b11a2f69b0864d9df199ac653e2d7767c6b679d3"
+rev           = "078845ce4d6faa823a582faeeed868ed39980a36"
 default_branch = "main"
 path          = "src"
 test_enabled  = false
@@ -78,7 +78,7 @@ note          = "MASQUE CONNECT-IP (RFC 9484) over Multipath QUIC; WLB/minrtt/ba
 
 [sources.aether]
 repo          = "https://github.com/CluvexStudio/Aether"
-rev           = "21e7150ac2225caa01cbb96ac572b5c0cc1e1dc2"
+rev           = "6175b67df370ab856bcee07fe85b524031903956"
 default_branch = "main"
 path          = "aether"
 test_enabled  = false
@@ -87,7 +87,7 @@ note          = "open-source Rust WARP core (AGPL-3.0): MASQUE over HTTP/3 and H
 
 [sources.zeptun]
 repo          = "https://github.com/Noisemux/zeptun"
-rev           = "5620e57cdbf1a4464567a404adbff7cffd9b4bb9"
+rev           = "1bf813133af91c84350dcc5c02c3f02f32ce1aec"
 default_branch = "main"
 path          = "src"
 test_enabled  = false
@@ -105,9 +105,18 @@ note          = "DNS covert channel over QUIC multipath (picoquic); TCP-over-DNS
 
 [sources.quiche]
 repo          = "https://github.com/cloudflare/quiche"
-rev           = "3fc9bc1c5d47757df20f80f78aa8efa912897d34"
+rev           = "96e7dd51214d7bbc84796350bbc5ba988a801ee4"
 default_branch = "master"
 path          = "quiche"
 test_enabled  = false
 ferrox_binary = ""
 note          = "Cloudflare QUIC + HTTP/3 stack (BSD-2.0); the default QUIC for MASQUE/H3 rungs — never a preference, always the measured choice"
+
+[sources.lxbox]
+repo          = "https://github.com/Leadaxe/LxBox"
+rev           = "15e4fcb84bb57f9fb90c7c77a8517fe7b818b901"
+default_branch = "main"
+path          = "app"
+test_enabled  = false
+ferrox_binary = ""
+note          = "Android VPN client for VLESS, REALITY, XHTTP, Cloudflare WARP, Tailscale and AmneziaWG, powered by a sing-box fork; the client-side superset and config shapes to read against"
