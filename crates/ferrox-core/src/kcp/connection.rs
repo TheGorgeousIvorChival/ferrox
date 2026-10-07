@@ -588,51 +588,62 @@ impl Connection {
 mod tests {
     use std::io;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::{
         ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, PING_INTERVAL_MS,
         WRITE_ATTEMPTS,
     };
 
-    fn counting_writer(
+    struct Recorder {
+        attempts: AtomicU32,
+        seen: Mutex<Vec<Vec<u8>>>,
         fail_times: u32,
-    ) -> (
-        Arc<AtomicU32>,
-        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-        impl FnMut(&[u8]) -> io::Result<()> + Send,
-    ) {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (a, s) = (Arc::clone(&attempts), Arc::clone(&seen));
-        (attempts, seen, move |data: &[u8]| {
-            let n = a.fetch_add(1, Ordering::SeqCst);
-            s.lock().unwrap().push(data.to_vec());
-            if n < fail_times {
+    }
+
+    impl Recorder {
+        fn new(fail_times: u32) -> Arc<Self> {
+            Arc::new(Self {
+                attempts: AtomicU32::new(0),
+                seen: Mutex::new(Vec::new()),
+                fail_times,
+            })
+        }
+
+        fn write(&self, data: &[u8]) -> io::Result<()> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(data.to_vec());
+            if n < self.fail_times {
                 Err(io::Error::other("transient"))
             } else {
                 Ok(())
             }
-        })
+        }
     }
 
-    #[test]
-    fn a_failed_write_is_retried_with_the_same_bytes() {
+    fn recording_connection(fail_times: u32) -> (Arc<Recorder>, Arc<Connection>) {
+        let recorder = Recorder::new(fail_times);
+        let sink = Arc::clone(&recorder);
         let local = ([127, 0, 0, 1], 1).into();
-        let (attempts, seen, write) = counting_writer(2);
         let conn = Connection::new(
             ConnMetadata {
                 local,
                 remote: local,
                 conversation: 4,
             },
-            Box::new(write),
+            Box::new(move |data: &[u8]| sink.write(data)),
             Box::new(|| {}),
             Config::default(),
         );
+        (recorder, conn)
+    }
+
+    #[test]
+    fn a_failed_write_is_retried_with_the_same_bytes() {
+        let (recorder, conn) = recording_connection(2);
         conn.ping(1, Command::Terminate);
-        let seen = seen.lock().unwrap();
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let seen = recorder.seen.lock().unwrap();
+        assert_eq!(recorder.attempts.load(Ordering::SeqCst), 3);
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[0], seen[1]);
         assert_eq!(seen[1], seen[2]);
@@ -641,20 +652,9 @@ mod tests {
 
     #[test]
     fn a_write_that_never_succeeds_stops_at_the_attempt_limit() {
-        let local = ([127, 0, 0, 1], 1).into();
-        let (attempts, _, write) = counting_writer(u32::MAX);
-        let conn = Connection::new(
-            ConnMetadata {
-                local,
-                remote: local,
-                conversation: 4,
-            },
-            Box::new(write),
-            Box::new(|| {}),
-            Config::default(),
-        );
+        let (recorder, conn) = recording_connection(u32::MAX);
         conn.ping(1, Command::Ping);
-        assert_eq!(attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+        assert_eq!(recorder.attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
     }
 
     #[test]
