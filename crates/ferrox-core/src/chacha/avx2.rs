@@ -65,7 +65,9 @@ impl Lanes for A8 {
 
     #[inline]
     fn rotl16(self) -> Self {
-        Self(unsafe { _mm256_shuffle_epi8(self.0, _mm256_loadu_si256(ROTL16.as_ptr().cast())) })
+        // black-boxed so the mask is not a constant: LLVM otherwise reads this rotate as two lane swaps
+        let mask = core::hint::black_box(ROTL16.as_ptr().cast::<i8>());
+        Self(unsafe { _mm256_shuffle_epi8(self.0, _mm256_loadu_si256(mask.cast())) })
     }
 
     #[inline]
