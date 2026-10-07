@@ -660,6 +660,79 @@ Two streams already share one handshake through `dial_pooled`, proved by the soc
 Then earn the gate the hard way: three consecutive green `ci.yml` runs with no change to either file between them. A socket test that passes twice and fails the third is testing the scheduler, and the fix is in the test's determinism, not in its budget.
 ```
 
+## P31 · Decide what the QUIC carrier claims, and prove it on the wire
+
+**When to use:** Now, and before any more QUIC work: `quic.rs` sends `h3` in its ALPN and then writes a VLESS request header as the first bytes of the stream, which is not an HTTP/3 frame and not the framing the removed `Xray-core` QUIC transport used either. Measured on this tree, dropping the ALPN on both client and server fails the handshake and turns all four socket tests red, so an ALPN is required here and the value is a decision rather than a cleanup.
+**Status:** todo
+**Leverage:** 5
+**Effort:** large
+**Gates:** `cargo test --workspace`; a test that asserts the negotiated application protocol against what the carrier offers; CI: `conformance.yml` with at least one QUIC row green against a pinned peer
+**Depends on:** P30
+**Touches:** crates/ferrox-app/src/quic.rs, crates/ferrox-app/src/proxy.rs, upstream/pins.toml
+**Random weight:** 5
+
+```text
+The pinned `Xray-core` has no QUIC stream transport at all. `infra/conf/transport_internet.go:35-36` answers `{"network":"quic"}` with `PrintRemovedFeatureError("QUIC transport (without web service, etc.)", "XHTTP stream-one H3")`, so upstream's own verdict on this name is to refuse the config and point at XHTTP. Its QUIC is MASQUE CONNECT-IP over HTTP/3 under `transport/internet/masque/`, XHTTP stream-one H3 under `transport/internet/splithttp/`, DoQ under `app/dns/nameserver_quic.go`, and the Initial sniffer under `common/protocol/quic/`. There is no `quicSettings` in the tree and no `MaxEarlyData`, no `QuicSecurity`, no `KeyType`.
+
+So there is no pinned peer for a QUIC stream carrier to interop with, and that is the fact to write down before writing code. Choose one and say which in the report:
+
+- **Speak HTTP/3.** An ALPN of `h3` is then honest and a real server stops erroring the stream. It costs a QPACK encoder, SETTINGS, HEADERS and DATA framing, and there is no `h3`, `h3-quinn`, `quinn` or `webpki-roots` in `Cargo.lock` today, so it is hand-rolled or a new dependency the dependency-policy check will have an opinion about.
+- **Speak nothing and name what it is.** An ALPN that says this is a raw multiplexed stream carrier turns a mid-stream HTTP/3 error into a `no_application_protocol` at the handshake, which is a better failure to debug and no more capable.
+- **Refuse the carrier.** `upstream/` has already made this call; a config that upstream refuses is a config this tree may refuse, with the reason.
+
+Whichever it is, the table cell says which, and an unsupported cell with a reason beats a supported one that a real peer answers with a stream error.
+```
+
+## P32 · Give the KCP config a consumer or stop naming the knobs
+
+**When to use:** When `Carrier::Kcp` is next asked for its settings: `proxy.rs` reads `kcpSettings` only for `host`, which is not an mKCP setting, so `mtu`, `tti`, `uplinkCapacity`, `downlinkCapacity`, `cwndMultiplier` and `maxSendingWindow` are unreachable from any config file, and the `Config` arithmetic that would consume them has no validator anywhere in the tree.
+**Status:** todo
+**Leverage:** 3
+**Effort:** small
+**Gates:** `cargo test --workspace`
+**Depends on:** P29
+**Touches:** crates/ferrox-app/src/proxy.rs, crates/ferrox-core/src/kcp/config.rs
+**Random weight:** 2
+
+```text
+Parsing the six knobs before there is a dial path that uses them is a second way of reading a config, and `prompts.md` currently claims `Carrier::Kcp` "parses their settings" when it parses none of them. Either this slice parses all six into `ferrox_core::kcp::Config` and P29 hands that config to `Connection::new`, or it corrects the sentence in `prompts.md` and leaves the struct to P29. Say which.
+
+Where the validation goes is upstream's answer read rather than invented: `infra/conf/transport_method.go:562-573` rejects `mtu < 21`, `tti` outside 10 to 1000, `cwndMultiplier < 1` and a `maxSendingWindow` below one MTU, in the config builder and not in the KCP package. Those four bounds are exactly the ones that keep `Config`'s derived sizes total, and `crates/ferrox-core/src/kcp/config.rs` now saturates instead of panicking, so the bounds are a rejection policy rather than a memory-safety requirement. Decide which this tree wants, because a setting that silently saturates and a setting that is refused are different user experiences.
+```
+
+## P33 · Cover the KCP connection, not only its arithmetic
+
+**When to use:** When the next KCP change touches `connection.rs`: the oracle proves `SendingWindow`, `AckList`, `RoundTripInfo` and three serializers against the captured Go output, and proves nothing about the state machine, `flush`, `Ping`, `Terminate`, deadlines, or `read_segment` in the parse direction, which is only ever self-round-tripped.
+**Status:** todo
+**Leverage:** 4
+**Effort:** medium
+**Gates:** `cargo test --workspace`; `cargo run -p ferrox-core --example kcp_interop`
+**Touches:** scripts/kcp-oracle/main.go, scripts/kcp-oracle/expected.txt, crates/ferrox-core/src/kcp/oracle.rs, scripts/check.sh
+**Random weight:** 4
+
+```text
+Three holes are named by reading `oracle.rs` against the Go harness. `RoundTripInfo::default()` gives `min_rtt = 0` where `Connection::new` uses `RoundTripInfo::new(config.tti)`, so the `srtt < minRtt` clamp and the `minRtt < 4*variation` branch never run, and `on_packet_loss`'s `Timeout() == 0` guard always trips. `al_flush` passes `(1350 - 17) / 4` as a literal rather than going through the `mtu = mss + 18` and `limit = (mtu - 17) / 4` derivation `ReceivingWorker` uses, so a change to either leaves the oracle green. And `scripts/kcp-oracle/interop/main.go`, the Go echo server and client that would compare bytes over a real socket, is referenced by nothing: no script, no workflow, no `Cargo.toml` target.
+
+Drive the estimator through the constructor the connection uses, derive the ack limit through `ReceivingWorker`, and put `interop/main.go` behind the same command that runs `crates/ferrox-core/examples/kcp_interop.rs`. Then the four bugs this tree's own suite found — the double ping, the missing wakeup, the close deadlock and the payload copy on a discarded segment — were all reachable by a rule that already existed, and the next one will be too.
+```
+
+## P34 · Give the pooled QUIC connection an owner that lets it go
+
+**When to use:** When the next QUIC slice reads `quic.rs`: the pool is a process-global `OnceLock` keyed by `(address, port, host, roots)` with no eviction and no target or user in the key, so a connection outlives its last session for the life of the process, and `pump` holds the connection mutex across a `recv_from` that waits up to 500 ms.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace` green on three consecutive `ci.yml` runs
+**Depends on:** P30
+**Touches:** crates/ferrox-app/src/quic.rs
+**Random weight:** 2
+
+```text
+Two costs and one hang, in order of how much they cost a user. A pooled entry is removed only by `leave_session` when the last session ends, so a connection whose sessions all ended closes, but one opened with zero sessions and never re-entered sits in the map with an idle timeout ticking; key it by target and user id as well as server, and let the idle timeout be the reaper rather than a second thread. The `pump` lock is held across `pump_once`, which blocks in `recv_from` for up to `PUMP_POLL`, so a stalled peer stalls every other session sharing that connection; take the connection out of the lock, poll, and take it again, which is the same shape `quiche`'s `poll` wants. And `leave_session` flushes egress once and drops, so a lost CONNECTION_CLOSE leaves the peer to time out.
+
+P30 wants the pool proved under an adversarial packet layer. This slice is what that proof should be pointed at, because a share that cannot be released is not a share a test can schedule around.
+```
+
 ## Reading this file as a roadmap
 
 The graph is the point, and it is not a decoration: `ferrox-prompt next` ranks ready slices by leverage, breaks ties towards the smaller one, leaves out the ones waiting on a decision, and reports what each slice unblocks. `P21` waits on `P18`, which waits on `P17`, which waits on `P7` — the longest chain in the file, which is the kind of thing that is obvious once and invisible otherwise.
