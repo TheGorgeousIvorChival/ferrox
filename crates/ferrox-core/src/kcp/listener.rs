@@ -205,10 +205,57 @@ impl Listener {
 
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
-        let mut sessions = self.inner.sessions.lock().unwrap();
-        for (_, conn) in sessions.drain() {
+        let sessions = std::mem::take(&mut *self.inner.sessions.lock().unwrap());
+        for (_, conn) in sessions {
             conn.terminate();
         }
         self.inner.ready_cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::kcp::connection::ConnMetadata;
+
+    #[test]
+    fn close_returns_while_a_session_is_registered() {
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into(), Config::default()).expect("bind");
+        let local = listener.local_addr();
+        let key = (local, 1);
+        let slot = Arc::downgrade(&listener.inner);
+        let closer: Box<dyn FnOnce() + Send> = Box::new(move || {
+            if let Some(inner) = slot.upgrade() {
+                inner.sessions.lock().unwrap().remove(&key);
+            }
+        });
+        let session = Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 1,
+            },
+            Box::new(|_| Ok(())),
+            closer,
+            Config::default(),
+        );
+        listener
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(key, Arc::clone(&session));
+
+        let (done, seen) = mpsc::channel();
+        thread::spawn(move || {
+            listener.close();
+            let _ = done.send(());
+        });
+        assert!(
+            seen.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "close did not return: it held the session lock across terminate"
+        );
     }
 }

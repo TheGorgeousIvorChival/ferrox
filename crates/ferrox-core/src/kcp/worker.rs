@@ -16,6 +16,7 @@ pub struct SendingWorker {
     next_number: u32,
     remote_next_number: u32,
     control_window: u32,
+    in_flight_size: u32,
     window_size: u32,
     first_unacknowledged_updated: bool,
     closed: bool,
@@ -36,6 +37,7 @@ impl SendingWorker {
             next_number: 0,
             remote_next_number: 32,
             control_window: config.sending_in_flight_size(),
+            in_flight_size: config.sending_in_flight_size(),
             window_size: config.sending_buffer_size(),
             first_unacknowledged_updated: false,
             closed: false,
@@ -145,9 +147,8 @@ impl SendingWorker {
         if self.control_window < 16 {
             self.control_window = 16;
         }
-        let cwnd = self.ctx.config.sending_in_flight_size();
-        if self.control_window > cwnd {
-            self.control_window = cwnd;
+        if self.control_window > self.in_flight_size {
+            self.control_window = self.in_flight_size;
         }
     }
 
@@ -155,7 +156,7 @@ impl SendingWorker {
         if self.closed {
             return false;
         }
-        let mut cwnd = self.ctx.config.sending_in_flight_size();
+        let mut cwnd = self.in_flight_size;
         let rest = self
             .remote_next_number
             .wrapping_sub(self.first_unacknowledged);
@@ -197,9 +198,7 @@ impl SendingWorker {
     }
 
     pub fn release(&mut self) {
-        while !self.window.is_empty() {
-            self.window.remove(self.window.first_number());
-        }
+        self.window.release();
         self.closed = true;
     }
 }
@@ -212,7 +211,7 @@ pub struct ReceivingWorker {
     acklist: AckList,
     next_number: u32,
     window_size: u32,
-    mtu: u32,
+    ack_limit: usize,
 }
 
 impl std::fmt::Debug for ReceivingWorker {
@@ -222,7 +221,7 @@ impl std::fmt::Debug for ReceivingWorker {
 }
 
 impl ReceivingWorker {
-    pub(crate) fn new(config: Config, mss: u32, ctx: Arc<Ctx>) -> Self {
+    pub(crate) fn new(config: Config, ctx: Arc<Ctx>) -> Self {
         let window_size = config.receiving_in_flight_size();
         Self {
             ctx,
@@ -232,7 +231,7 @@ impl ReceivingWorker {
             acklist: AckList::new(),
             next_number: 0,
             window_size,
-            mtu: mss + super::segment::DATA_SEGMENT_OVERHEAD,
+            ack_limit: config.ack_limit(),
         }
     }
 
@@ -257,13 +256,12 @@ impl ReceivingWorker {
 
     pub fn process_segment(&mut self, seg: DataSegment) {
         let number = seg.number;
-        let idx = number.wrapping_sub(self.next_number);
-        if idx >= self.window_size {
+        if number.wrapping_sub(self.next_number) >= self.window_size {
             return;
         }
         self.acklist.clear(seg.sending_next);
         self.acklist.add(number, seg.timestamp);
-        if !self.window.set(number, seg) {}
+        self.window.set(number, seg);
     }
 
     pub fn read_multi_buffer(&mut self) -> Vec<Vec<u8>> {
@@ -310,7 +308,7 @@ impl ReceivingWorker {
 
     pub fn flush(&mut self, current: u32) {
         let rto = self.ctx.round_trip.lock().unwrap().timeout();
-        let limit = (self.mtu as usize - 17) / 4;
+        let limit = self.ack_limit;
         let ctx = Arc::clone(&self.ctx);
         let window_size = self.window_size;
         let next_number = self.next_number;
