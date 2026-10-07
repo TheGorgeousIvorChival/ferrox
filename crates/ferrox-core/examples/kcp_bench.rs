@@ -136,6 +136,6 @@ fn feed(sock: UdpSocket, conn: Arc<Connection>, peer: Arc<Mutex<Option<SocketAdd
             segs.push(seg);
             rest = tail;
         }
-        conn.input(&segs);
+        conn.input(segs);
     }
 }

@@ -142,6 +142,7 @@ pub struct AckList {
     numbers: Vec<u32>,
     timestamps: Vec<u32>,
     next_flush: Vec<u32>,
+    staging: Vec<u32>,
     dirty: bool,
 }
 
@@ -191,12 +192,13 @@ impl AckList {
         limit: usize,
         write: &mut impl FnMut(&mut AckSegment),
     ) {
-        let mut flush_candidates = Vec::new();
+        let mut candidates = std::mem::take(&mut self.staging);
+        candidates.clear();
         let mut seg = AckSegment::new(limit);
         for i in 0..self.numbers.len() {
             if self.next_flush[i] > current {
-                if flush_candidates.len() < 128 {
-                    flush_candidates.push(self.numbers[i]);
+                if candidates.len() < 128 {
+                    candidates.push(self.numbers[i]);
                 }
                 continue;
             }
@@ -214,7 +216,7 @@ impl AckList {
             }
         }
         if self.dirty || !seg.is_empty() {
-            for number in flush_candidates {
+            for number in candidates.drain(..) {
                 if seg.is_full() {
                     break;
                 }
@@ -223,6 +225,7 @@ impl AckList {
             write(&mut seg);
             self.dirty = false;
         }
+        self.staging = candidates;
     }
 }
 

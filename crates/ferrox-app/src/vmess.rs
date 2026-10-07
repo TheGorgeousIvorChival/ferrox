@@ -1211,6 +1211,31 @@ pub(crate) fn serve_httpupgrade(stream: TcpStream, path: &str, id: &[u8; 16], fr
     pump_relay_carried(&uplink, reader, write, &close, send, recv);
 }
 
+pub(crate) fn serve_kcp<R, W>(
+    mut reader: R,
+    mut writer: W,
+    id: &[u8; 16],
+    freedom: bool,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some((target, send, recv, prefix, cmd)) = accept_request(&mut reader, id) else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+        return;
+    };
+    if writer.write_all(&prefix).is_err() {
+        return;
+    }
+    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+}
+
 pub(crate) fn serve(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
     let Some((target, send, recv, prefix, cmd)) = accept_request(&mut stream, id) else {
         return;

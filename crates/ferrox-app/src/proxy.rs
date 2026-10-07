@@ -49,58 +49,15 @@ pub(crate) fn serve_file(path: &str) -> ! {
                     }
                 }
                 "trojan" => {
-                    let key = trojan_key(&inbound_password(inbound));
-                    let carrier = inbound_carrier(inbound);
-                    spawn_role(
-                        &address,
-                        Role::Trojan {
-                            key,
-                            carrier,
-                            freedom,
-                        },
-                    );
+                    serve_trojan_inbound(&address, inbound, freedom);
                     inbounds += 1;
                 }
                 "vmess" => {
-                    let id = inbound_id(inbound);
-                    let carrier = inbound_carrier(inbound);
-                    spawn_role(
-                        &address,
-                        Role::Vmess {
-                            id,
-                            carrier,
-                            freedom,
-                        },
-                    );
+                    serve_vmess_inbound(&address, inbound, freedom);
                     inbounds += 1;
                 }
                 "shadowsocks" => {
-                    let password = inbound_ss_password(inbound);
-                    let method = inbound_method(inbound);
-                    let carrier = inbound_carrier(inbound);
-                    let udp_address = address.clone();
-                    let udp_password = password.clone();
-                    let udp_method = method.clone();
-                    let udp_carrier = carrier.clone();
-                    spawn_role(
-                        &address,
-                        Role::Shadowsocks {
-                            password,
-                            method,
-                            carrier,
-                            freedom,
-                        },
-                    );
-                    if matches!(udp_carrier, Carrier::Raw) {
-                        thread::spawn(move || {
-                            crate::shadowsocks::serve_udp(
-                                &udp_address,
-                                &udp_password,
-                                &udp_method,
-                                freedom,
-                            );
-                        });
-                    }
+                    serve_shadowsocks_inbound(&address, inbound, freedom);
                     inbounds += 1;
                 }
                 "socks" => {
@@ -142,8 +99,11 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
         }
         _ => {
             let owned = address.to_owned();
-            if matches!(carrier, Carrier::Kcp) {
-                thread::spawn(move || serve_kcp_loop(&owned, id, freedom));
+            if let Carrier::Kcp(config) = carrier {
+                let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
+                    serve_vless_kcp(conn, &id, freedom);
+                });
+                thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
                 return true;
             }
             let role = Role::Vless {
@@ -281,7 +241,7 @@ struct VlessOut {
 macro_rules! refused_carriers {
     () => {
         Carrier::Quic
-            | Carrier::Kcp
+            | Carrier::Kcp(_)
             | Carrier::Hysteria
             | Carrier::Masque
             | Carrier::Xdrive
@@ -298,7 +258,7 @@ enum Carrier {
     Xhttp { path: String },
     HttpHeader { path: String },
     Quic,
-    Kcp,
+    Kcp(ferrox_core::kcp::Config),
     Hysteria,
     Masque,
     Xdrive,
@@ -961,6 +921,15 @@ fn serve_vless_tls_inbound(
         return false;
     };
     let owned = address.to_owned();
+    if let Carrier::Kcp(config) = carrier {
+        let config = *config;
+        let id = *id;
+        let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
+            serve_vless_kcp_tls(conn, &id, freedom, &server);
+        });
+        thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        return true;
+    }
     let role = Role::VlessTls {
         id: *id,
         freedom,
@@ -984,6 +953,16 @@ fn serve_vless_reality_inbound(
         return false;
     };
     let owned = address.to_owned();
+    if let Carrier::Kcp(config) = carrier {
+        let config = *config;
+        let id = *id;
+        let server = Arc::new(server);
+        let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
+            serve_vless_kcp_reality(conn, &id, freedom, &server);
+        });
+        thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        return true;
+    }
     let role = Role::VlessReality {
         id: *id,
         freedom,
@@ -1571,9 +1550,16 @@ fn dial_vless(client: &TcpStream, mut uplink: TcpStream, vless: &VlessOut, targe
     }
 }
 
-// KCP speaks the same VLESS bytes as TCP over a reliable UDP stream.
+// KCP carries the same protocol bytes as TCP over a reliable UDP stream.
+#[derive(Clone)]
 struct KcpIo {
     conn: Arc<ferrox_core::kcp::Connection>,
+}
+
+impl KcpIo {
+    fn close(&self) {
+        self.conn.close();
+    }
 }
 
 impl Read for KcpIo {
@@ -1584,6 +1570,21 @@ impl Read for KcpIo {
         self.conn
             .read(buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+    }
+}
+
+impl Write for KcpIo {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.conn
+            .write(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1663,20 +1664,233 @@ fn dial_vless_kcp(
     kcp_relay(client, conn);
 }
 
-fn serve_kcp_loop(address: &str, id: [u8; 16], freedom: bool) {
-    let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+fn serve_vless_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    id: &[u8; 16],
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    serve_carried_tls(
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+        id,
+        freedom,
+        server,
+    );
+}
+
+fn serve_vless_kcp_reality(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    id: &[u8; 16],
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+) {
+    let Ok(session) = ferrox_core::tls::RealityServer::accept(
+        server,
+        unix_now(),
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    ) else {
         return;
     };
-    let Ok(listener) =
-        ferrox_core::kcp::Listener::bind(server, ferrox_core::kcp::Config::default())
+    finish_reality(session, None, id, freedom);
+}
+
+fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[u8; 56], freedom: bool) {
+    let mut io = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    let Some((cmd, target)) = decode_trojan_request(&mut io, key) else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    kcp_relay(&uplink, conn);
+}
+
+fn kcp_dial_session(
+    carrier: &Carrier,
+    address: &str,
+    port: u16,
+) -> Option<Arc<ferrox_core::kcp::Connection>> {
+    let Carrier::Kcp(config) = carrier else {
+        return None;
+    };
+    let endpoint = format!("{address}:{port}");
+    let server = endpoint.to_socket_addrs().ok()?.next()?;
+    ferrox_core::kcp::dial(server, *config, ferrox_core::kcp::fresh_conversation()).ok()
+}
+
+fn dial_trojan_kcp(
+    client: &TcpStream,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    trojan: &TrojanOut,
+    target: &SocketAddr,
+) {
+    if conn.write(&trojan_header(&trojan.key, 1, target)).is_err() {
+        return;
+    }
+    kcp_relay(client, conn);
+}
+
+fn dial_vmess_kcp(
+    client: &TcpStream,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
         return;
     };
+    if conn.write(&request).is_err() {
+        return;
+    }
+    let mut reader = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+        return;
+    }
+    let (_, writer, close) = kcp_parts(conn);
+    crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
+}
+
+fn dial_ss_kcp(
+    client: &TcpStream,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    ss: &ShadowsocksOut,
+    target: &SocketAddr,
+) {
+    let mut writer = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    let Some((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return;
+    };
+    let (reader, _, close) = kcp_parts(conn);
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+}
+
+fn serve_kcp_loop(address: &str, config: ferrox_core::kcp::Config, serve: &KcpServe) {
+    let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        return;
+    };
+    let Ok(listener) = ferrox_core::kcp::Listener::bind(server, config) else {
+        return;
+    };
+    serve_kcp_each(&listener, serve);
+}
+
+fn serve_kcp_each(listener: &ferrox_core::kcp::Listener, serve: &KcpServe) {
     loop {
         let Ok(session) = listener.accept() else {
             continue;
         };
-        std::thread::spawn(move || serve_vless_kcp(&session, &id, freedom));
+        let serve = Arc::clone(serve);
+        std::thread::spawn(move || serve(&session));
+    }
+}
+
+type KcpServe = Arc<dyn Fn(&Arc<ferrox_core::kcp::Connection>) + Send + Sync>;
+
+type KcpClose = Arc<dyn Fn() + Send + Sync>;
+
+fn kcp_parts(conn: &Arc<ferrox_core::kcp::Connection>) -> (KcpIo, KcpIo, KcpClose) {
+    let reader = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    let writer = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    let closer = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    let close: KcpClose = Arc::new(move || closer.close());
+    (reader, writer, close)
+}
+
+fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) {
+    let key = trojan_key(&inbound_password(inbound));
+    match inbound_carrier(inbound) {
+        Carrier::Kcp(config) => {
+            let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &key, freedom));
+            let owned = address.to_owned();
+            thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        }
+        other => spawn_role(
+            address,
+            Role::Trojan {
+                key,
+                carrier: other,
+                freedom,
+            },
+        ),
+    }
+}
+
+fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
+    let id = inbound_id(inbound);
+    match inbound_carrier(inbound) {
+        Carrier::Kcp(config) => {
+            let serve: KcpServe = Arc::new(move |conn| {
+                let (reader, writer, close) = kcp_parts(conn);
+                crate::vmess::serve_kcp(reader, writer, &id, freedom, &close);
+            });
+            let owned = address.to_owned();
+            thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        }
+        other => spawn_role(
+            address,
+            Role::Vmess {
+                id,
+                carrier: other,
+                freedom,
+            },
+        ),
+    }
+}
+
+fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
+    let password = inbound_ss_password(inbound);
+    let method = inbound_method(inbound);
+    let carrier = inbound_carrier(inbound);
+    let udp_raw = matches!(carrier, Carrier::Raw);
+    let udp_address = address.to_owned();
+    let udp_password = password.clone();
+    let udp_method = method.clone();
+    match carrier {
+        Carrier::Kcp(config) => {
+            let serve: KcpServe = Arc::new(move |conn| {
+                let (reader, writer, close) = kcp_parts(conn);
+                crate::shadowsocks::serve_kcp(reader, writer, &password, &method, freedom, &close);
+            });
+            let owned = address.to_owned();
+            thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        }
+        other => spawn_role(
+            address,
+            Role::Shadowsocks {
+                password,
+                method,
+                carrier: other,
+                freedom,
+            },
+        ),
+    }
+    if udp_raw {
+        thread::spawn(move || {
+            crate::shadowsocks::serve_udp(&udp_address, &udp_password, &udp_method, freedom);
+        });
     }
 }
 
@@ -2606,18 +2820,34 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
             );
             return;
         }
-        if matches!(vless.carrier, Carrier::Kcp) && !vless.mux {
-            let endpoint = format!("{}:{}", vless.address, vless.port);
-            let Some(server) = endpoint.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
-                return;
-            };
-            let conversation = ferrox_core::kcp::fresh_conversation();
-            let Ok(session) =
-                ferrox_core::kcp::dial(server, ferrox_core::kcp::Config::default(), conversation)
-            else {
-                return;
-            };
-            dial_vless_kcp(&client, &session, vless, &target);
+        if matches!(vless.carrier, Carrier::Kcp(_)) && !vless.mux {
+            if let Some(session) = kcp_dial_session(&vless.carrier, &vless.address, vless.port) {
+                dial_vless_kcp(&client, &session, vless, &target);
+            }
+            return;
+        }
+    }
+    if let Outbound::Vmess(vmess) = out {
+        if matches!(vmess.carrier, Carrier::Kcp(_)) {
+            if let Some(session) = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port) {
+                dial_vmess_kcp(&client, &session, vmess, &target);
+            }
+            return;
+        }
+    }
+    if let Outbound::Trojan(trojan) = out {
+        if matches!(trojan.carrier, Carrier::Kcp(_)) {
+            if let Some(session) = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port) {
+                dial_trojan_kcp(&client, &session, trojan, &target);
+            }
+            return;
+        }
+    }
+    if let Outbound::Shadowsocks(ss) = out {
+        if matches!(ss.carrier, Carrier::Kcp(_)) {
+            if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
+                dial_ss_kcp(&client, &session, ss, &target);
+            }
             return;
         }
     }
@@ -4253,6 +4483,38 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
     None
 }
 
+fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
+    let base = ferrox_core::kcp::Config::default();
+    let Some(kcp) = settings.and_then(|s| s.get("kcpSettings")) else {
+        return base;
+    };
+    let num = |camel: &str, snake: &str| {
+        kcp.get(camel)
+            .or_else(|| kcp.get(snake))
+            .and_then(Json::as_u32)
+    };
+    let mtu = num("mtu", "mtu").unwrap_or(base.mtu);
+    let tti = num("tti", "tti").unwrap_or(base.tti);
+    ferrox_core::kcp::Config {
+        mtu: if mtu > ferrox_core::kcp::DATA_SEGMENT_OVERHEAD {
+            mtu
+        } else {
+            base.mtu
+        },
+        tti: if (1..=1000).contains(&tti) {
+            tti
+        } else {
+            base.tti
+        },
+        uplink_capacity: num("uplinkCapacity", "uplink_capacity").unwrap_or(base.uplink_capacity),
+        downlink_capacity: num("downlinkCapacity", "downlink_capacity")
+            .unwrap_or(base.downlink_capacity),
+        cwnd_multiplier: num("cwndMultiplier", "cwnd_multiplier").unwrap_or(base.cwnd_multiplier),
+        max_sending_window: num("maxSendingWindow", "max_sending_window")
+            .unwrap_or(base.max_sending_window),
+    }
+}
+
 fn stream_carrier(settings: Option<&Json>) -> Carrier {
     match settings
         .and_then(|s| s.get("network"))
@@ -4275,7 +4537,7 @@ fn stream_carrier(settings: Option<&Json>) -> Carrier {
             path: xhttp_path(settings),
         },
         Some("quic") => Carrier::Quic,
-        Some("kcp" | "mkcp") => Carrier::Kcp,
+        Some("kcp" | "mkcp") => Carrier::Kcp(kcp_config(settings)),
         Some("hysteria") => Carrier::Hysteria,
         Some("masque") => Carrier::Masque,
         Some("xdrive") => Carrier::Xdrive,
@@ -4356,7 +4618,7 @@ fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
         Carrier::Xhttp { .. } => "xhttpSettings",
         Carrier::HttpHeader { .. } => "tcpSettings",
         Carrier::Quic => "quicSettings",
-        Carrier::Kcp => "kcpSettings",
+        Carrier::Kcp(_) => "kcpSettings",
         Carrier::Hysteria => "hysteriaSettings",
         Carrier::Masque => "masqueSettings",
         Carrier::Xdrive => "xdriveSettings",
@@ -7298,7 +7560,7 @@ mod tests {
                 Carrier::Xhttp { .. } => "Xhttp",
                 Carrier::HttpHeader { .. } => "HttpHeader",
                 Carrier::Quic => "Quic",
-                Carrier::Kcp => "Kcp",
+                Carrier::Kcp(_) => "Kcp",
                 Carrier::Hysteria => "Hysteria",
                 Carrier::Masque => "Masque",
                 Carrier::Xdrive => "Xdrive",
@@ -8186,6 +8448,250 @@ mod tests {
         assert_eq!(&back, b"ping");
         conn.close();
         server.join().expect("joins");
+    }
+
+    #[test]
+    fn kcp_settings_parse_in_both_casings_with_guarded_fallbacks() {
+        let base = ferrox_core::kcp::Config::default();
+        let plain = crate::json::parse(r#"{"network":"kcp"}"#).expect("parses");
+        assert!(matches!(stream_carrier(Some(&plain)), Carrier::Kcp(cfg) if cfg == base));
+        let camel = crate::json::parse(
+            r#"{"network":"mkcp","kcpSettings":{"mtu":1400,"tti":20,"uplinkCapacity":10,"downlinkCapacity":50,"cwndMultiplier":2,"maxSendingWindow":1048576}}"#,
+        )
+        .expect("parses");
+        let Carrier::Kcp(cfg) = stream_carrier(Some(&camel)) else {
+            panic!("mkcp names Kcp");
+        };
+        assert_eq!(cfg.mtu, 1400);
+        assert_eq!(cfg.tti, 20);
+        assert_eq!(cfg.uplink_capacity, 10);
+        assert_eq!(cfg.downlink_capacity, 50);
+        assert_eq!(cfg.cwnd_multiplier, 2);
+        assert_eq!(cfg.max_sending_window, 1_048_576);
+        let snake = crate::json::parse(
+            r#"{"network":"kcp","kcpSettings":{"uplink_capacity":7,"downlink_capacity":9,"cwnd_multiplier":3,"max_sending_window":4096}}"#,
+        )
+        .expect("parses");
+        let Carrier::Kcp(cfg) = stream_carrier(Some(&snake)) else {
+            panic!("snake case parses");
+        };
+        assert_eq!(cfg.uplink_capacity, 7);
+        assert_eq!(cfg.downlink_capacity, 9);
+        assert_eq!(cfg.cwnd_multiplier, 3);
+        assert_eq!(cfg.max_sending_window, 4096);
+        let bad = crate::json::parse(
+            r#"{"network":"kcp","kcpSettings":{"mtu":10,"tti":0,"uplinkCapacity":7}}"#,
+        )
+        .expect("parses");
+        let Carrier::Kcp(cfg) = stream_carrier(Some(&bad)) else {
+            panic!("bad values still Kcp");
+        };
+        assert_eq!(cfg.mtu, base.mtu);
+        assert_eq!(cfg.tti, base.tti);
+        assert_eq!(cfg.uplink_capacity, 7);
+        let slow =
+            crate::json::parse(r#"{"network":"kcp","kcpSettings":{"tti":5000}}"#).expect("parses");
+        let Carrier::Kcp(cfg) = stream_carrier(Some(&slow)) else {
+            panic!("slow tti still Kcp");
+        };
+        assert_eq!(cfg.tti, base.tti);
+    }
+
+    fn echo_once() -> u16 {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
+    fn kcp_loop_with(serve: KcpServe) -> u16 {
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        thread::spawn(move || serve_kcp_each(&listener, &serve));
+        port
+    }
+
+    fn socks_tcp_client(front_port: u16, echo_port: u16) -> TcpStream {
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        client
+    }
+
+    fn socks_front_with(out: Outbound) -> u16 {
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+        });
+        port
+    }
+
+    #[test]
+    fn socks_dials_vless_over_kcp_to_echo() {
+        let echo_port = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let serve: KcpServe = Arc::new(move |conn| serve_vless_kcp(conn, &id, true));
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            id,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn trojan_over_kcp_reaches_echo() {
+        let echo_port = echo_once();
+        let key = trojan_key("secret");
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_trojan_kcp(&conn, &key, true);
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let server_addr: SocketAddr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+        let conn = ferrox_core::kcp::dial(
+            server_addr,
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        conn.write(&trojan_header(&key, 1, &target))
+            .expect("writes");
+        conn.write(b"ping").expect("writes");
+        conn.set_read_deadline(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < 4 {
+            let n = conn.read(&mut back[at..]).expect("echoes");
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        assert_eq!(&back, b"ping");
+        conn.close();
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn socks_dials_trojan_over_kcp_to_echo() {
+        let echo_port = echo_once();
+        let key = trojan_key("secret");
+        let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &key, true));
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Trojan(TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            key,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn socks_dials_vmess_over_kcp_to_echo() {
+        let echo_port = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let serve: KcpServe = Arc::new(move |conn| {
+            let (reader, writer, close) = kcp_parts(conn);
+            crate::vmess::serve_kcp(reader, writer, &id, true, &close);
+        });
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Vmess(VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            id,
+            cipher: crate::vmess::Cipher::Auto,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn socks_dials_ss_over_kcp_to_echo() {
+        let echo_port = echo_once();
+        let password = "an-example-shared-password".to_owned();
+        let method = "aes-256-gcm".to_owned();
+        let serve_password = password.clone();
+        let serve_method = method.clone();
+        let serve: KcpServe = Arc::new(move |conn| {
+            let (reader, writer, close) = kcp_parts(conn);
+            crate::shadowsocks::serve_kcp(
+                reader,
+                writer,
+                &serve_password,
+                &serve_method,
+                true,
+                &close,
+            );
+        });
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            method,
+            password,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
     }
 }
 

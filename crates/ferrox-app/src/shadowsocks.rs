@@ -151,6 +151,29 @@ pub(crate) fn serve_httpheader(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
+pub(crate) fn serve_kcp<R, W>(
+    mut reader: R,
+    mut writer: W,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some((uplink, send, recv)) = accept_on(
+        &mut reader as &mut dyn Read,
+        &mut writer as &mut dyn Write,
+        password,
+        method,
+        freedom,
+    ) else {
+        return;
+    };
+    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+}
+
 fn accept_on(
     reader: &mut dyn Read,
     writer: &mut dyn Write,

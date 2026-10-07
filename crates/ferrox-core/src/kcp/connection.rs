@@ -272,7 +272,7 @@ impl Connection {
         self.ctx.round_trip.lock().unwrap().timeout()
     }
 
-    pub fn input(&self, segments: &[Segment]) {
+    pub fn input(&self, segments: Vec<Segment>) {
         let current = self.elapsed();
         self.last_incoming_time.store(current, Ordering::SeqCst);
         for seg in segments {
@@ -284,7 +284,7 @@ impl Connection {
             }
             match seg {
                 Segment::Data(d) => {
-                    self.receiving.lock().unwrap().process_segment(d.clone());
+                    self.receiving.lock().unwrap().process_segment(d);
                     if self.receiving.lock().unwrap().is_data_available() {
                         self.data_input.signal();
                     }
@@ -294,7 +294,7 @@ impl Connection {
                     self.sending
                         .lock()
                         .unwrap()
-                        .process_segment(current, a, rto);
+                        .process_segment(current, &a, rto);
                     self.data_output.signal();
                 }
                 Segment::CmdOnly(c) => {

@@ -35,7 +35,7 @@ fn feed(sock: &UdpSocket, conn: &Connection) {
     let mut buf = vec![0u8; 65536];
     loop {
         match sock.recv_from(&mut buf) {
-            Ok((n, _)) => conn.input(&parse_segments(&buf[..n])),
+            Ok((n, _)) => conn.input(parse_segments(&buf[..n])),
             Err(ref e)
                 if matches!(
                     e.kind(),
@@ -136,7 +136,7 @@ impl Listener {
                         let key = (src, conv);
                         let existing = inner.sessions.lock().unwrap().get(&key).cloned();
                         if let Some(session) = existing {
-                            session.input(&segs);
+                            session.input(segs);
                             continue;
                         }
                         if segs[0].command() == Some(Command::Terminate) {
@@ -169,7 +169,7 @@ impl Listener {
                             .lock()
                             .unwrap()
                             .insert(key, Arc::clone(&session));
-                        session.input(&segs);
+                        session.input(segs);
                         inner.ready.lock().unwrap().push_back(session);
                         inner.ready_cv.notify_all();
                     }
