@@ -517,7 +517,7 @@ fn planned_reason(link: &VlessLink) -> &'static str {
             "http/h2/h3: removed by Xray-core in favour of xhttp; parses, no transport"
         }
         TransportKind::Hysteria => {
-            "vless-hysteria: parses, dial needs its own QUIC stack and congestion glue"
+            "vless-hysteria: carrier dials TCP; UDP datagrams and masquerade stay refused"
         }
         TransportKind::Masque => "vless-masque: parses, dial needs a QUIC stack",
         TransportKind::Xdrive => "vless-xdrive: parses, transport not scheduled",
@@ -536,6 +536,7 @@ fn carrier_method(kind: TransportKind) -> Option<&'static str> {
         TransportKind::Quic => "vless-quic",
         TransportKind::HttpUpgrade => "vless-httpupgrade",
         TransportKind::Kcp => "vless-kcp",
+        TransportKind::Hysteria => "vless-hysteria",
         _ => return None,
     })
 }

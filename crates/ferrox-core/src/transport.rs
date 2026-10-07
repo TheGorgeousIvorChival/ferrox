@@ -63,6 +63,7 @@ impl TransportKind {
                 | Self::Quic
                 | Self::HttpUpgrade
                 | Self::Kcp
+                | Self::Hysteria
         )
     }
 }

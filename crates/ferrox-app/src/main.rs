@@ -7,6 +7,7 @@ mod foxy_live;
 mod grpc;
 mod httpheader;
 mod httpupgrade;
+mod hysteria;
 mod json;
 mod proxy;
 mod quic;

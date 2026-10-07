@@ -86,7 +86,7 @@ pub(crate) const MAX_STREAMS: u64 = 100;
 
 const PUMP_POLL: Duration = Duration::from_millis(500);
 
-const SEND_WAIT: Duration = Duration::from_secs(10);
+pub(crate) const SEND_WAIT: Duration = Duration::from_secs(10);
 
 static TRUST_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -263,7 +263,7 @@ fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf
     Some((path.to_path_buf(), text))
 }
 
-pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
+pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quiche::Config> {
     if roots.is_empty() {
         return None;
     }
@@ -277,6 +277,9 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
         .and_then(|mut config| {
             config.verify_peer(true);
             config.set_application_protos(&[ALPN]).ok()?;
+            if let Some(name) = cc {
+                config.set_cc_algorithm_name(name).ok()?;
+            }
             config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
             config.set_initial_max_data(MAX_DATA);
             config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
@@ -395,7 +398,8 @@ pub(crate) fn stream_recv_exact(
     let mut out = Vec::with_capacity(want);
     let mut chunk = [0u8; 8192];
     while out.len() < want {
-        match conn.stream_recv(stream, &mut chunk) {
+        let end = (want - out.len()).min(chunk.len());
+        match conn.stream_recv(stream, &mut chunk[..end]) {
             Ok((0, _)) | Err(quiche::Error::Done) => {
                 if conn.is_closed() || Instant::now() >= deadline {
                     return None;
@@ -468,7 +472,7 @@ pub(crate) fn handshake(
     let mut scid = [0u8; SCID_LEN];
     getrandom::getrandom(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
-    let mut config = quiche_config(roots)?;
+    let mut config = quiche_config(roots, None)?;
     let mut conn = quiche::connect(Some(server_name), &cid, local, peer, &mut config).ok()?;
     drive_handshake(&mut conn, sock, local)?;
     Some(conn)
@@ -1083,8 +1087,8 @@ mod tests {
 
     #[test]
     fn config_refuses_without_trust() {
-        assert!(quiche_config(&[]).is_none());
-        assert!(quiche_config(&[vec![0u8; 16]]).is_none());
+        assert!(quiche_config(&[], None).is_none());
+        assert!(quiche_config(&[vec![0u8; 16]], None).is_none());
     }
 
     #[test]
@@ -1093,6 +1097,8 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()]).expect("mints");
         let roots = parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
-        assert!(quiche_config(&roots).is_some());
+        assert!(quiche_config(&roots, None).is_some());
+        assert!(quiche_config(&roots, Some("bbr")).is_some());
+        assert!(quiche_config(&roots, Some("no-such-cc")).is_none());
     }
 }

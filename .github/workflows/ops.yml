@@ -6,6 +6,9 @@ on:
       - 'crates/**'
       - 'scripts/count-ops.sh'
       - 'scripts/expected-ops.txt'
+      - 'scripts/method-ops.txt'
+      - 'scripts/method-counts.txt'
+      - 'docs/**'
       - '.github/workflows/ops.yml'
   workflow_dispatch:
 
@@ -31,3 +34,20 @@ jobs:
         env:
           RUSTFLAGS: -C debuginfo=line-tables-only
         run: ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
+      - name: report the per-method counts, never red
+        env:
+          RUSTFLAGS: -C debuginfo=line-tables-only
+        run: |
+          {
+            echo '# per-method retired instructions, informational'
+            while read -r doc filter symbol; do
+              case "$doc" in ''|'#'*) continue ;; esac
+              printf '\n## %s -- %s\n' "$doc" "$symbol"
+              ./scripts/count-ops.sh report "$filter" "$symbol" < /dev/null || echo "not found: $symbol"
+            done < scripts/method-ops.txt
+          } | tee target/method-ops.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: method-ops
+          path: target/method-ops.md
+          if-no-files-found: error

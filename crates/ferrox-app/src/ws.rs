@@ -104,15 +104,27 @@ struct Shared {
     closed: AtomicBool,
 }
 
+/// Bytes one socket read asks for. A frame header and its payload come out of
+/// one syscall between them, and a read that lands mid-frame is finished by
+/// the next one rather than by a fresh syscall per header field.
+const READ_AHEAD: usize = 32 * 1024;
+
 #[derive(Debug)]
-pub(crate) struct WsReader {
-    read: TcpStream,
+pub(crate) struct WsReader<R: Read = TcpStream> {
+    read: R,
     shared: Arc<Shared>,
-    backlog: Vec<u8>,
-    bat: usize,
+    /// Socket bytes this reader has taken but not yet parsed or delivered.
+    have: Vec<u8>,
+    /// Cursor into `have`; `have[at..]` is what is left.
+    at: usize,
+    /// End of the message being delivered, so a small `read` returns part of
+    /// it and the rest is still there.
+    msg_end: usize,
     early: Vec<u8>,
     eat: usize,
     eof: bool,
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the syscall gate"))]
+    reads: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -121,109 +133,129 @@ pub(crate) struct WsWriter {
     masked: bool,
 }
 
-impl WsReader {
-    fn frame_head(&mut self) -> Option<(bool, u8, usize, Option<[u8; 4]>)> {
-        let mut head = [0u8; 2];
-        crate::proxy::read_exact(&mut self.read, &mut head).ok()?;
-        let fin = head[0] & 0x80 != 0;
-        let opcode = head[0] & 0x0F;
-        let masked = head[1] & 0x80 != 0;
-        let marker = usize::from(head[1] & 0x7F);
-        let ext_len = if marker == 126 {
-            2
-        } else if marker == 127 {
-            8
-        } else {
-            0
-        };
-        let mut rest = [0u8; 12];
-        let rest_len = ext_len + if masked { 4 } else { 0 };
-        crate::proxy::read_exact(&mut self.read, &mut rest[..rest_len]).ok()?;
-        let mut len = marker;
-        if marker == 126 {
-            len = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
-        } else if marker == 127 {
-            len = usize::try_from(u64::from_be_bytes(rest[..8].try_into().ok()?)).ok()?;
+impl<R: Read> WsReader<R> {
+    /// At least `len` unparsed bytes, or false once the socket is done.
+    fn need(&mut self, len: usize) -> bool {
+        while self.have.len() - self.at < len {
+            if self.eof || !self.pull(len) {
+                return false;
+            }
         }
-        if len > FRAME_LIMIT {
-            return None;
-        }
-        if opcode & 0x08 != 0 && (len > 125 || !fin) {
-            return None;
-        }
-        let mask = if masked {
-            let mut mask = [0u8; 4];
-            mask.copy_from_slice(&rest[ext_len..ext_len + 4]);
-            Some(mask)
-        } else {
-            None
-        };
-        Some((fin, opcode, len, mask))
+        true
     }
 
-    fn data_into(&mut self, len: usize, mask: Option<[u8; 4]>) -> Option<()> {
-        if len == 0 {
-            return Some(());
+    /// One syscall. The buffer grows only when one frame needs more room than
+    /// the window holds; a frame is unmasked in place, never copied aside.
+    /// False means the socket is finished.
+    fn pull(&mut self, len: usize) -> bool {
+        if self.at > 0 {
+            self.have.copy_within(self.at.., 0);
+            self.have.truncate(self.have.len() - self.at);
+            self.msg_end = self.msg_end.saturating_sub(self.at);
+            self.at = 0;
         }
-        self.backlog.reserve(len);
-        let base = self.backlog.len();
+        let room = READ_AHEAD.max(len);
+        if self.have.capacity() - self.have.len() < room {
+            self.have.reserve_exact(room);
+        }
+        let base = self.have.len();
         unsafe {
-            self.backlog.set_len(base + len);
+            self.have.set_len(base + room);
         }
-        if crate::proxy::read_exact(&mut self.read, &mut self.backlog[base..]).is_err() {
-            self.backlog.truncate(base);
-            return None;
-        }
-        if let Some(mask) = mask {
-            apply_mask(&mut self.backlog[base..], mask);
-        }
-        Some(())
+        let taken = match self.read.read(&mut self.have[base..]) {
+            Ok(0) | Err(_) => {
+                self.have.truncate(base);
+                self.eof = true;
+                0
+            }
+            Ok(n) => n,
+        };
+        self.reads += 1;
+        self.have.truncate(base + taken);
+        taken > 0
     }
 
-    fn message(&mut self) -> Option<usize> {
-        let base = self.backlog.len();
+    /// Parse frames until one message ends. Control frames are answered on the
+    /// spot; a data or continuation frame is unmasked where it lies.
+    fn message(&mut self) -> bool {
         let mut open = false;
         loop {
-            let (fin, opcode, len, mask) = self.frame_head()?;
+            if !self.need(2) {
+                return false;
+            }
+            let head = [self.have[self.at], self.have[self.at + 1]];
+            self.at += 2;
+            let fin = head[0] & 0x80 != 0;
+            let opcode = head[0] & 0x0F;
+            let masked = head[1] & 0x80 != 0;
+            let marker = usize::from(head[1] & 0x7F);
+            let ext_len = if marker == 126 {
+                2
+            } else if marker == 127 {
+                8
+            } else {
+                0
+            };
+            let rest = ext_len + usize::from(masked) * 4;
+            if !self.need(rest) {
+                return false;
+            }
+            let mut len = marker;
+            if marker == 126 {
+                let at = self.at;
+                len = usize::from(u16::from_be_bytes([self.have[at], self.have[at + 1]]));
+            } else if marker == 127 {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(&self.have[self.at..self.at + 8]);
+                let Ok(wide) = usize::try_from(u64::from_be_bytes(raw)) else {
+                    return false;
+                };
+                len = wide;
+            }
+            if len > FRAME_LIMIT || (opcode & 0x08 != 0 && (len > 125 || !fin)) {
+                return false;
+            }
+            let mask = if masked {
+                let at = self.at + ext_len;
+                let mask = [
+                    self.have[at],
+                    self.have[at + 1],
+                    self.have[at + 2],
+                    self.have[at + 3],
+                ];
+                Some(mask)
+            } else {
+                None
+            };
+            self.at += rest;
+            if !self.need(len) {
+                return false;
+            }
+            let start = self.at;
+            let payload = start..start + len;
+            self.at += len;
             match opcode {
                 OP_CLOSE => {
-                    let mut body = [0u8; 125];
-                    if len > 0 {
-                        crate::proxy::read_exact(&mut self.read, &mut body[..len]).ok()?;
-                    }
-                    self.reply(OP_CLOSE, &body[..len]);
-                    self.eof = true;
-                    self.backlog.truncate(base);
-                    return None;
+                    self.reply(OP_CLOSE, &self.have[payload]);
+                    return false;
                 }
-                OP_PING => {
-                    let mut body = [0u8; 125];
-                    if len > 0 {
-                        crate::proxy::read_exact(&mut self.read, &mut body[..len]).ok()?;
-                    }
-                    self.reply(OP_PONG, &body[..len]);
-                }
-                OP_PONG => {
-                    let mut body = [0u8; 125];
-                    if len > 0 {
-                        crate::proxy::read_exact(&mut self.read, &mut body[..len]).ok()?;
-                    }
-                }
+                OP_PING => self.reply(OP_PONG, &self.have[payload]),
+                OP_PONG => {}
                 OP_DATA | OP_CONT => {
-                    let continues = opcode == OP_CONT;
-                    if continues && !open || !continues && open {
-                        return None;
+                    if (opcode == OP_CONT) != open {
+                        return false;
+                    }
+                    if let Some(mask) = mask {
+                        apply_mask(&mut self.have[payload], mask);
+                    }
+                    if fin {
+                        self.msg_end = self.at;
+                        self.at = start;
+                        return true;
                     }
                     open = true;
-                    self.data_into(len, mask)?;
-                    if fin {
-                        return Some(self.backlog.len() - base);
-                    }
                 }
-                _ => {
-                    self.backlog.truncate(base);
-                    return None;
-                }
+                _ => return false,
             }
         }
     }
@@ -237,34 +269,41 @@ impl WsReader {
         };
         let _ = write_frame(&mut stream, false, opcode, payload);
     }
+
+    /// Read syscalls this reader has spent: the header is parsed out of the
+    /// window, so one read covers `READ_AHEAD` bytes however many frames that
+    /// is, not one read per frame header.
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> usize {
+        self.reads
+    }
 }
 
-impl Read for WsReader {
+impl<R: Read> Read for WsReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.eat < self.early.len() {
+            let n = (self.early.len() - self.eat).min(buf.len());
+            buf[..n].copy_from_slice(&self.early[self.eat..self.eat + n]);
+            self.eat += n;
+            return Ok(n);
+        }
         loop {
-            if self.eat < self.early.len() {
-                let n = (self.early.len() - self.eat).min(buf.len());
-                buf[..n].copy_from_slice(&self.early[self.eat..self.eat + n]);
-                self.eat += n;
+            if self.at < self.msg_end {
+                let n = (self.msg_end - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.have[self.at..self.at + n]);
+                self.at += n;
                 return Ok(n);
             }
-            if self.bat < self.backlog.len() {
-                let n = (self.backlog.len() - self.bat).min(buf.len());
-                buf[..n].copy_from_slice(&self.backlog[self.bat..self.bat + n]);
-                self.bat += n;
-                return Ok(n);
-            }
-            self.early.clear();
-            self.eat = 0;
-            self.backlog.clear();
-            self.bat = 0;
             if self.eof {
                 return Ok(0);
             }
-            if self.message().is_none() {
+            self.early.clear();
+            self.eat = 0;
+            if !self.message() {
+                self.eof = true;
                 return Ok(0);
             }
         }
@@ -424,11 +463,13 @@ fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsW
     let reader = WsReader {
         read,
         shared: Arc::clone(&shared),
-        backlog: Vec::new(),
-        bat: 0,
+        have: Vec::new(),
+        at: 0,
+        msg_end: 0,
         early,
         eat: 0,
         eof: false,
+        reads: 0,
     };
     Some((reader, WsWriter { shared, masked }))
 }
@@ -499,17 +540,87 @@ mod tests {
                 let mut reader = WsReader {
                     read: stream,
                     shared,
-                    backlog: Vec::new(),
-                    bat: 0,
+                    have: Vec::new(),
+                    at: 0,
+                    msg_end: 0,
                     early: Vec::new(),
                     eat: 0,
                     eof: false,
+                    reads: 0,
                 };
-                let n = reader.message().expect("reads");
-                assert_eq!(&reader.backlog[..n], &payload[..]);
+                let mut whole = Vec::new();
+                let mut buf = [0u8; 4096];
+                while whole.len() < payload.len() {
+                    let n = reader.read(&mut buf).expect("reads");
+                    assert!(n > 0, "len {len} masked {masked}: no progress");
+                    whole.extend_from_slice(&buf[..n]);
+                }
+                assert_eq!(whole, payload, "len {len} masked {masked}");
                 writer.join().expect("joins");
             }
         }
+    }
+
+    /// Over a fixed byte source a read returns everything it is asked for, so
+    /// the syscall count is exact rather than a race with a scheduler: the
+    /// header is parsed out of the window, and a read covers
+    /// `READ_AHEAD` bytes however many frames that is.
+    #[test]
+    fn a_read_covers_a_window_not_one_frame_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || listener.accept().expect("accepts").0);
+        let _spare = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let shared = Arc::new(Shared {
+            stream: Mutex::new(server.join().expect("joins")),
+            closed: AtomicBool::new(false),
+        });
+        let frames = 64usize;
+        let mut wire = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..frames {
+            let payload: Vec<u8> = (0..300 + i).map(|j| (j % 251) as u8).collect();
+            wire.push(0x80u8 | OP_DATA);
+            wire.push(126);
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(&payload);
+            expected.extend_from_slice(&payload);
+        }
+        assert!(wire.len() < READ_AHEAD, "the fixture must fit one window");
+        let mut reader = WsReader {
+            read: std::io::Cursor::new(wire),
+            shared,
+            have: Vec::new(),
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            reads: 0,
+        };
+        let mut whole = Vec::new();
+        let mut got = 0usize;
+        let mut buf = [0u8; 997];
+        while whole.len() < expected.len() {
+            let n = reader.read(&mut buf).expect("reads");
+            assert!(n > 0, "no progress at {got}");
+            got += n;
+            whole.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(
+            &whole[..expected.len()],
+            &expected[..],
+            "{frames} frames delivered whole, in order"
+        );
+        assert!(
+            whole.len() - expected.len() < 997 + 8,
+            "only a partial frame header is left over, not payload"
+        );
+        assert_eq!(
+            reader.reads(),
+            1,
+            "{frames} frames cost one read, not one per frame header"
+        );
     }
 
     #[test]
