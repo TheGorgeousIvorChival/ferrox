@@ -2,6 +2,17 @@ pub const DATA_SEGMENT_OVERHEAD: u32 = 18;
 
 pub const ACK_NUMBER_LIMIT: usize = 128;
 
+const ACK_HEADER: usize = 17;
+const CMD_HEADER: usize = 16;
+
+fn be16(buf: &[u8], at: usize) -> u16 {
+    u16::from_be_bytes([buf[at], buf[at + 1]])
+}
+
+fn be32(buf: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Ack,
@@ -38,33 +49,6 @@ impl SegmentOption {
     }
 }
 
-struct Cursor<'a> {
-    buf: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.buf.len() < n {
-            return None;
-        }
-        let (head, tail) = self.buf.split_at(n);
-        self.buf = tail;
-        Some(head)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataSegment {
     pub conv: u16,
@@ -87,24 +71,19 @@ impl DataSegment {
         if buf.len() < 15 {
             return None;
         }
-        let mut cur = Cursor { buf };
-        let timestamp = cur.u32()?;
-        let number = cur.u32()?;
-        let sending_next = cur.u32()?;
-        let data_len = cur.u16()? as usize;
-        let payload = cur.take(data_len)?;
+        let data_len = usize::from(be16(buf, 12));
         Some((
             Self {
                 conv,
                 option,
-                timestamp,
-                number,
-                sending_next,
-                payload: payload.to_vec(),
+                timestamp: be32(buf, 0),
+                number: be32(buf, 4),
+                sending_next: be32(buf, 8),
+                payload: buf.get(14..14 + data_len)?.to_vec(),
                 timeout: 0,
                 transmit: 0,
             },
-            cur.buf,
+            &buf[14 + data_len..],
         ))
     }
 
@@ -113,13 +92,15 @@ impl DataSegment {
     }
 
     pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.conv.to_be_bytes());
-        out.push(Command::Data.to_byte());
-        out.push(self.option.to_byte());
-        out.extend_from_slice(&self.timestamp.to_be_bytes());
-        out.extend_from_slice(&self.number.to_be_bytes());
-        out.extend_from_slice(&self.sending_next.to_be_bytes());
-        out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        let mut header = [0u8; DATA_SEGMENT_OVERHEAD as usize];
+        header[0..2].copy_from_slice(&self.conv.to_be_bytes());
+        header[2] = Command::Data.to_byte();
+        header[3] = self.option.to_byte();
+        header[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
+        header[8..12].copy_from_slice(&self.number.to_be_bytes());
+        header[12..16].copy_from_slice(&self.sending_next.to_be_bytes());
+        header[16..18].copy_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&header);
         out.extend_from_slice(&self.payload);
     }
 }
@@ -170,22 +151,23 @@ impl AckSegment {
     }
 
     pub(crate) fn byte_size(&self) -> usize {
-        17 + self.numbers.len() * 4
+        ACK_HEADER + self.numbers.len() * 4
     }
 
     fn parse(conv: u16, option: SegmentOption, buf: &[u8]) -> Option<(Self, &[u8])> {
         if buf.len() < 13 {
             return None;
         }
-        let mut cur = Cursor { buf };
-        let receiving_window = cur.u32()?;
-        let receiving_next = cur.u32()?;
-        let timestamp = cur.u32()?;
-        let count = cur.u8()? as usize;
-        let mut numbers = Vec::with_capacity(count);
-        for _ in 0..count {
-            numbers.push(cur.u32()?);
-        }
+        let receiving_window = be32(buf, 0);
+        let receiving_next = be32(buf, 4);
+        let timestamp = be32(buf, 8);
+        let count = usize::from(buf[12]);
+        let tail = buf.get(13..13 + count.checked_mul(4)?)?;
+        let (chunks, _) = tail.as_chunks::<4>();
+        let numbers: Vec<u32> = chunks
+            .iter()
+            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         Some((
             Self {
                 conv,
@@ -196,18 +178,21 @@ impl AckSegment {
                 numbers,
                 limit: ACK_NUMBER_LIMIT,
             },
-            cur.buf,
+            &buf[13 + count * 4..],
         ))
     }
 
     pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.conv.to_be_bytes());
-        out.push(Command::Ack.to_byte());
-        out.push(self.option.to_byte());
-        out.extend_from_slice(&self.receiving_window.to_be_bytes());
-        out.extend_from_slice(&self.receiving_next.to_be_bytes());
-        out.extend_from_slice(&self.timestamp.to_be_bytes());
-        out.push(self.numbers.len() as u8);
+        let mut header = [0u8; ACK_HEADER];
+        header[0..2].copy_from_slice(&self.conv.to_be_bytes());
+        header[2] = Command::Ack.to_byte();
+        header[3] = self.option.to_byte();
+        header[4..8].copy_from_slice(&self.receiving_window.to_be_bytes());
+        header[8..12].copy_from_slice(&self.receiving_next.to_be_bytes());
+        header[12..16].copy_from_slice(&self.timestamp.to_be_bytes());
+        header[16] = self.numbers.len() as u8;
+        out.extend_from_slice(&header);
+        out.reserve(self.numbers.len() * 4);
         for number in &self.numbers {
             out.extend_from_slice(&number.to_be_bytes());
         }
@@ -249,37 +234,33 @@ impl CmdOnlySegment {
     }
 
     pub(crate) fn byte_size() -> usize {
-        16
+        CMD_HEADER
     }
 
     fn parse(conv: u16, cmd: u8, option: SegmentOption, buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < 12 {
-            return None;
-        }
-        let mut cur = Cursor { buf };
-        let sending_next = cur.u32()?;
-        let receiving_next = cur.u32()?;
-        let peer_rto = cur.u32()?;
+        let body = buf.get(..12)?;
         Some((
             Self {
                 conv,
                 cmd,
                 option,
-                sending_next,
-                receiving_next,
-                peer_rto,
+                sending_next: be32(body, 0),
+                receiving_next: be32(body, 4),
+                peer_rto: be32(body, 8),
             },
-            cur.buf,
+            &body[12..],
         ))
     }
 
     pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.conv.to_be_bytes());
-        out.push(self.cmd);
-        out.push(self.option.to_byte());
-        out.extend_from_slice(&self.sending_next.to_be_bytes());
-        out.extend_from_slice(&self.receiving_next.to_be_bytes());
-        out.extend_from_slice(&self.peer_rto.to_be_bytes());
+        let mut header = [0u8; CMD_HEADER];
+        header[0..2].copy_from_slice(&self.conv.to_be_bytes());
+        header[2] = self.cmd;
+        header[3] = self.option.to_byte();
+        header[4..8].copy_from_slice(&self.sending_next.to_be_bytes());
+        header[8..12].copy_from_slice(&self.receiving_next.to_be_bytes());
+        header[12..16].copy_from_slice(&self.peer_rto.to_be_bytes());
+        out.extend_from_slice(&header);
     }
 }
 
@@ -437,6 +418,128 @@ mod tests {
         match seg {
             Segment::CmdOnly(c) => assert_eq!(c.cmd, 250),
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_data_segment_round_trips_at_every_length_and_offset() {
+        for len in 1..=64usize {
+            for tail_len in 0..=8usize {
+                let seg = DataSegment {
+                    conv: 0x0102,
+                    option: SegmentOption(0x7f),
+                    timestamp: 0x0a0b_0c0d,
+                    number: 0x1122_3344,
+                    sending_next: 0x5566_7788,
+                    payload: (0..len as u8).collect(),
+                    timeout: 0,
+                    transmit: 0,
+                };
+                let trailer: Vec<u8> = (0..tail_len as u8).collect();
+                let mut buf = Vec::new();
+                Segment::Data(seg.clone()).serialize(&mut buf);
+                buf.extend_from_slice(&trailer);
+                assert_eq!(buf.len(), DATA_SEGMENT_OVERHEAD as usize + len + tail_len);
+                let (got, rest) = read_segment(&buf).expect("parses");
+                assert_eq!(got, Segment::Data(seg));
+                assert_eq!(rest, trailer);
+            }
+        }
+    }
+
+    #[test]
+    fn a_data_segment_claiming_more_than_it_carries_is_refused() {
+        let mut raw = vec![0, 1, 1, 0];
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        raw.extend_from_slice(&2u32.to_be_bytes());
+        raw.extend_from_slice(&3u32.to_be_bytes());
+        raw.extend_from_slice(&9u16.to_be_bytes());
+        raw.extend_from_slice(b"short");
+        assert!(read_segment(&raw).is_none());
+    }
+
+    #[test]
+    fn two_segments_in_one_datagram_split_at_the_second() {
+        let first = DataSegment {
+            conv: 3,
+            option: SegmentOption::NONE,
+            timestamp: 1,
+            number: 0,
+            sending_next: 0,
+            payload: b"first".to_vec(),
+            timeout: 0,
+            transmit: 0,
+        };
+        let second = CmdOnlySegment {
+            conv: 3,
+            cmd: Command::Terminate.to_byte(),
+            option: SegmentOption::CLOSE,
+            sending_next: 7,
+            receiving_next: 8,
+            peer_rto: 9,
+        };
+        let mut buf = Vec::new();
+        Segment::Data(first.clone()).serialize(&mut buf);
+        Segment::CmdOnly(second).serialize(&mut buf);
+        assert_eq!(buf.len(), 23 + CMD_HEADER);
+        let (got, rest) = read_segment(&buf).expect("first parses");
+        assert_eq!(got, Segment::Data(first));
+        let (got, rest) = read_segment(rest).expect("second parses");
+        assert!(matches!(got, Segment::CmdOnly(_)));
+        assert_eq!(rest.len(), 0);
+    }
+
+    #[test]
+    fn a_cmd_only_segment_round_trips_at_every_command_byte() {
+        for cmd in 2..=255u8 {
+            let seg = CmdOnlySegment {
+                conv: 0xbeef,
+                cmd,
+                option: SegmentOption(0xa5),
+                sending_next: 0xdead_beef,
+                receiving_next: 0x0bad_f00d,
+                peer_rto: 12_500,
+            };
+            let mut buf = Vec::new();
+            Segment::CmdOnly(seg).serialize(&mut buf);
+            assert_eq!(buf.len(), CMD_HEADER);
+            let (got, rest) = read_segment(&buf).expect("parses");
+            assert_eq!(got, Segment::CmdOnly(seg));
+            assert_eq!(rest.len(), 0);
+        }
+    }
+
+    #[test]
+    fn a_command_zero_or_one_reads_back_as_an_ack_or_a_data_segment() {
+        for cmd in [0u8, 1u8] {
+            let mut buf = vec![0xbe, 0xef, cmd, 0xa5];
+            buf.extend_from_slice(&[0u8; CMD_HEADER]);
+            let (got, _) = read_segment(&buf).expect("parses");
+            match (cmd, got) {
+                (0, Segment::Ack(a)) => assert_eq!((a.conv, a.option.0), (0xbeef, 0xa5)),
+                (1, Segment::Data(d)) => assert_eq!((d.conv, d.option.0), (0xbeef, 0xa5)),
+                _ => panic!("command {cmd} read back as the wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_ack_segment_round_trips_at_every_count() {
+        for count in 0..=255usize {
+            let mut seg = AckSegment::new(ACK_NUMBER_LIMIT);
+            seg.conv = 0x0102;
+            seg.receiving_window = u32::MAX;
+            seg.receiving_next = 7;
+            seg.put_timestamp(4242);
+            for n in 0..count as u32 {
+                seg.put_number(n.wrapping_mul(0x0101_0101));
+            }
+            let mut buf = Vec::new();
+            Segment::Ack(seg.clone()).serialize(&mut buf);
+            assert_eq!(buf.len(), ACK_HEADER + count * 4);
+            let (got, rest) = read_segment(&buf).expect("parses");
+            assert_eq!(got, Segment::Ack(seg));
+            assert_eq!(rest.len(), 0);
         }
     }
 
