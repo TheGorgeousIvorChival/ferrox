@@ -125,31 +125,5 @@ for name in zeronet xray-rust; do
   fi
 done
 
-sing_rev="$(pin_field sing-box 3)"
-sing_repo="$(pin_field sing-box 2)"
-{
-  echo "## sing-box @ \`${sing_rev:0:7}\`: no seam, not runnable against ferrox-app"
-  echo
-} >>"$report"
-sdir="$(mktemp -d)"
-if git clone --quiet --no-checkout "$sing_repo" "$sdir" 2>/dev/null && git -C "$sdir" checkout --quiet "$sing_rev" 2>/dev/null && [[ "$(git -C "$sdir" rev-parse HEAD)" == "$sing_rev" ]]; then
-  proto_tests="$(find "$sdir/protocol/shadowsocks" "$sdir/protocol/vless" -name '*_test.go' 2>/dev/null | wc -l | tr -d ' ')"
-  env_files="$(git -C "$sdir" grep -lI -e 'os.Getenv' -- test/ 2>/dev/null | tr '\n' ' ')"
-  images="$(git -C "$sdir" grep -hI -e 'Image.*= ".*:latest"' -- test/clash_test.go 2>/dev/null | tr '\n' ' ')"
-  vless_tests="$(find "$sdir/test" -maxdepth 1 -name 'vless*' 2>/dev/null | wc -l | tr -d ' ')"
-  {
-    echo "Checked at the pin: $proto_tests _test.go files under protocol/shadowsocks and protocol/vless; test/ reads the environment in 2 files only ($env_files), neither naming a proxy binary (openconnect interop flag, DOCKER_HOST); the cross-implementation peers are hardcoded docker images ($images); vless test files: $vless_tests."
-    echo
-    echo "No seam: every peer is built in-process or pulled by image name, so no Ferrox binary can be injected without editing their tests, which never happens here. Unblocked by an upstream env override for the peer image, not by a rung here."
-    echo
-  } >>"$report"
-else
-  {
-    echo "Pin did not resolve for a live check; verdict carried from the last green run: no seam, in-process Go tests only."
-    echo
-  } >>"$report"
-fi
-rm -rf "$sdir"
-
 cat "$report"
 exit 0
