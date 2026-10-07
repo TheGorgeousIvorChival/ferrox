@@ -299,6 +299,21 @@ Reading copies for the lanes: WARP, Tailscale UX, detour shapes, DPI parameters,
 | 106 | VLESS `flow`/`encryption` grammar + XHTTP full params (modes, padding, placements, `xmux`) | planned | LxBox 016 (`xhttp-params.md`, task 127F); ZeroNet `xhttp.rs` + `xhttp_request.rs` (stream-one/stream-up/packet-up). Tree: one xhttp mode (row 9), one flow (row 35 is the gap). |
 | 107 | Config template + contract registry (typed vars, schemas, build gate) | planned | LxBox features 024/025 (`build_config.dart`, `contract/registry/protocols/*.json`). |
 
+### M — SlipNet tunnel types (learned from anonvector/SlipNet, not pinned)
+
+Android VPN client (Kotlin + Go CLI) whose tunnel table is DNS-first: three KCP + Noise DNS transports, QUIC Slipstream, SSH everywhere as a chaining layer, NaiveProxy, a DNS-only DoH mode, and Tor — with a built-in DNS scanner. Searched this machine and this tree first: no local copy exists, nothing was pinned or cloned; the rows below are read off its README Tunnel Types + Features and its submodule list (`dnstt`, `dnstt-mobile`, `noizdns`, `vaydns`, `vaydns-mobile`, `lyrebird`, `meek-mobile`, `snowflake-mobile`).
+
+| # | method | state | supported today by |
+| --- | --- | --- | --- |
+| 108 | DNSTT (KCP + Noise DNS tunneling, the default) | planned | SlipNet (`dnstt`, `dnstt-mobile` submodules). Zero `dnstt` in `crates/`. |
+| 109 | NoizDNS (DPI-resistant DNS tunneling, stealth mode) | planned | SlipNet (`noizdns` submodule). Zero `noizdns` in `crates/`. |
+| 110 | VayDNS (configurable wire format: QNAME lengths, record types, rate limiting) | planned | SlipNet (`vaydns`, `vaydns-mobile` submodules). Zero `vaydns` in `crates/`. |
+| 111 | `+ SSH` chaining over any tunnel (zero DNS leaks) | planned | SlipNet tunnel table (DNSTT/NoizDNS/VayDNS/Slipstream/NaiveProxy each ship a `+ SSH` variant). Standalone SSH is row 91; the Slipstream carrier is row 58 — chaining one through the other exists nowhere in tree. |
+| 112 | SSH over TLS (custom SNI, domain fronting) / over ws-wss (CDN proxying) / over HTTP CONNECT (custom Host) | planned | SlipNet features. Zero `ssh` in `crates/`, so no SSH dialects either. |
+| 113 | SSH payload injection (raw bytes before the handshake) + cipher selection (AES-128-GCM/ChaCha20/AES-128-CTR) | planned | SlipNet features. |
+| 114 | DoH lane (DNS-only encryption per RFC 8484, no tunnel) | planned | SlipNet (`DOH` tunnel type). Row 80 is the resolver; this row is the DNS-only lane. |
+| 115 | DNS server scanner (EDNS probing, NXDOMAIN-hijack detection, country-range scan) | planned | SlipNet (built-in DNS scanner). Row 84 scans subnets/proxies; this row scans resolvers. |
+
 ### Conformance, per row
 
 The oracle names live in `upstream/pins.toml`, and `scripts/run-upstream-suite.sh` is the checker: it builds the named binary, refuses a pin whose rev does not read the seam it claims, injects the binary through that seam and rejects a green run that executed no test. Two pins are enabled — `zeronet` (8 named `xray_oracle` tests, seam `ZRAY_XRAY_BINARY`) and `xray-rust` (7 named `local_xray_interop_tests`, seam `XRAY_VLESS_FULL_BINARY`); the other eleven print `SKIPPED` with the rung that would enable them. Those suites are run in CI only.
@@ -309,7 +324,7 @@ Thirteen upstream pins, all resolving, all re-derivable by `scripts/fetch-upstre
 `zeronet` (`97a99734`, `crates/`), `mqvpn` (`078845ce`), `aether` (`6175b67d`),
 `zeptun` (`1bf81313`), `slipstream` (`397850b1`), `quiche` (`96e7dd51`, `quiche/`, `master`),
 `lxbox` (`15e4fcb8`, `app/`).
-Read but not pinned: `WhiteDNS/CottenDNS`, `masterking32/MasterDnsVPN`, `mlmvpn/mlmvpn_android`, local `configer`.
+Read but not pinned: `WhiteDNS/CottenDNS`, `masterking32/MasterDnsVPN`, `mlmvpn/mlmvpn_android`, `anonvector/SlipNet`, local `configer`.
 
 ## Layout
 
