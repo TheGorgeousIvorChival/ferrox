@@ -11,7 +11,9 @@ chunk length we claim until after it has opened the length itself.
 
 The AEAD sits on [`ferrox-core`'s own ChaCha20-Poly1305](../../crates/ferrox-core/src/aead.rs)
 and, for `aes-128-gcm`/`aes-256-gcm`, on [our AES-GCM ladder](../../crates/ferrox-core/src/aesgcm/mod.rs).
-Neither takes a pointer to a scratch buffer: `seal_into` writes the plaintext
+`xchacha20-ietf-poly1305` derives a per-chunk subkey with HChaCha from the first
+sixteen extended-nonce bytes and seals with the same IETF AEAD over an inner
+nonce of four zero bytes plus the last eight. Neither takes a pointer to a scratch buffer: `seal_into` writes the plaintext
 into the caller's buffer and encrypts it where it lies.
 
 ## Data path
@@ -69,7 +71,7 @@ the diff that moved it, never copying a measurement to silence a gate.
 
 **Not measured on this branch.** Wall clock for this method comes from
 `ferrox-bench` gate 9 (`crates/ferrox-bench/src/ciphers.rs`), which seals the
-same chunk lengths with the same three methods and compares bytes and
+same chunk lengths with the same four methods and compares bytes and
 allocation counts against the pinned reference. `.github/workflows/bench.yml`
 runs it on `linux x86_64`, `linux aarch64`, `macos aarch64` and
 `windows x86_64` and publishes `target/bench-report.md` as an artefact. No
@@ -112,6 +114,18 @@ Read against the three pinned implementations, all of which are in
   `size + TAG_LEN > chunk.len()`, which for the one buffer size this method
   allocates is exactly the `size > MAX_CHUNK` check it replaced, without
   needing a second constant to stay honest.
+- **A second vector path for the extended nonce.** HChaCha runs once per chunk
+  as scalar integer math in `chacha::hchacha`; the payload still goes through
+  the same AVX2/NEON/portable `Lanes` ladder as every other ChaCha chunk, so
+  no second transpose and no second store exist. The subkey and the inner nonce
+  live on the stack, and the method dispatch is one `match` on `Aead`, hoisted
+  out of the per-byte loop rather than a string compare per chunk.
+
+What is **not** removed, and is named rather than claimed: `2022-blake3-aes-128-gcm`,
+`2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-poly1305` and `rc4-md5` still
+parse to `None` and are refused by name (`a_method_outside_the_rung_is_refused`
+is the gate); the 2022 family needs a BLAKE3 key schedule this tree does not
+carry, and `rc4-md5` stays refused because it is broken rather than missing.
 
 ## Pins
 
@@ -120,4 +134,6 @@ Read against the three pinned implementations, all of which are in
 | AEAD chunking | `upstream/xray-core/common/crypto/auth.go`, `chunk.go` |
 | AEAD chunking, delegated out of tree | `upstream/sing-box/protocol/shadowsocks/outbound.go` |
 | AEAD chunking | `upstream/zeronet/crates/zero-protocol/src/shadowsocks.rs` |
+| XChaCha AEAD, 32-byte salt | `upstream/xray-core/proxy/shadowsocks/config.go` |
+| XChaCha spellings | `upstream/sing-box/option/shadowsocks.go` |
 | method spellings, MD5 chain, HKDF info string | `ferrox-core-shadowsocks` |

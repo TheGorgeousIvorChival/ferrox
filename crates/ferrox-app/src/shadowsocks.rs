@@ -522,7 +522,7 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
 mod tests {
     use super::*;
 
-    fn methods() -> [(&'static str, Method); 8] {
+    fn methods() -> [(&'static str, Method); 10] {
         [
             ("aes-128-gcm", Method::Aes128Gcm),
             ("aead_aes_128_gcm", Method::Aes128Gcm),
@@ -531,6 +531,8 @@ mod tests {
             ("chacha20-ietf-poly1305", Method::Chacha20Poly1305),
             ("aead_chacha20_poly1305", Method::Chacha20Poly1305),
             ("chacha20-poly1305", Method::Chacha20Poly1305),
+            ("xchacha20-ietf-poly1305", Method::XChacha20Poly1305),
+            ("aead_xchacha20_poly1305", Method::XChacha20Poly1305),
             ("AES-256-GCM", Method::Aes256Gcm),
         ]
     }
@@ -592,8 +594,9 @@ mod tests {
     fn a_method_outside_the_rung_is_refused() {
         for name in [
             "aes-192-gcm",
-            "xchacha20-ietf-poly1305",
+            "2022-blake3-aes-128-gcm",
             "2022-blake3-aes-256-gcm",
+            "2022-blake3-chacha20-poly1305",
             "rc4-md5",
             "none",
             "",
