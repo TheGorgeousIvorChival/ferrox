@@ -207,11 +207,11 @@ fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     }
 }
 
-// The rung a dial starts at: the ladder's, never above the configured one.
+// The rung a dial starts at: the configured carrier, or the ladder's when it has climbed past it.
 fn ladder_start(ladder: &Ladder, carrier: &Carrier) -> Rung {
     let start = ladder.start_rung();
     match rung_of(carrier) {
-        Some(configured) if start > configured => configured,
+        Some(configured) if start < configured => configured,
         _ => start,
     }
 }
@@ -9797,7 +9797,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ladder_climbs_from_raw_to_ws_and_relays() {
+    fn the_ladder_climbs_past_the_configured_rung_and_relays() {
         let server = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
@@ -9806,18 +9806,18 @@ mod tests {
                 let Ok(stream) = stream else { continue };
                 thread::spawn(move || {
                     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-                    let mut head = [0u8; 4];
+                    let mut head = [0u8; 5];
                     loop {
                         match stream.peek(&mut head) {
-                            Ok(4) => break,
+                            Ok(5) => break,
                             Ok(_) => thread::sleep(Duration::from_millis(1)),
                             Err(_) => return,
                         }
                     }
-                    if head != *b"GET " {
+                    if head != *b"POST " {
                         return;
                     }
-                    let Some((mut reader, writer)) = crate::ws::accept(stream, "/ladder") else {
+                    let Some((mut reader, writer)) = crate::xhttp::accept(stream, "/ladder") else {
                         return;
                     };
                     let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
@@ -9872,11 +9872,12 @@ mod tests {
         let mut back = [0u8; 12];
         client.read_exact(&mut back).expect("reads");
         assert_eq!(&back, b"hello-ladder");
-        assert_eq!(ladder.current(), Rung::Ws);
+        assert_eq!(ladder.current(), Rung::Xhttp);
         assert_eq!(ladder.climbs(), 1);
-        assert_eq!(ladder.attempts(Rung::Raw), 1);
         assert_eq!(ladder.attempts(Rung::Ws), 1);
-        assert_eq!(ladder.useful(Rung::Ws), 1);
+        assert_eq!(ladder.attempts(Rung::Xhttp), 1);
+        assert_eq!(ladder.useful(Rung::Xhttp), 1);
+        assert_eq!(ladder.useful(Rung::Ws), 0);
     }
 
     const QUIC_TEST_TIMEOUT: Duration = Duration::from_secs(120);
