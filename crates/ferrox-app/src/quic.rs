@@ -431,19 +431,20 @@ pub(crate) fn stream_recv_exact(
 pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(address)?;
     #[cfg(target_os = "linux")]
-    if let Ok(raw) = std::os::fd::AsRawFd::as_raw_fd(&sock) {
+    {
+        use std::os::fd::AsRawFd as _;
         let off: libc::c_int = 0;
         // SAFETY: `off` outlives the call, and the size is its own.
-        unsafe {
+        let _ = unsafe {
             libc::setsockopt(
-                raw,
+                sock.as_raw_fd(),
                 libc::SOL_UDP,
                 libc::UDP_GRO,
                 std::ptr::addr_of!(off).cast(),
                 libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
                     .unwrap_or(libc::socklen_t::MAX),
             );
-        }
+        };
     }
     Ok(sock)
 }
