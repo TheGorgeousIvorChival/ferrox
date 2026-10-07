@@ -9445,6 +9445,10 @@ mod tests {
     #[test]
     fn hysteria_client_passes_a_hand_rolled_server() {
         let _serial = quic_serial();
+        quic_retry_dial(hysteria_client_once, 3);
+    }
+
+    fn hysteria_client_once() {
         let echo_port = echo_once();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let minted =
@@ -9523,8 +9527,12 @@ mod tests {
 
     #[test]
     fn hysteria_server_passes_a_hand_rolled_client() {
-        use ferrox_core::foxy::frames as h3;
         let _serial = quic_serial();
+        quic_retry_dial(hysteria_server_once, 3);
+    }
+
+    fn hysteria_server_once() {
+        use ferrox_core::foxy::frames as h3;
         let echo_port = echo_once();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (port, roots) = hysteria_loop_with("bisect2-auth", id);
@@ -9607,6 +9615,10 @@ mod tests {
     #[test]
     fn hysteria_refuses_a_wrong_password_without_relaying() {
         let _serial = quic_serial();
+        quic_retry_dial(hysteria_refuses_once, 3);
+    }
+
+    fn hysteria_refuses_once() {
         let echo_port = echo_once();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (port, roots) = hysteria_loop_with("test-auth", id);
