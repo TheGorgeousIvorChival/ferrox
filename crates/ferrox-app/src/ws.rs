@@ -16,44 +16,18 @@ const OP_PING: u8 = 0x09;
 const OP_PONG: u8 = 0x0A;
 const CLOSE_BODY: [u8; 2] = [0x03, 0xE8];
 
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let mut word = 0u32;
-        for &byte in chunk {
-            word = (word << 8) | u32::from(byte);
-        }
-        word <<= 8 * (3 - chunk.len());
-        out.push(ALPHABET[(word >> 18 & 0x3F) as usize] as char);
-        out.push(ALPHABET[(word >> 12 & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(word >> 6 & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(word & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 fn accept_key(key: &str) -> String {
     use sha1::Digest as _;
     let mut hash = sha1::Sha1::new();
     hash.update(key.trim().as_bytes());
     hash.update(GUID.as_bytes());
-    b64_encode(&hash.finalize())
+    ferrox_core::b64::encode(&hash.finalize())
 }
 
 fn fresh_key() -> Option<String> {
     let mut raw = [0u8; 16];
     getrandom::getrandom(&mut raw).ok()?;
-    Some(b64_encode(&raw))
+    Some(ferrox_core::b64::encode(&raw))
 }
 
 fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {

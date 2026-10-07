@@ -21,19 +21,6 @@ fn bare_path(target: &str) -> &str {
     target.split_once('?').map_or(target, |(base, _)| base)
 }
 
-fn header_value(head: &[u8], name: &str) -> Option<String> {
-    let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text.split("\r\n");
-    lines.next()?;
-    for line in lines {
-        let (key, value) = line.split_once(':')?;
-        if key.trim().eq_ignore_ascii_case(name) {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
-}
-
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut head = Vec::with_capacity(512);
     let mut probe = [0u8; 512];
@@ -275,7 +262,7 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, Xhtt
     if !path_covers(path, bare_path(target)) {
         return None;
     }
-    let chunked = header_value(&head, "transfer-encoding")
+    let chunked = crate::proxy::header_value(&head, "transfer-encoding")
         .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
     if !chunked {
         return None;
@@ -299,7 +286,7 @@ pub(crate) fn connect(
     if text.split("\r\n").next()? != "HTTP/1.1 200 OK" {
         return None;
     }
-    if !header_value(&head, "transfer-encoding")
+    if !crate::proxy::header_value(&head, "transfer-encoding")
         .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
     {
         return None;
