@@ -117,7 +117,7 @@ They are not the same, and where they differ the table says so. `Support::Planne
 
 Every implemented row links to its page: the counts, the data-path graph, and
 what was removed against the pinned implementations live there, not here.
-This table is the verdict; the page is the evidence. Rows 1–22 are the share-link world; rows 61–77 are the xray-core config surface the tree must also read — same columns, same honesty.
+This table is the verdict; the page is the evidence. Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surface the tree must also read — same columns, same honesty.
 
 | # | method | link | binary | page | notes |
 | --- | --- | --- | --- | --- | --- |
@@ -143,52 +143,52 @@ This table is the verdict; the page is the evidence. Rows 1–22 are the share-l
 | 20 | MASQUE CONNECT-IP (RFC 9484) | planned — *"parses, dial needs a QUIC stack"* | refused | [carrier-quic](docs/function/carrier-quic.md) | Name only: `TransportKind::Masque`, `Carrier::Masque`. quiche is pinned as the default stack for this rung when it lands. |
 | 21 | TUIC / AnyTLS / ShadowTLS / Snell / Naive / SSH / OpenConnect / OpenVPN | parse to `TransportKind::Other` — *"unknown type: parses, transport not scheduled"* | refused | — | Zero occurrences in `crates/`. They are refused by falling into `Other`, not by a hand-written list, so there is no per-protocol reason string to quote for them. |
 | 22 | Mux / XUDP / `multi` | — | implemented, **raw carrier only** | [mux-cool](docs/function/mux-cool.md) | The codec is complete — `Status`/`Network`/`Target`/`Outgoing`/`Incoming`, `global_id`, `CHUNK_MAX` (`mux.rs`) — and it is wired in both roles when `mux.enabled` is true. XUDP rides the mux: a `Network::Udp` target opens a UDP socket keyed by the frame's `global_id`, datagrams arrive as `Keep` frames carrying their own destination, and replies return as `Keep` frames carrying their source. The client sends one XUDP session per SOCKS association instead of dialling a carrier per destination. Both roles encode the mux request the way upstream does — command 3, no address (`vless_mux_header`) — so a real Xray peer agrees on the wire; `KeepAlive` is a no-op and the cap is `DEFAULT_CAP` 8 sessions. |
-| 61 | HTTP proxy, both roles | — (config-driven) | refused | — | Planned. Xray `proxy/http/` both roles; sing-box `protocol/http/` in+out. No plain HTTP CONNECT lane in tree — the foxy CONNECT (`proxy.rs:3514`) is account-bound. |
-| 62 | dokodemo-door transparent inbound | — (config-driven) | refused | — | Planned. Xray `proxy/dokodemo/`, TCP+UDP. Zero occurrences in `crates/`. |
-| 63 | blackhole sink outbound | — (config-driven) | refused | — | Planned. Xray `proxy/blackhole/`; sing-box `protocol/block/`. The only sink-shaped outbound in tree is `Freedom` (`proxy.rs:247`). |
-| 64 | DNS outbound | — (config-driven) | refused | — | Planned. Xray `proxy/dns/` + `app/dns/` (UDP/TCP/DoH/QUIC/FakeDNS); sing-box `protocol/dns/`; ZeroNet `zero-dns` (UDP/TCP/DoT/DoH/DoH2/DoH3/DoQ). No `dns` protocol in `proxy.rs`. |
-| 65 | loopback re-inject inbound | — (config-driven) | refused | — | Planned. Xray `proxy/loopback/`. `loopback` in tree means loopback test sockets only. |
-| 66 | Shadowsocks-2022 ciphers | — (config-driven) | refused by name (row 7) | [shadowsocks](docs/function/shadowsocks.md) | Planned. Xray `proxy/shadowsocks_2022/`; ZeroNet `shadowsocks2022.rs` (`2022-blake3-*`, TCP-only like ours). |
-| 67 | TUN inbound (native) | — (config-driven) | refused | — | Planned. Xray `proxy/tun/`; sing-box `protocol/tun/` + `transport/device/`; ZeroNet `zero-tun`. Row 41 is the tun2socks translator; this row is the native inbound. |
-| 68 | Unix domain sockets | — (config-driven) | refused | — | Planned. Xray `transport/internet/system_listener.go:46-75` Unix wrappers. Tree binds TCP only (`unix` hits are `UNIX_EPOCH` clocks). |
-| 69 | finalmask post-TLS mask chain | — (config-driven) | refused | — | Planned. Xray `transport/internet/finalmask/` (`fragment`/`noise`/`salamander`/`realm`/…). Zero occurrences in `crates/`. |
-| 70 | xdrive cloud-drive carrier | — (config-driven) | refused | — | Name only: `TransportKind::Xdrive`, `Carrier::Xdrive` (`refused_carriers!`, `proxy.rs:284`). Xray `transport/internet/xdrive/` polls Drive remotes. |
-| 71 | native HTTP/H2/H3 transport | — (config-driven) | refused | — | `TransportKind::Http` parses (`transport.rs:47`), never dialled (`is_dialled`, `transport.rs:56`). Even Xray refuses these now — `transport_internet.go` maps `h2`/`h3`/`http` to a removed-feature error pointing at XHTTP. |
-| 72 | VLESS `encryption=mlkem768x25519plus` | — | refused | — | Planned. ZeroNet `vless_encryption.rs` (`native`/`xorpub`/`random` x `1rtt`/`0rtt`); LxBox passes it through (task 335); sing-box-lx SPEC 032. The tree's only ML-KEM is the REALITY hybrid key-share group (`reality.rs:10`). |
-| 73 | `flow=xtls-rprx-vision-udp443` | — | refused | — | Planned. Xray accepts it outbound (`infra/conf/vless.go:329-334`); the tree knows only `xtls-rprx-vision`. |
-| 74 | REALITY client | planned — *"server rung landed, client unwired"* | refused | — | Server role complete (row 1); an outbound is accepted only with empty/`none` security (`proxy.rs:4262`). ZeroNet `reality.rs` (`reality_connect`) is the second implementation to read. |
-| 75 | TLS client from config | planned — *"core client exists, no config path"* | refused | — | The rustls client role exists (`tls/mod.rs:199`), exercised by core tests; no config path dials it (row 2). Xray `tls.go` and sing-box `common/tls/` are the shapes to match. |
-| 76 | uTLS fingerprints | — | refused | — | Nothing shapes a ClientHello (row 18; bench emits the `utls` object, `linkconfig.rs:235`, shaping none). Xray `tls.go:204-277` preset/modern/other prints; sing-box `common/tls/utls_client.go`. |
-| 77 | ECH | — | refused | — | Planned. Xray `ech.go` + `config.proto:80-86`; sing-box `common/tls/ech.go`; LxBox passes `tls.ech{}` through from JSON. Zero word-hits in `crates/`. |
+| 23 | HTTP proxy, both roles | — (config-driven) | refused | — | Planned. Xray `proxy/http/` both roles; sing-box `protocol/http/` in+out. No plain HTTP CONNECT lane in tree — the foxy CONNECT (`proxy.rs:3514`) is account-bound. |
+| 24 | dokodemo-door transparent inbound | — (config-driven) | refused | — | Planned. Xray `proxy/dokodemo/`, TCP+UDP. Zero occurrences in `crates/`. |
+| 25 | blackhole sink outbound | — (config-driven) | refused | — | Planned. Xray `proxy/blackhole/`; sing-box `protocol/block/`. The only sink-shaped outbound in tree is `Freedom` (`proxy.rs:247`). |
+| 26 | DNS outbound | — (config-driven) | refused | — | Planned. Xray `proxy/dns/` + `app/dns/` (UDP/TCP/DoH/QUIC/FakeDNS); sing-box `protocol/dns/`; ZeroNet `zero-dns` (UDP/TCP/DoT/DoH/DoH2/DoH3/DoQ). No `dns` protocol in `proxy.rs`. |
+| 27 | loopback re-inject inbound | — (config-driven) | refused | — | Planned. Xray `proxy/loopback/`. `loopback` in tree means loopback test sockets only. |
+| 28 | Shadowsocks-2022 ciphers | — (config-driven) | refused by name (row 7) | [shadowsocks](docs/function/shadowsocks.md) | Planned. Xray `proxy/shadowsocks_2022/`; ZeroNet `shadowsocks2022.rs` (`2022-blake3-*`, TCP-only like ours). |
+| 29 | TUN inbound (native) | — (config-driven) | refused | — | Planned. Xray `proxy/tun/`; sing-box `protocol/tun/` + `transport/device/`; ZeroNet `zero-tun`. Row 58 is the tun2socks translator; this row is the native inbound. |
+| 30 | Unix domain sockets | — (config-driven) | refused | — | Planned. Xray `transport/internet/system_listener.go:46-75` Unix wrappers. Tree binds TCP only (`unix` hits are `UNIX_EPOCH` clocks). |
+| 31 | finalmask post-TLS mask chain | — (config-driven) | refused | — | Planned. Xray `transport/internet/finalmask/` (`fragment`/`noise`/`salamander`/`realm`/…). Zero occurrences in `crates/`. |
+| 32 | xdrive cloud-drive carrier | — (config-driven) | refused | — | Name only: `TransportKind::Xdrive`, `Carrier::Xdrive` (`refused_carriers!`, `proxy.rs:284`). Xray `transport/internet/xdrive/` polls Drive remotes. |
+| 33 | native HTTP/H2/H3 transport | — (config-driven) | refused | — | `TransportKind::Http` parses (`transport.rs:47`), never dialled (`is_dialled`, `transport.rs:56`). Even Xray refuses these now — `transport_internet.go` maps `h2`/`h3`/`http` to a removed-feature error pointing at XHTTP. |
+| 34 | VLESS `encryption=mlkem768x25519plus` | — | refused | — | Planned. ZeroNet `vless_encryption.rs` (`native`/`xorpub`/`random` x `1rtt`/`0rtt`); LxBox passes it through (task 335); sing-box-lx SPEC 032. The tree's only ML-KEM is the REALITY hybrid key-share group (`reality.rs:10`). |
+| 35 | `flow=xtls-rprx-vision-udp443` | — | refused | — | Planned. Xray accepts it outbound (`infra/conf/vless.go:329-334`); the tree knows only `xtls-rprx-vision`. |
+| 36 | REALITY client | planned — *"server rung landed, client unwired"* | refused | — | Server role complete (row 1); an outbound is accepted only with empty/`none` security (`proxy.rs:4262`). ZeroNet `reality.rs` (`reality_connect`) is the second implementation to read. |
+| 37 | TLS client from config | planned — *"core client exists, no config path"* | refused | — | The rustls client role exists (`tls/mod.rs:199`), exercised by core tests; no config path dials it (row 2). Xray `tls.go` and sing-box `common/tls/` are the shapes to match. |
+| 38 | uTLS fingerprints | — | refused | — | Nothing shapes a ClientHello (row 18; bench emits the `utls` object, `linkconfig.rs:235`, shaping none). Xray `tls.go:204-277` preset/modern/other prints; sing-box `common/tls/utls_client.go`. |
+| 39 | ECH | — | refused | — | Planned. Xray `ech.go` + `config.proto:80-86`; sing-box `common/tls/ech.go`; LxBox passes `tls.ech{}` through from JSON. Zero word-hits in `crates/`. |
 
 ### B — PattNG in full (what the fork wires)
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 23 | `PROXYCHAIN` ordered member list | planned (see chaining) | PattNG only — at most one `AETHER` member per chain |
-| 24 | `POLICYGROUP` / routing groups | planned | PattNG only |
-| 25 | Psiphon as its own program (`AETHER_PSIPHON_BIN`) | planned | PattNG, mlmvpn |
-| 26 | Pluggable transports via lyrebird (`obfs4`/`snowflake`/`webtunnel`/`meek`) | planned | PattNG, Aether |
-| 27 | hev-socks5-tunnel TUN (`libhev-socks5-tunnel.so`) | planned | PattNG |
+| 40 | `PROXYCHAIN` ordered member list | planned (see chaining) | PattNG only — at most one `AETHER` member per chain |
+| 41 | `POLICYGROUP` / routing groups | planned | PattNG only |
+| 42 | Psiphon as its own program (`AETHER_PSIPHON_BIN`) | planned | PattNG, mlmvpn |
+| 43 | Pluggable transports via lyrebird (`obfs4`/`snowflake`/`webtunnel`/`meek`) | planned | PattNG, Aether |
+| 44 | hev-socks5-tunnel TUN (`libhev-socks5-tunnel.so`) | planned | PattNG |
 
 ### C — VPN / tunnel carriers
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 28 | WireGuard (UDP) | planned | Xray-core, sing-box, Aether, PattNG, ZeroNet WARP paths, mlmvpn |
-| 29 | AmneziaWG | planned | amneziawg-go, amnezia-client, mlmvpn |
-| 30 | MASQUE CONNECT-IP over QUIC | planned, quiche by default | mqvpn, Aether, sing-box, Xray-core, PattNG, configer |
-| 31 | MASQUE over HTTP/3 vs HTTP/2 carriers | planned | Aether, mqvpn, configer |
-| 32 | Multipath QUIC (`draft-ietf-quic-multipath`) | planned | mqvpn, slipstream, quiche |
-| 33 | quiche itself: QUIC + HTTP/3, 0-RTT, migration, key updates, batched datagram I/O | provider, not a lane — in use for row 13 | quiche pin |
-| 34 | Multipath schedulers `minrtt` / `wlb` / `wlb_udp_pin` / `backup-fec` | planned | mqvpn |
-| 35 | Hybrid TCP lane (local termination over an H3 stream) | planned | mqvpn |
-| 36 | Reorder buffer + reinjection (`deadline` / `idle` / `dgram`) | planned | mqvpn |
-| 37 | Nested WireGuard (`gool`, two hops) | planned | Aether |
-| 38 | Nested MASQUE (`mim`, tunnel in a tunnel) | planned | Aether |
-| 39 | TCP-over-DNS covert channel (base32 domain + TXT) | planned | slipstream |
-| 40 | Multi-resolver parallel + port-53 impersonation, DCUBIC/BBR | planned | slipstream |
-| 41 | tun2socks engine (TUN → TCP/UDP/ICMP; `userspace`/`hybrid`/`system`) | planned — zeptun, one device away from row 3 | zeptun |
+| 45 | WireGuard (UDP) | planned | Xray-core, sing-box, Aether, PattNG, ZeroNet WARP paths, mlmvpn |
+| 46 | AmneziaWG | planned | amneziawg-go, amnezia-client, mlmvpn |
+| 47 | MASQUE CONNECT-IP over QUIC | planned, quiche by default | mqvpn, Aether, sing-box, Xray-core, PattNG, configer |
+| 48 | MASQUE over HTTP/3 vs HTTP/2 carriers | planned | Aether, mqvpn, configer |
+| 49 | Multipath QUIC (`draft-ietf-quic-multipath`) | planned | mqvpn, slipstream, quiche |
+| 50 | quiche itself: QUIC + HTTP/3, 0-RTT, migration, key updates, batched datagram I/O | provider, not a lane — in use for row 13 | quiche pin |
+| 51 | Multipath schedulers `minrtt` / `wlb` / `wlb_udp_pin` / `backup-fec` | planned | mqvpn |
+| 52 | Hybrid TCP lane (local termination over an H3 stream) | planned | mqvpn |
+| 53 | Reorder buffer + reinjection (`deadline` / `idle` / `dgram`) | planned | mqvpn |
+| 54 | Nested WireGuard (`gool`, two hops) | planned | Aether |
+| 55 | Nested MASQUE (`mim`, tunnel in a tunnel) | planned | Aether |
+| 56 | TCP-over-DNS covert channel (base32 domain + TXT) | planned | slipstream |
+| 57 | Multi-resolver parallel + port-53 impersonation, DCUBIC/BBR | planned | slipstream |
+| 58 | tun2socks engine (TUN → TCP/UDP/ICMP; `userspace`/`hybrid`/`system`) | planned — zeptun, one device away from row 3 | zeptun |
 
 ### D — DNS-tunnel ways (learned from CottenDNS / MasterDnsVPN, not pinned)
 
@@ -196,34 +196,34 @@ Custom ARQ, ~5–7 B header overhead, session multiplexing, compatibility kept a
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 42 | DNS carriers UDP/53 + TCP/53 + DoT/853 + DoH/443, per-resolver `auto`/`udp`/`tcp`/`dot`/`doh` + per-path override | planned | CottenDNS |
-| 43 | Record-type rotation + QNAME reshaping + ID/cookie randomization | planned | CottenDNS |
-| 44 | Reliability: ARQ + ACK/NACK, adaptive duplication, Reed-Solomon FEC, MTU discovery, ZSTD/LZ4/ZLIB, request packing | planned | CottenDNS, MasterDnsVPN |
-| 45 | Balancing across resolvers: round-robin / least-loss / lowest-latency / hybrid + health checks, failover | planned | CottenDNS, MasterDnsVPN |
-| 46 | Local DNS service + cache + DNS-over-SOCKS5 + hijack guards; SOCKS4/5 with auth; CIDR resolver lists | planned | CottenDNS, MasterDnsVPN |
-| 47 | Server egress direct / upstream-SOCKS5 chaining + flood protection | planned | CottenDNS, MasterDnsVPN |
-| 48 | Encryption methods 0–5 (none / XOR / ChaCha20 / AES-128/192/256-GCM) + auto-detect | planned | CottenDNS |
+| 59 | DNS carriers UDP/53 + TCP/53 + DoT/853 + DoH/443, per-resolver `auto`/`udp`/`tcp`/`dot`/`doh` + per-path override | planned | CottenDNS |
+| 60 | Record-type rotation + QNAME reshaping + ID/cookie randomization | planned | CottenDNS |
+| 61 | Reliability: ARQ + ACK/NACK, adaptive duplication, Reed-Solomon FEC, MTU discovery, ZSTD/LZ4/ZLIB, request packing | planned | CottenDNS, MasterDnsVPN |
+| 62 | Balancing across resolvers: round-robin / least-loss / lowest-latency / hybrid + health checks, failover | planned | CottenDNS, MasterDnsVPN |
+| 63 | Local DNS service + cache + DNS-over-SOCKS5 + hijack guards; SOCKS4/5 with auth; CIDR resolver lists | planned | CottenDNS, MasterDnsVPN |
+| 64 | Server egress direct / upstream-SOCKS5 chaining + flood protection | planned | CottenDNS, MasterDnsVPN |
+| 65 | Encryption methods 0–5 (none / XOR / ChaCha20 / AES-128/192/256-GCM) + auto-detect | planned | CottenDNS |
 
 ### E — circumvention engines (learned from mlmvpn_android, not pinned)
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 49 | SoftEther / L2TP + WireGuard via `kittoku`; VPN Gate public relays | planned | mlmvpn |
-| 50 | GST / EDG relay engines; GitHub Tunnel + Quick Connect pool; OpenVPN with TunnelBear | planned | mlmvpn |
-| 51 | MLM Adaptive Engine: per-app route learning on one Xray tunnel + 5-step repair ladder | planned | mlmvpn |
-| 52 | Config Studio + Config Arena: one Cloudflare Worker panel raced across panels on a clean IP | planned | mlmvpn |
-| 53 | Game Booster: DNS/latency racing + pass-through DNS-only VPN | planned | mlmvpn |
-| 54 | Sanction-domain smart routing | planned | mlmvpn |
-| 55 | Server-less domain fronting (on-device CA, local TLS termination, re-establish under unblocked SNI) | planned | mlmvpn |
-| 56 | Serverless / mihomo / superdns / pdoq / openvpn / http-injector / tunnel-wg / oblivion / auto lanes | planned | configer |
-| 57 | Three-tier Emergency fallback | planned | mlmvpn |
+| 66 | SoftEther / L2TP + WireGuard via `kittoku`; VPN Gate public relays | planned | mlmvpn |
+| 67 | GST / EDG relay engines; GitHub Tunnel + Quick Connect pool; OpenVPN with TunnelBear | planned | mlmvpn |
+| 68 | MLM Adaptive Engine: per-app route learning on one Xray tunnel + 5-step repair ladder | planned | mlmvpn |
+| 69 | Config Studio + Config Arena: one Cloudflare Worker panel raced across panels on a clean IP | planned | mlmvpn |
+| 70 | Game Booster: DNS/latency racing + pass-through DNS-only VPN | planned | mlmvpn |
+| 71 | Sanction-domain smart routing | planned | mlmvpn |
+| 72 | Server-less domain fronting (on-device CA, local TLS termination, re-establish under unblocked SNI) | planned | mlmvpn |
+| 73 | Serverless / mihomo / superdns / pdoq / openvpn / http-injector / tunnel-wg / oblivion / auto lanes | planned | configer |
+| 74 | Three-tier Emergency fallback | planned | mlmvpn |
 
 ### F — configer `https-proxy` + `foxy` lanes (learned, not pinned)
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 58 | Free HTTPS-proxy lane: anonymous `POST /v3/launch/` mints a token, server list yields HTTPS proxies exported as `http://` URIs + Clash/sing-box profiles | planned | configer |
-| 59 | Foxy lane: CONNECT to an account's edge over HTTP/1.1, HTTP/2 or HTTP/3, country-pinned at dial, per-flow Bearer, failover inside the country, SPKI pins, split-tunnel | in tree, every carrier socket-proven over a real QUIC, TCP and TLS connection (`cargo test -p ferrox-app foxy`): the FxA login with its two-factor branch, the Hawk-signed exchange, the Fastly `/_fs-ch-` bot challenge, the Guardian mint with its activate-and-retry, and the published Remote Settings catalogue that turns a `country` in a `foxy://` link into an edge. `auto` tries QUIC, then HTTP/2, then HTTP/1.1, and a refused pass latches. Against the live account the catalogue answers with `*.fastly-masque.net:2499`: TCP answers there and HTTP/3 does not, so the carrier that reaches this edge is MASQUE over HTTP/2 (`P43`), and the account host's own certificate does not verify from a strict verifier (`P42`). `foxy-live.yml` reports both on a weekly schedule | configer, FoxyVPN |
+| 75 | Free HTTPS-proxy lane: anonymous `POST /v3/launch/` mints a token, server list yields HTTPS proxies exported as `http://` URIs + Clash/sing-box profiles | planned | configer |
+| 76 | Foxy lane: CONNECT to an account's edge over HTTP/1.1, HTTP/2 or HTTP/3, country-pinned at dial, per-flow Bearer, failover inside the country, SPKI pins, split-tunnel | in tree, every carrier socket-proven over a real QUIC, TCP and TLS connection (`cargo test -p ferrox-app foxy`): the FxA login with its two-factor branch, the Hawk-signed exchange, the Fastly `/_fs-ch-` bot challenge, the Guardian mint with its activate-and-retry, and the published Remote Settings catalogue that turns a `country` in a `foxy://` link into an edge. `auto` tries QUIC, then HTTP/2, then HTTP/1.1, and a refused pass latches. Against the live account the catalogue answers with `*.fastly-masque.net:2499`: TCP answers there and HTTP/3 does not, so the carrier that reaches this edge is MASQUE over HTTP/2 (`P43`), and the account host's own certificate does not verify from a strict verifier (`P42`). `foxy-live.yml` reports both on a weekly schedule | configer, FoxyVPN |
 
 ### G — chaining: lanes stack, not just single dials
 
@@ -242,7 +242,7 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 60 | Fake-ClientHello SNI spoofing (DPI allowlist bypass, no root) | planned — nothing in CI checks it | `UAC-SNI-Spoofer-Android`; `sni-spoofing-rust` |
+| 77 | Fake-ClientHello SNI spoofing (DPI allowlist bypass, no root) | planned — nothing in CI checks it | `UAC-SNI-Spoofer-Android`; `sni-spoofing-rust` |
 
 `VpnService` TUN intercepts device traffic and a userspace TCP stack owns the connection, so no `SOCK_RAW` is ever opened. The stack sends a fake ClientHello with a spoofed SNI and a deliberately wrong sequence number first: DPI sees the allowlist entry and permits the flow, the real server discards the bad-seq packet, and the legitimate handshake proceeds.
 
@@ -256,7 +256,7 @@ The config surface no link exercises: what sits around the protocols in a drop-i
 | --- | --- | --- | --- |
 | 78 | Routing rules + geosite/geoip | planned | Xray `app/router/` + `app/geodata/`; sing-box `route/`; ZeroNet `zero-router`. No routing engine in `proxy.rs`: inbounds bind fixed ports, outbounds pick by protocol only. |
 | 79 | Balancers: leastPing/leastLoad/roundRobin/random + urltest/selector | planned | Xray `router/balancing.go` + `app/observatory/`; sing-box `protocol/group/`; ZeroNet `zero-observatory` ladder; LxBox round-robin urltest (task 208). |
-| 80 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns/`; sing-box `dns/`; ZeroNet `zero-dns` + `dns_oracle` tests. Row 64 is the outbound; this row is the resolver. |
+| 80 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns/`; sing-box `dns/`; ZeroNet `zero-dns` + `dns_oracle` tests. Row 26 is the outbound; this row is the resolver. |
 | 81 | Reverse tunnel bridge/portal | planned | Xray `app/reverse/`. |
 | 82 | Commander gRPC management API | planned | Xray `app/commander/`. |
 | 83 | Connection-planner ladder (ordered rungs, climb on failure, earned descent) | planned | ZeroNet `zero-observatory` (10-rung `ALL`: DirectReality through AmneziaWireguard, 3 access classes). |
@@ -291,12 +291,12 @@ Reading copies for the lanes: WARP, Tailscale UX, detour shapes, DPI parameters,
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 101 | WARP: auto-race WireGuard vs MASQUE-H2/H3 + one-tap registration | planned | ZeroNet `warp.rs` + `warp/report.rs` (`WarpRoute::Auto`); LxBox feature 015 (on-device keys, `warp_endpoints.json`, SCAN generator). Row 28 is the carrier; this row is the account + race. |
-| 102 | AmneziaWG 1.0–3.1 parameter set (junk/masquerade/header-protection/timings) | planned | LxBox §8.5 + tasks 097F/112/421; ZeroNet `amnezia.rs`; amneziawg-go + amnezia-client pins. Row 29 stays the one-line pointer. |
+| 101 | WARP: auto-race WireGuard vs MASQUE-H2/H3 + one-tap registration | planned | ZeroNet `warp.rs` + `warp/report.rs` (`WarpRoute::Auto`); LxBox feature 015 (on-device keys, `warp_endpoints.json`, SCAN generator). Row 45 is the carrier; this row is the account + race. |
+| 102 | AmneziaWG 1.0–3.1 parameter set (junk/masquerade/header-protection/timings) | planned | LxBox §8.5 + tasks 097F/112/421; ZeroNet `amnezia.rs`; amneziawg-go + amnezia-client pins. Row 46 stays the one-line pointer. |
 | 103 | Evasion on TCP/TLS (fragment, keepalive shaping, noise, fake-SNI) | planned | ZeroNet `zero-evasion/`; LxBox 016 (first-hop-only fragment, mixed-case SNI, REALITY pbk/sid validation). |
 | 104 | Detour graph + hop chains with cycle detection | planned (G is the engine sketch) | LxBox feature 006 (`type:chain`, detour-as-direction, fail-closed, culprits named); Xray `dialerProxy`, sing-box `detour`. |
 | 105 | Import superset: Xray JSON, sing-box JSON, WG INI, Amnezia `vpn://`, OpenVPN passthrough — with `.ovpn`, Clash YAML and hysteria-v1 as named gaps | planned | LxBox feature 002 + `PROTOCOLS.md` §§9–11 (gaps named in its Boundaries, not silently dropped). |
-| 106 | VLESS `flow`/`encryption` grammar + XHTTP full params (modes, padding, placements, `xmux`) | planned | LxBox 016 (`xhttp-params.md`, task 127F); ZeroNet `xhttp.rs` + `xhttp_request.rs` (stream-one/stream-up/packet-up). Tree: one xhttp mode (row 9), one flow (row 73 is the gap). |
+| 106 | VLESS `flow`/`encryption` grammar + XHTTP full params (modes, padding, placements, `xmux`) | planned | LxBox 016 (`xhttp-params.md`, task 127F); ZeroNet `xhttp.rs` + `xhttp_request.rs` (stream-one/stream-up/packet-up). Tree: one xhttp mode (row 9), one flow (row 35 is the gap). |
 | 107 | Config template + contract registry (typed vars, schemas, build gate) | planned | LxBox features 024/025 (`build_config.dart`, `contract/registry/protocols/*.json`). |
 
 ### Conformance, per row
