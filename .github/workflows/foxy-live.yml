@@ -73,6 +73,23 @@ jobs:
       # The UDP reachability report is a measurement, not a gate: whether an
       # edge answers QUIC is a fact about the edge, not about this tree, and a
       # network that filters udp/443 must not turn the lane red.
+      # What the account host actually presents, and how much of the runner's
+      # bundle the lane read. A refusal with no issuer in it is a refusal nobody
+      # can act on.
+      - name: What the account host presents
+        if: steps.secrets.outputs.present == 'true'
+        continue-on-error: true
+        run: |
+          for host in api.accounts.firefox.com firefox.settings.services.mozilla.com; do
+            echo "== $host"
+            echo | openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null               | openssl x509 -noout -subject -issuer -dates || echo "no certificate"
+          done
+          echo "== runner bundle"
+          for bundle in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt; do
+            if [ -r "$bundle" ]; then
+              echo "$bundle: $(grep -c 'BEGIN CERTIFICATE' "$bundle") certificates"
+            fi
+          done
       - name: Summarise
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
