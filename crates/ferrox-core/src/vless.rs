@@ -530,7 +530,6 @@ fn carrier_method(kind: TransportKind) -> Option<&'static str> {
         return None;
     }
     Some(match kind {
-        TransportKind::Tcp => "vless-tcp",
         TransportKind::Ws => "vless-ws",
         TransportKind::Xhttp => "vless-xhttp",
         TransportKind::Grpc => "vless-grpc",
@@ -854,6 +853,24 @@ mod tests {
         assert_eq!(percent_decode("%2F"), "/");
         assert_eq!(percent_decode("a%20b"), "a b");
         assert_eq!(percent_decode("%FF"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn no_tcp_link_reports_the_bare_tcp_method() {
+        for link in [
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:80?security=none&encryption=none&type=tcp#plain",
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:80?security=none&encryption=none&type=raw#plain",
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:80?security=none&encryption=none&type=tcp#public",
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:443?security=tls&type=tcp#tls",
+            BRIEF_LINK,
+        ] {
+            let l = VlessLink::parse(link).expect("parses");
+            assert_ne!(
+                l.support(),
+                Support::Implemented { method: "vless-tcp" },
+                "{link}"
+            );
+        }
     }
 
     #[test]
