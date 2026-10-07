@@ -67,6 +67,62 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     }
 }
 
+/// One turn of the quiche wheel with the lock held for quiche calls only,
+/// never for the socket wait between them — the shape the pool's pump takes,
+/// so a writer's one `send_all` is never starved by a reader's polling.
+fn drive_once(session: &Session, wait: Duration) -> bool {
+    let wait = {
+        let Ok(conn) = session.shared.lock() else {
+            return false;
+        };
+        if conn.is_closed() {
+            return false;
+        }
+        conn.timeout().map_or(wait, |left| left.min(wait))
+    };
+    if session
+        .sock
+        .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; crate::quic::MAX_DATAGRAM];
+    let incoming = match session.sock.recv_from(&mut buf) {
+        Ok(found) => Some(found),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            None
+        }
+        Err(_) => {
+            std::thread::sleep(wait);
+            return false;
+        }
+    };
+    let Ok(mut conn) = session.shared.lock() else {
+        return false;
+    };
+    if conn.is_closed() {
+        return false;
+    }
+    match incoming {
+        Some((n, from)) => {
+            let info = quiche::RecvInfo {
+                from,
+                to: session.local,
+            };
+            let _ = conn.recv(&mut buf[..n], info);
+        }
+        None => conn.on_timeout(),
+    }
+    crate::quic::flush_egress(&mut conn, &session.sock);
+    true
+}
+
 fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(want);
     let mut chunk = [0u8; 8192];
@@ -88,10 +144,7 @@ fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) ->
             if Instant::now() >= deadline {
                 return None;
             }
-            let Ok(mut conn) = session.shared.lock() else {
-                return None;
-            };
-            crate::quic::pump_once(&mut conn, &session.sock, session.local, STREAM_POLL);
+            let _ = drive_once(session, STREAM_POLL);
         }
     }
     (out.len() == want).then_some(out)
@@ -126,10 +179,7 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
         if let Some(n) = read {
             head.extend_from_slice(&chunk[..n]);
         } else {
-            let Ok(mut conn) = session.shared.lock() else {
-                return None;
-            };
-            crate::quic::pump_once(&mut conn, &session.sock, session.local, STREAM_POLL);
+            let _ = drive_once(session, STREAM_POLL);
         }
     }
 }
@@ -189,6 +239,10 @@ pub(crate) struct Flow {
     stream: u64,
     backlog: Vec<u8>,
     at: usize,
+    /// Whether `read` may drive the socket itself. A flow on the server's
+    /// routed socket must not: `serve_loop` reads every datagram and routes
+    /// it, and a second reader steals packets the router must see.
+    drive: bool,
 }
 
 impl Flow {
@@ -198,6 +252,7 @@ impl Flow {
         local: SocketAddr,
         stream: u64,
         backlog: Vec<u8>,
+        drive: bool,
     ) -> Self {
         Self {
             session: Session {
@@ -208,6 +263,7 @@ impl Flow {
             stream,
             backlog,
             at: 0,
+            drive,
         }
     }
 
@@ -251,15 +307,19 @@ impl Read for Flow {
             if let Some(n) = read {
                 return Ok(n);
             }
-            let Ok(mut conn) = self.session.shared.lock() else {
-                return Err(broken());
-            };
-            crate::quic::pump_once(
-                &mut conn,
-                &self.session.sock,
-                self.session.local,
-                STREAM_POLL,
-            );
+            if self.drive {
+                let _ = drive_once(&self.session, STREAM_POLL);
+                continue;
+            }
+            {
+                let Ok(conn) = self.session.shared.lock() else {
+                    return Err(broken());
+                };
+                if conn.is_closed() {
+                    return Ok(0);
+                }
+            }
+            std::thread::sleep(STREAM_POLL);
         }
     }
 }
@@ -298,6 +358,7 @@ pub(crate) fn open_flow(session: &Session, header: &[u8]) -> Option<Flow> {
         stream: FIRST_FLOW_STREAM,
         backlog: Vec::new(),
         at: 0,
+        drive: true,
     })
 }
 
@@ -432,13 +493,15 @@ fn serve_stream(
         if let Some(n) = read {
             head.extend_from_slice(&chunk[..n]);
         } else {
-            let Ok(mut conn) = shared.lock() else {
-                return;
-            };
-            if conn.is_closed() {
-                return;
+            {
+                let Ok(conn) = shared.lock() else {
+                    return;
+                };
+                if conn.is_closed() {
+                    return;
+                }
             }
-            crate::quic::pump_once(&mut conn, sock, local, STREAM_POLL);
+            std::thread::sleep(STREAM_POLL);
             continue;
         }
         if head.is_empty() {
@@ -458,6 +521,7 @@ fn serve_stream(
         local,
         stream,
         head[prefix..].to_vec(),
+        false,
     ));
 }
 

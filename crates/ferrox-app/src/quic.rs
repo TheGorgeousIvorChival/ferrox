@@ -74,7 +74,7 @@ pub(crate) const ALPN: &[u8] = b"h3";
 
 const SCID_LEN: usize = 16;
 
-const MAX_DATAGRAM: usize = 1350;
+pub(crate) const MAX_DATAGRAM: usize = 1350;
 
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 

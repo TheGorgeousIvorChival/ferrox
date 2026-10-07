@@ -9839,6 +9839,7 @@ mod tests {
                 local,
                 4,
                 rest,
+                true,
             );
             serve_vless_hysteria(flow, &id, true);
         });
