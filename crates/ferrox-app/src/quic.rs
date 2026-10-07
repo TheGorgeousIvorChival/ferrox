@@ -565,22 +565,22 @@ fn pump(
     let mut ready: Vec<(u64, TcpStream)> = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut buf = [0u8; MAX_DATAGRAM];
+    let mut applied: Option<Duration> = None;
     loop {
         // The lock is for quiche calls only, never for the wait between them: a
         // stalled peer must not stall the sessions sharing the connection.
-        let wait = {
+        let timeout = {
             let Ok(conn) = shared.lock() else {
                 return;
             };
             if conn.is_closed() {
                 return;
             }
-            conn.timeout().map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
+            conn.timeout()
+                .map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
+                .max(Duration::from_millis(1))
         };
-        if sock
-            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
-            .is_err()
-        {
+        if !crate::proxy::refresh_read_timeout(sock, timeout, &mut applied) {
             return;
         }
         let incoming = match sock.recv_from(&mut buf) {

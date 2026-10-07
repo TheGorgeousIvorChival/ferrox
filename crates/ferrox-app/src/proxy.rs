@@ -635,7 +635,7 @@ fn write_mux_frame(
     data: Option<&[u8]>,
 ) -> bool {
     let len = data.map_or(0, <[u8]>::len);
-    staging.resize(frame.frame_len(len), 0);
+    resize_scratch(staging, frame.frame_len(len));
     let written = frame.encode_into(data, staging);
     staging.truncate(written);
     match shared.lock() {
@@ -1482,6 +1482,29 @@ fn copy_stream<R: Read, W: Write>(from: &Half<R>, to: &Half<W>) {
             return;
         }
     }
+}
+
+pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
+    buf.clear();
+    if buf.capacity() < len {
+        buf.reserve(len);
+    }
+    unsafe { buf.set_len(len) }
+}
+
+pub(crate) fn refresh_read_timeout(
+    sock: &UdpSocket,
+    want: Duration,
+    applied: &mut Option<Duration>,
+) -> bool {
+    if *applied == Some(want) {
+        return true;
+    }
+    if sock.set_read_timeout(Some(want)).is_err() {
+        return false;
+    }
+    *applied = Some(want);
+    true
 }
 
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
@@ -2333,7 +2356,7 @@ fn mux_dial_uplink(client: &TcpStream, uplink: &mut TcpStream, id: u16) {
                     target: None,
                     global_id: None,
                 };
-                scratch.resize(keep.frame_len(n), 0);
+                resize_scratch(&mut scratch, keep.frame_len(n));
                 let written = keep.encode_into(Some(&chunk[..n]), &mut scratch);
                 if uplink.write_all(&scratch[..written]).is_err() {
                     break;
@@ -2342,7 +2365,7 @@ fn mux_dial_uplink(client: &TcpStream, uplink: &mut TcpStream, id: u16) {
         }
     }
     let end = ferrox_core::mux::Outgoing::bare(id, ferrox_core::mux::Status::End, 0);
-    scratch.resize(end.frame_len(0), 0);
+    resize_scratch(&mut scratch, end.frame_len(0));
     let written = end.encode_into(None, &mut scratch);
     let _ = uplink.write_all(&scratch[..written]);
     let _ = uplink.shutdown(Shutdown::Both);
@@ -2851,13 +2874,14 @@ fn serve_trojan_udp(stream: TcpStream) {
     };
     let replied = RelayPool::global().run(forward);
     let mut buf = vec![0u8; UDP_BUF];
+    let mut trojan_head = Vec::with_capacity(32);
     loop {
         if done.load(Ordering::Relaxed) {
             break;
         }
-        let mut live = pump_trojan_replies(&udp4, &mut stream, &mut buf, &done);
+        let mut live = pump_trojan_replies(&udp4, &mut stream, &mut buf, &done, &mut trojan_head);
         if let Some(sock) = &udp6 {
-            live &= pump_trojan_replies(sock, &mut stream, &mut buf, &done);
+            live &= pump_trojan_replies(sock, &mut stream, &mut buf, &done, &mut trojan_head);
         }
         if !live {
             break;
@@ -2873,13 +2897,14 @@ fn pump_trojan_replies(
     stream: &mut TcpStream,
     buf: &mut [u8],
     done: &AtomicBool,
+    head: &mut Vec<u8>,
 ) -> bool {
     match udp.recv_from(buf) {
         Ok((n, src)) => {
             if n == 0 {
                 return true;
             }
-            write_trojan_datagram(stream, &src, &buf[..n])
+            write_trojan_datagram(stream, &src, &buf[..n], head)
         }
         Err(error) if is_timeout(&error) => !done.load(Ordering::Relaxed),
         Err(_) => false,
@@ -3569,14 +3594,14 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
             target: Some(mux_target_of(dest)),
             global_id: if first { Some(*identity) } else { None },
         };
-        staging.resize(frame.frame_len(payload.len()), 0);
+        resize_scratch(&mut staging, frame.frame_len(payload.len()));
         let written = frame.encode_into(Some(payload), &mut staging);
         if write.write_all(&staging[..written]).is_err() {
             break;
         }
     }
     let end = ferrox_core::mux::Outgoing::bare(0, ferrox_core::mux::Status::End, 0);
-    staging.resize(end.frame_len(0), 0);
+    resize_scratch(&mut staging, end.frame_len(0));
     let written = end.encode_into(None, &mut staging);
     let _ = write.write_all(&staging[..written]);
     let _ = write.shutdown(Shutdown::Both);
@@ -3587,6 +3612,7 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<TrojanUdpUplink> = None;
     let mut buf = vec![0u8; UDP_BUF];
+    let mut trojan_head = Vec::with_capacity(32);
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
@@ -3601,7 +3627,7 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
             uplink = dial_trojan_udp_uplink(trojan, &dest, relay, Arc::clone(&source));
         }
         if let Some(up) = &mut uplink {
-            if !write_trojan_datagram(&mut up.write, &dest, payload) {
+            if !write_trojan_datagram(&mut up.write, &dest, payload, &mut trojan_head) {
                 if let Some(old) = uplink.take() {
                     let _ = old.write.shutdown(Shutdown::Both);
                 }
@@ -3735,15 +3761,20 @@ fn write_udp_datagram(stream: &mut TcpStream, payload: &[u8]) -> bool {
     write_all_two(stream, &len, payload)
 }
 
-fn write_trojan_datagram(stream: &mut TcpStream, dest: &SocketAddr, payload: &[u8]) -> bool {
+fn write_trojan_datagram(
+    stream: &mut TcpStream,
+    dest: &SocketAddr,
+    payload: &[u8],
+    head: &mut Vec<u8>,
+) -> bool {
     if payload.is_empty() || payload.len() > u16::MAX as usize {
         return true;
     }
-    let mut head = Vec::with_capacity(32);
-    push_socks_addr(&mut head, dest);
+    head.clear();
+    push_socks_addr(head, dest);
     head.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     head.extend_from_slice(b"\r\n");
-    write_all_two(stream, &head, payload)
+    write_all_two(stream, head, payload)
 }
 
 fn read_trojan_datagram(stream: &mut TcpStream, buf: &mut [u8]) -> Option<(SocketAddr, usize)> {
@@ -3846,9 +3877,7 @@ pub(crate) fn pump_vmess_udp(
             if chunk.is_empty() {
                 break;
             }
-            let mut datagram = vec![0u8; chunk.len()];
-            datagram.copy_from_slice(chunk);
-            if udp_send.send(&datagram).is_err() {
+            if udp_send.send(chunk).is_err() {
                 break;
             }
         }
@@ -5603,6 +5632,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scratch_reuses_capacity_and_reports_its_length() {
+        let mut buf = Vec::new();
+        for len in [0usize, 1, 16, 4096, 65_536, 3] {
+            resize_scratch(&mut buf, len);
+            assert!(buf.capacity() >= len, "len {len}");
+            assert_eq!(buf.len(), len, "len {len}");
+            buf.fill(0x5A);
+            assert!(buf.iter().all(|&byte| byte == 0x5A), "len {len}");
+        }
+    }
+
+    #[test]
     fn b64url_matches_the_shared_encoder() {
         for (bytes, want) in [
             (&b""[..], ""),
@@ -7067,10 +7108,11 @@ mod tests {
         thread::spawn(move || {
             let (mut stream, _) = tunnel.accept().expect("accepts");
             let mut buf = vec![0u8; UDP_BUF];
+            let mut head = Vec::with_capacity(32);
             loop {
                 match read_trojan_datagram(&mut stream, &mut buf) {
                     Some((dest, n)) => {
-                        if !write_trojan_datagram(&mut stream, &dest, &buf[..n]) {
+                        if !write_trojan_datagram(&mut stream, &dest, &buf[..n], &mut head) {
                             return;
                         }
                     }
@@ -7083,14 +7125,15 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let v4: SocketAddr = "127.0.0.1:53".parse().expect("addr");
-        assert!(write_trojan_datagram(&mut stream, &v4, b"ping"));
+        let mut head = Vec::with_capacity(32);
+        assert!(write_trojan_datagram(&mut stream, &v4, b"ping", &mut head));
         let mut buf = vec![0u8; UDP_BUF];
         let (dest, n) = read_trojan_datagram(&mut stream, &mut buf).expect("reads");
         assert_eq!(dest, v4);
         assert_eq!(&buf[..n], b"ping");
-        assert!(write_trojan_datagram(&mut stream, &v4, &[]));
+        assert!(write_trojan_datagram(&mut stream, &v4, &[], &mut head));
         let wide: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
-        assert!(write_trojan_datagram(&mut stream, &v4, &wide));
+        assert!(write_trojan_datagram(&mut stream, &v4, &wide, &mut head));
         let mut buf = vec![0u8; UDP_BUF];
         let (dest, n) = read_trojan_datagram(&mut stream, &mut buf).expect("reads");
         assert_eq!(dest, v4);
@@ -7167,9 +7210,10 @@ mod tests {
         header.extend_from_slice(&target.port().to_be_bytes());
         header.extend_from_slice(b"\r\n");
         stream.write_all(&header).expect("requests");
+        let mut head = Vec::with_capacity(32);
         for (port, word) in [(first, b"ping".as_slice()), (second, b"pong".as_slice())] {
             let dest: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-            assert!(write_trojan_datagram(&mut stream, &dest, word));
+            assert!(write_trojan_datagram(&mut stream, &dest, word, &mut head));
             let mut buf = vec![0u8; UDP_BUF];
             let (source, n) = read_trojan_datagram(&mut stream, &mut buf).expect("reads");
             assert_eq!(source.port(), dest.port());

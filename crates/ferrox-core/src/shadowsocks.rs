@@ -148,9 +148,13 @@ impl Cipher {
     }
 
     pub fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Option<()> {
-        let nonce = self.nonce();
         let at = out.len();
         out.extend_from_slice(plaintext);
+        self.seal_tail_in_place(out, at)
+    }
+
+    pub fn seal_tail_in_place(&mut self, out: &mut Vec<u8>, at: usize) -> Option<()> {
+        let nonce = self.nonce();
         let body = &mut out[at..];
         let tag = match &self.aead {
             Aead::Aes128(cipher) => cipher.seal_in_place(&nonce, b"", body),

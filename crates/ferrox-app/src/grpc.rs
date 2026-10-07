@@ -251,6 +251,23 @@ fn read_head(stream: &mut TcpStream) -> Option<(usize, u8, u8, u32)> {
     Some((len, head[3], head[4], id))
 }
 
+fn write_frame_parts(
+    stream: &mut TcpStream,
+    kind: u8,
+    flags: u8,
+    id: u32,
+    first: &[u8],
+    second: &[u8],
+) -> bool {
+    let mut head = [0u8; 9];
+    let len = first.len() + second.len();
+    head[0..3].copy_from_slice(&(len as u32).to_be_bytes()[1..]);
+    head[3] = kind;
+    head[4] = flags;
+    head[5..9].copy_from_slice(&id.to_be_bytes());
+    crate::proxy::write_all_three(stream, &head, first, second)
+}
+
 fn write_frame(stream: &mut TcpStream, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
     let mut head = [0u8; 9];
     head[0..3].copy_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
@@ -305,8 +322,10 @@ pub(crate) struct GrpcReader {
     head: Vec<u8>,
     head_id: u32,
     msg: Vec<u8>,
+    msg_at: usize,
     need: usize,
     backlog: Vec<u8>,
+    backlog_at: usize,
     frame: Vec<u8>,
     eof: bool,
 }
@@ -464,29 +483,38 @@ impl GrpcReader {
         let end = flags & F_END != 0;
         loop {
             if self.need == 0 {
-                if self.msg.len() < 5 {
+                let msg = &self.msg[self.msg_at..];
+                if msg.len() < 5 {
                     break;
                 }
-                if self.msg[0] != 0 {
+                if msg[0] != 0 {
                     return None;
                 }
-                let len = u32::from_be_bytes(self.msg[1..5].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(msg[1..5].try_into().unwrap()) as usize;
                 if len > MSG_CAP {
                     return None;
                 }
                 self.need = len;
-                self.msg.drain(..5);
+                self.msg_at += 5;
+            } else {
+                let msg = &self.msg[self.msg_at..];
+                if msg.len() < self.need {
+                    break;
+                }
+                let payload = hunk_decode(&msg[..self.need])?;
+                self.backlog.extend_from_slice(payload);
+                self.msg_at += self.need;
+                self.need = 0;
             }
-            if self.msg.len() < self.need {
-                break;
-            }
-            let payload = hunk_decode(&self.msg[..self.need])?;
-            self.backlog.extend_from_slice(payload);
-            self.msg.drain(..self.need);
-            self.need = 0;
+        }
+        if self.msg_at * 2 >= self.msg.len() {
+            let at = self.msg_at;
+            self.msg.copy_within(at.., 0);
+            self.msg.truncate(self.msg.len() - at);
+            self.msg_at = 0;
         }
         if end {
-            if self.need != 0 || !self.msg.is_empty() {
+            if self.need != 0 || self.msg_at != self.msg.len() {
                 return None;
             }
             self.eof = true;
@@ -498,7 +526,7 @@ impl GrpcReader {
         let head = read_head(&mut self.read);
         let (len, kind, flags, id) = head?;
         let mut frame = std::mem::take(&mut self.frame);
-        frame.resize(len, 0);
+        crate::proxy::resize_scratch(&mut frame, len);
         if len > 0 && crate::proxy::read_exact(&mut self.read, &mut frame).is_err() {
             self.frame = frame;
             return None;
@@ -608,10 +636,16 @@ impl Read for GrpcReader {
             return Ok(0);
         }
         loop {
-            if !self.backlog.is_empty() {
-                let n = self.backlog.len().min(buf.len());
-                buf[..n].copy_from_slice(&self.backlog[..n]);
-                self.backlog.drain(..n);
+            if self.backlog_at < self.backlog.len() {
+                let n = (self.backlog.len() - self.backlog_at).min(buf.len());
+                buf[..n].copy_from_slice(&self.backlog[self.backlog_at..self.backlog_at + n]);
+                self.backlog_at += n;
+                if self.backlog_at * 2 >= self.backlog.len() {
+                    let at = self.backlog_at;
+                    self.backlog.copy_within(at.., 0);
+                    self.backlog.truncate(self.backlog.len() - at);
+                    self.backlog_at = 0;
+                }
                 return Ok(n);
             }
             if self.eof {
@@ -642,7 +676,9 @@ impl GrpcWriter {
     }
 
     fn message(&self, data: &[u8], end: bool) -> bool {
-        let frame = hunk_frame(data);
+        let mut prefix = [0u8; 16];
+        let plen = frame_prefix(data.len(), &mut prefix);
+        let total = plen + data.len();
         let max = *self
             .shared
             .max_frame
@@ -650,9 +686,9 @@ impl GrpcWriter {
             .unwrap_or_else(PoisonError::into_inner);
         let max = max.max(1);
         let mut at = 0;
-        while at < frame.len() {
-            let n = (frame.len() - at).min(max);
-            let last = at + n == frame.len();
+        while at < total {
+            let n = (total - at).min(max);
+            let last = at + n == total;
             if !take_window(&self.shared, n as u64) {
                 return false;
             }
@@ -660,7 +696,28 @@ impl GrpcWriter {
             let Ok(mut stream) = self.shared.stream.lock() else {
                 return false;
             };
-            if !write_frame(&mut stream, T_DATA, flags, self.stream, &frame[at..at + n]) {
+            let wrote = if at + n <= plen {
+                write_frame(&mut stream, T_DATA, flags, self.stream, &prefix[at..at + n])
+            } else if at >= plen {
+                let from = at - plen;
+                write_frame(
+                    &mut stream,
+                    T_DATA,
+                    flags,
+                    self.stream,
+                    &data[from..from + n],
+                )
+            } else {
+                write_frame_parts(
+                    &mut stream,
+                    T_DATA,
+                    flags,
+                    self.stream,
+                    &prefix[at..plen],
+                    &data[..n - (plen - at)],
+                )
+            };
+            if !wrote {
                 return false;
             }
             drop(stream);
@@ -684,16 +741,28 @@ impl std::io::Write for GrpcWriter {
     }
 }
 
-fn hunk_frame(data: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; 5];
-    out.push(0x0A);
-    push_varint(&mut out, data.len() as u64);
-    out.extend_from_slice(data);
-    let hunk_len = (out.len() - 5) as u32;
-    out[1..5].copy_from_slice(&hunk_len.to_be_bytes());
-    out
+fn frame_prefix(data_len: usize, out: &mut [u8; 16]) -> usize {
+    let mut value = data_len as u64;
+    let mut at = 6;
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            out[at] = byte;
+            at += 1;
+            break;
+        }
+        out[at] = byte | 0x80;
+        at += 1;
+    }
+    let inner = (at - 5 + data_len) as u32;
+    out[0] = 0;
+    out[1..5].copy_from_slice(&inner.to_be_bytes());
+    out[5] = 0x0A;
+    at
 }
 
+#[cfg(test)]
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         out.push(value as u8 & 0x7F | 0x80);
@@ -805,8 +874,10 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcW
         head: Vec::new(),
         head_id: 0,
         msg: Vec::new(),
+        msg_at: 0,
         need: 0,
         backlog: Vec::new(),
+        backlog_at: 0,
         frame: Vec::new(),
         eof: false,
     };
@@ -874,8 +945,10 @@ pub(crate) fn connect(
         head: Vec::new(),
         head_id: 0,
         msg: Vec::new(),
+        msg_at: 0,
         need: 0,
         backlog: Vec::new(),
+        backlog_at: 0,
         frame: Vec::new(),
         eof: false,
     };
@@ -948,13 +1021,86 @@ mod tests {
 
     #[test]
     fn hunks_carry_the_xray_schema_bytes() {
-        assert_eq!(hunk_frame(b"ping"), b"\0\0\0\0\x06\x0a\x04ping");
+        let mut prefix = [0u8; 16];
+        let plen = frame_prefix(4, &mut prefix);
+        let mut frame = prefix[..plen].to_vec();
+        frame.extend_from_slice(b"ping");
+        assert_eq!(frame, b"\0\0\0\0\x06\x0a\x04ping");
         assert_eq!(
             hunk_decode(&[0x0A, 0x04, b'p', b'i', b'n', b'g']).expect("decodes"),
             b"ping"
         );
         assert!(hunk_decode(b"raw payload").is_none());
         assert!(hunk_decode(&[0x0A, 0x80]).is_none());
+    }
+
+    #[test]
+    fn messages_frame_identically_at_every_chunk_size() {
+        for max in [1usize, 2, 5, 6, 7, 8, 11, 16, 100, 16_384] {
+            for len in [0usize, 1, 4, 127, 300] {
+                let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                let mut want = vec![0u8; 5];
+                want.push(0x0A);
+                push_varint(&mut want, len as u64);
+                want.extend_from_slice(&data);
+                let hunk_len = (want.len() - 5) as u32;
+                want[1..5].copy_from_slice(&hunk_len.to_be_bytes());
+
+                let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+                let port = listener.local_addr().expect("addr").port();
+                let handle = thread::spawn(move || {
+                    let (stream, _) = listener.accept().expect("accepts");
+                    let shared = Arc::new(Shared {
+                        stream: Mutex::new(stream),
+                        send: Mutex::new(SendWindow {
+                            conn: u64::MAX,
+                            stream: u64::MAX,
+                        }),
+                        wake: Condvar::new(),
+                        max_frame: Mutex::new(max),
+                        init: Mutex::new(u64::from(WINDOW)),
+                        ended: AtomicBool::new(false),
+                        dead: AtomicBool::new(false),
+                    });
+                    let writer = GrpcWriter { shared, stream: 1 };
+                    assert!(writer.message(&data, true), "max {max} len {len}");
+                });
+                let mut read = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+                let mut wire = Vec::new();
+                read.read_to_end(&mut wire).expect("reads");
+                handle.join().expect("joins");
+                let mut body = Vec::new();
+                let mut at = 0;
+                while at < wire.len() {
+                    let head = &wire[at..at + 9];
+                    let len = usize::from(head[0]) << 16
+                        | usize::from(head[1]) << 8
+                        | usize::from(head[2]);
+                    assert_eq!(head[3], T_DATA, "max {max} len {len}");
+                    assert_eq!(u32::from_be_bytes(head[5..9].try_into().unwrap()), 1);
+                    at += 9;
+                    body.extend_from_slice(&wire[at..at + len]);
+                    at += len;
+                }
+                assert_eq!(body, want, "max {max} len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn frame_prefix_matches_the_vec_form_at_varint_edges() {
+        for len in [0usize, 1, 127, 128, 300, 16383, 16384, 1 << 21, 1 << 28] {
+            let mut varint = Vec::new();
+            push_varint(&mut varint, len as u64);
+            let inner = (1 + varint.len() + len) as u32;
+            let mut want = vec![0u8];
+            want.extend_from_slice(&inner.to_be_bytes());
+            want.push(0x0A);
+            want.extend_from_slice(&varint);
+            let mut prefix = [0u8; 16];
+            let plen = frame_prefix(len, &mut prefix);
+            assert_eq!(&prefix[..plen], &want[..], "len {len}");
+        }
     }
 
     #[test]

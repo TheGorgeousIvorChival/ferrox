@@ -443,15 +443,12 @@ pub(crate) fn seal_udp_datagram(
     let mut salt = [0u8; SALT_LEN];
     getrandom::getrandom(&mut salt[..salt_len]).ok()?;
     let mut cipher = Cipher::from_master_key(method, master, &salt[..salt_len])?;
-    let mut addr = Vec::with_capacity(20);
-    push_addr(&mut addr, dest, 4);
-    addr.extend_from_slice(&dest.port().to_be_bytes());
-    let mut plain = Vec::with_capacity(addr.len() + payload.len());
-    plain.extend_from_slice(&addr);
-    plain.extend_from_slice(payload);
-    let mut out = Vec::with_capacity(salt_len + plain.len() + TAG_LEN);
+    let mut out = Vec::with_capacity(salt_len + 20 + payload.len() + TAG_LEN);
     out.extend_from_slice(&salt[..salt_len]);
-    cipher.seal_into(&plain, &mut out)?;
+    push_addr(&mut out, dest, 4);
+    out.extend_from_slice(&dest.port().to_be_bytes());
+    out.extend_from_slice(payload);
+    cipher.seal_tail_in_place(&mut out, salt_len)?;
     Some(out)
 }
 
@@ -468,7 +465,9 @@ pub(crate) fn open_udp_datagram(
     let mut sealed = packet[salt_len..].to_vec();
     let len = cipher.open_in_place(&mut sealed)?;
     let (target, used) = parse_addr_header(&sealed[..len])?;
-    Some((target, sealed[used..len].to_vec()))
+    sealed.copy_within(used..len, 0);
+    sealed.truncate(len - used);
+    Some((target, sealed))
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {

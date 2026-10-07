@@ -256,8 +256,7 @@ fn read_frame(
     let mut header = [0u8; frames::H2_HEADER];
     read_exact(tls, &mut header).map_err(|()| Failure::Stream)?;
     let frame = frames::H2Frame::parse(&header).ok_or(Failure::Frame)?;
-    out.clear();
-    out.resize((frame.length as usize).min(max_frame), 0);
+    crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
     read_exact(tls, out).map_err(|()| Failure::Stream)?;
     Ok(frame)
 }
@@ -622,7 +621,7 @@ impl H3 {
         let id = self.stream;
         let room = H3_WINDOW - self.head.len();
         let mut chunk = std::mem::take(&mut self.inbox);
-        chunk.resize(room.max(1), 0);
+        crate::proxy::resize_scratch(&mut chunk, room.max(1));
         let read = self.with_conn(|conn| conn.stream_recv(id, &mut chunk).map(|r| (r, ())));
         self.inbox = chunk;
         let Some(Ok(((n, fin), ()))) = read else {

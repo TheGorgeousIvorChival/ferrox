@@ -70,21 +70,19 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
 /// One turn of the quiche wheel with the lock held for quiche calls only,
 /// never for the socket wait between them — the shape the pool's pump takes,
 /// so a writer's one `send_all` is never starved by a reader's polling.
-fn drive_once(session: &Session, wait: Duration) -> bool {
-    let wait = {
+fn drive_once(session: &Session, wait: Duration, applied: &mut Option<Duration>) -> bool {
+    let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
         };
         if conn.is_closed() {
             return false;
         }
-        conn.timeout().map_or(wait, |left| left.min(wait))
+        conn.timeout()
+            .map_or(wait, |left| left.min(wait))
+            .max(Duration::from_millis(1))
     };
-    if session
-        .sock
-        .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
-        .is_err()
-    {
+    if !crate::proxy::refresh_read_timeout(&session.sock, timeout, applied) {
         return false;
     }
     let mut buf = [0u8; crate::quic::MAX_DATAGRAM];
@@ -126,6 +124,7 @@ fn drive_once(session: &Session, wait: Duration) -> bool {
 fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(want);
     let mut chunk = [0u8; 8192];
+    let mut applied = None;
     while out.len() < want {
         let end = (want - out.len()).min(chunk.len());
         let read = {
@@ -144,7 +143,7 @@ fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) ->
             if Instant::now() >= deadline {
                 return None;
             }
-            let _ = drive_once(session, STREAM_POLL);
+            let _ = drive_once(session, STREAM_POLL, &mut applied);
         }
     }
     (out.len() == want).then_some(out)
@@ -153,6 +152,7 @@ fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) ->
 fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(128);
     let mut chunk = [0u8; 4096];
+    let mut applied = None;
     loop {
         if head.len() >= HEAD_CAP || Instant::now() >= deadline {
             return None;
@@ -179,7 +179,7 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
         if let Some(n) = read {
             head.extend_from_slice(&chunk[..n]);
         } else {
-            let _ = drive_once(session, STREAM_POLL);
+            let _ = drive_once(session, STREAM_POLL, &mut applied);
         }
     }
 }
@@ -290,6 +290,7 @@ impl Read for Flow {
             self.at += n;
             return Ok(n);
         }
+        let mut applied = None;
         loop {
             let read = {
                 let Ok(mut conn) = self.session.shared.lock() else {
@@ -308,7 +309,7 @@ impl Read for Flow {
                 return Ok(n);
             }
             if self.drive {
-                let _ = drive_once(&self.session, STREAM_POLL);
+                let _ = drive_once(&self.session, STREAM_POLL, &mut applied);
                 continue;
             }
             {
@@ -654,7 +655,7 @@ impl Router<'_> {
             return;
         };
         let info = quiche::RecvInfo { from, to: *local };
-        let spawn: Vec<u64> = {
+        {
             let Ok(mut conn) = shared.lock() else {
                 return;
             };
@@ -693,23 +694,25 @@ impl Router<'_> {
                     return;
                 }
             }
-            conn.readable().collect()
-        };
-        let Some(inbound) = routes.get_mut(dcid) else {
-            return;
-        };
-        for id in spawn {
-            if id < FIRST_FLOW_STREAM || id % 4 != 0 || inbound.served.contains(&id) {
-                continue;
+            for id in conn.readable() {
+                if id < FIRST_FLOW_STREAM || id % 4 != 0 {
+                    continue;
+                }
+                let Some(inbound) = routes.get_mut(dcid) else {
+                    return;
+                };
+                if inbound.served.contains(&id) {
+                    continue;
+                }
+                inbound.served.insert(id);
+                let thread_shared = Arc::clone(&shared);
+                let thread_sock = Arc::clone(sock);
+                let thread_serve = Arc::clone(serve);
+                let local = *local;
+                std::thread::spawn(move || {
+                    serve_stream(&thread_shared, &thread_sock, local, id, &thread_serve);
+                });
             }
-            inbound.served.insert(id);
-            let thread_shared = Arc::clone(&shared);
-            let thread_sock = Arc::clone(sock);
-            let thread_serve = Arc::clone(serve);
-            let local = *local;
-            std::thread::spawn(move || {
-                serve_stream(&thread_shared, &thread_sock, local, id, &thread_serve);
-            });
         }
     }
 
@@ -762,10 +765,10 @@ pub(crate) fn serve_loop(
         routes: HashMap::new(),
     };
     let mut buf = [0u8; 1350];
+    if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
+        return;
+    }
     loop {
-        if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
-            return;
-        }
         match router.sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 let Ok(header) = quiche::Header::from_slice(&mut buf[..n], SCID_LEN) else {
@@ -774,21 +777,30 @@ pub(crate) fn serve_loop(
                 if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
                     continue;
                 }
-                let dcid = header.dcid.as_ref().to_vec();
-                let peer_cid = header.scid.as_ref().to_vec();
                 let initial = header.ty == quiche::Type::Initial;
+                let dcid = header.dcid.as_ref();
+                let peer_cid = header.scid.as_ref();
+                if dcid.len() > 20 || peer_cid.len() > 20 {
+                    continue;
+                }
+                let mut dcid_buf = [0u8; 20];
+                dcid_buf[..dcid.len()].copy_from_slice(dcid);
+                let mut peer_buf = [0u8; 20];
+                peer_buf[..peer_cid.len()].copy_from_slice(peer_cid);
+                let dcid = &dcid_buf[..dcid.len()];
+                let peer_cid = &peer_buf[..peer_cid.len()];
                 if initial {
                     if let Some(key) = router.routes.iter().find_map(|(key, inbound)| {
-                        (inbound.client_cid == peer_cid).then(|| key.clone())
+                        (inbound.client_cid.as_slice() == peer_cid).then(|| key.clone())
                     }) {
                         router.drive(&key, &mut buf[..n], from);
-                    } else if !router.routes.contains_key(&dcid) {
-                        router.accept(&mut buf[..n], from, &mut template, &peer_cid);
+                    } else if !router.routes.contains_key(dcid) {
+                        router.accept(&mut buf[..n], from, &mut template, peer_cid);
                     } else {
-                        router.drive(&dcid, &mut buf[..n], from);
+                        router.drive(dcid, &mut buf[..n], from);
                     }
                 } else {
-                    router.drive(&dcid, &mut buf[..n], from);
+                    router.drive(dcid, &mut buf[..n], from);
                 }
             }
             Err(e)
