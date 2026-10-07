@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::json::Json;
-use ferrox_core::failure::{Failure, Kind, Stage};
+use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
 use ferrox_core::tls::TlsProvider as _;
 use ferrox_core::transport::EarlyData;
 
@@ -168,14 +168,51 @@ pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<TcpStream> {
     match dial(target) {
         Ok(stream) => Some(stream),
         Err(failure) => {
-            if failure.worth_retrying() {
-                RETRYABLE_DIALS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                FATAL_DIALS.fetch_add(1, Ordering::Relaxed);
-            }
-            eprintln!("dial {target} failed: {failure}");
+            note_dial_failure(target, failure);
             None
         }
+    }
+}
+
+fn note_dial_failure(target: &SocketAddr, failure: Failure) {
+    if failure.worth_retrying() {
+        RETRYABLE_DIALS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FATAL_DIALS.fetch_add(1, Ordering::Relaxed);
+    }
+    eprintln!("dial {target} failed: {failure}");
+}
+
+// The ladder rung a configured carrier answers, if it is on the ladder.
+fn rung_of(carrier: &Carrier) -> Option<Rung> {
+    match carrier {
+        Carrier::Raw => Some(Rung::Raw),
+        Carrier::Ws { .. } => Some(Rung::Ws),
+        Carrier::Xhttp { .. } => Some(Rung::Xhttp),
+        Carrier::Grpc { .. } => Some(Rung::Grpc),
+        Carrier::HttpUpgrade { .. } => Some(Rung::HttpUpgrade),
+        _ => None,
+    }
+}
+
+// The (path, early-data budget) a non-raw rung reuses from the configured carrier.
+fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
+    match carrier {
+        Carrier::Ws { path, ed } => Some((path, *ed)),
+        Carrier::HttpUpgrade { path }
+        | Carrier::Grpc { path }
+        | Carrier::Xhttp { path }
+        | Carrier::HttpHeader { path } => Some((path, 0)),
+        _ => None,
+    }
+}
+
+// The rung a dial starts at: the ladder's, never above the configured one.
+fn ladder_start(ladder: &Ladder, carrier: &Carrier) -> Rung {
+    let start = ladder.start_rung();
+    match rung_of(carrier) {
+        Some(configured) if start > configured => configured,
+        _ => start,
     }
 }
 
@@ -204,6 +241,23 @@ fn report_dial_failures() {
     eprintln!(
         "dials: {} fatal, {} retryable",
         failures.fatal, failures.retryable
+    );
+    report_ladder_rates();
+}
+
+fn report_ladder_rates() {
+    let ladder = Ladder::global();
+    for rung in Rung::ALL {
+        eprintln!(
+            "ladder: {rung}: {} attempts, {} useful",
+            ladder.attempts(rung),
+            ladder.useful(rung)
+        );
+    }
+    eprintln!(
+        "ladder: {} climbs, {} descents",
+        ladder.climbs(),
+        ladder.descents()
     );
 }
 
@@ -1561,83 +1615,192 @@ pub(crate) fn vless_mux_header(id: &[u8; 16]) -> Vec<u8> {
     header
 }
 
-fn dial_vless(client: &TcpStream, mut uplink: TcpStream, vless: &VlessOut, target: &SocketAddr) {
+// Records a rung failure and reports whether the session stops here.
+fn climb_or_hold(ladder: &Ladder, rung: Rung, stage: Stage, kind: Kind) -> bool {
+    let failure = Failure::new(stage, kind);
+    match ladder.record_failure(rung, &failure) {
+        Some(next) => {
+            eprintln!("ladder: {failure} climbs {rung} -> {next}");
+            false
+        }
+        None => true,
+    }
+}
+
+fn note_success(ladder: &Ladder, rung: Rung, stage: Stage, explicit: bool) {
+    if let Some((old, successes)) = ladder.record_success(rung, stage, explicit) {
+        eprintln!("ladder: {successes} useful successes descend {old} -> {rung} at {stage}");
+    }
+}
+
+// One rung of a ladder walk: the rung, its reused (path, budget), and whether
+// it is the session's configured carrier rather than a climb or a probe.
+#[derive(Clone, Copy)]
+struct RungAttempt<'a> {
+    rung: Rung,
+    path: &'a str,
+    ed: u32,
+    explicit: bool,
+}
+
+fn dial_vless(
+    client: &TcpStream,
+    server: &SocketAddr,
+    vless: &VlessOut,
+    target: &SocketAddr,
+    ladder: &Ladder,
+) {
     let header = vless_header(&vless.id, 1, target);
-    match &vless.carrier {
-        Carrier::Ws { path, ed } => {
+    let params = stream_params(&vless.carrier);
+    let explicit = rung_of(&vless.carrier);
+    if explicit.is_none() {
+        let Some(uplink) = dial_or_report(server) else {
+            return;
+        };
+        if dial_vless_headed(client, uplink, vless, &header) {
+            return;
+        }
+    }
+    let start = ladder_start(ladder, &vless.carrier);
+    let (rungs, count) = Rung::climb_from(start);
+    for rung in &rungs[..count] {
+        let attempt = if *rung == Rung::Raw {
+            RungAttempt {
+                rung: *rung,
+                path: "",
+                ed: 0,
+                explicit: Some(*rung) == explicit,
+            }
+        } else if let Some((path, ed)) = params {
+            RungAttempt {
+                rung: *rung,
+                path,
+                ed,
+                explicit: Some(*rung) == explicit,
+            }
+        } else {
+            break;
+        };
+        let uplink = match dial(server) {
+            Ok(uplink) => uplink,
+            Err(failure) => {
+                let _stop = ladder.record_failure(*rung, &failure);
+                note_dial_failure(server, failure);
+                return;
+            }
+        };
+        if dial_vless_rung(client, uplink, vless, &header, &attempt, ladder) {
+            return;
+        }
+    }
+}
+
+fn dial_vless_headed(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vless: &VlessOut,
+    header: &[u8],
+) -> bool {
+    let Carrier::HttpHeader { path } = &vless.carrier else {
+        return true;
+    };
+    let Some((mut reader, mut write)) = crate::httpheader::connect(uplink, &vless.host, path)
+    else {
+        return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
+    };
+    if write.write_all(header).is_err() {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    }
+    if read_vless_response(&mut reader).is_none() {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    }
+    crate::proxy::relay_carried(reader, &write, client);
+    true
+}
+
+fn dial_vless_rung(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vless: &VlessOut,
+    header: &[u8],
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    match rung {
+        Rung::Ws => {
             let Some((mut reader, writer)) =
-                crate::ws::connect(uplink, &vless.host, path, *ed, &header)
+                crate::ws::connect(uplink, &vless.host, attempt.path, attempt.ed, header)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             if read_vless_response(&mut reader).is_none() {
-                return;
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             crate::proxy::relay_sink(reader, &writer, client, |_| {});
+            true
         }
-        Carrier::HttpUpgrade { path } => {
+        Rung::HttpUpgrade => {
             let Some((mut reader, mut write)) =
-                crate::httpupgrade::connect(uplink, &vless.host, path)
+                crate::httpupgrade::connect(uplink, &vless.host, attempt.path)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if write.write_all(&header).is_err() {
-                return;
+            if write.write_all(header).is_err() {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             if read_vless_response(&mut reader).is_none() {
-                return;
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             crate::proxy::relay_carried(reader, &write, client);
+            true
         }
-        Carrier::Grpc { path } => {
-            let Some((mut reader, writer)) = crate::grpc::connect(uplink, &vless.host, path) else {
-                return;
+        Rung::Grpc => {
+            let Some((mut reader, writer)) =
+                crate::grpc::connect(uplink, &vless.host, attempt.path)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if !writer.send(&header) {
-                return;
+            if !writer.send(header) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             if read_vless_response(&mut reader).is_none() {
-                return;
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            true
         }
-        Carrier::Xhttp { path } => {
-            let Some((mut reader, writer)) = crate::xhttp::connect(uplink, &vless.host, path)
+        Rung::Xhttp => {
+            let Some((mut reader, writer)) =
+                crate::xhttp::connect(uplink, &vless.host, attempt.path)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if !writer.send(&header) {
-                return;
+            if !writer.send(header) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             if read_vless_response(&mut reader).is_none() {
-                return;
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             crate::proxy::relay_sink_drained(reader, &writer, client);
+            true
         }
-        Carrier::HttpHeader { path } => {
-            let Some((mut reader, mut write)) =
-                crate::httpheader::connect(uplink, &vless.host, path)
-            else {
-                return;
-            };
-            if write.write_all(&header).is_err() {
-                return;
-            }
-            if read_vless_response(&mut reader).is_none() {
-                return;
-            }
-            crate::proxy::relay_carried(reader, &write, client);
-        }
-        Carrier::Raw => {
-            if uplink.write_all(&header).is_err() {
-                return;
+        Rung::Raw => {
+            let mut uplink = uplink;
+            if uplink.write_all(header).is_err() {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
             }
             if read_vless_response(&mut uplink).is_none() {
-                return;
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             relay(client, &uplink);
+            true
         }
-        refused_carriers!() => {}
     }
 }
 
@@ -2431,30 +2594,35 @@ fn dial_vmess_httpupgrade(
     uplink: TcpStream,
     vmess: &VmessOut,
     target: &SocketAddr,
-    path: &str,
-) {
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let path = attempt.path;
     let Some((mut reader, mut write)) = crate::httpupgrade::connect(uplink, &vmess.host, path)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
     if write.write_all(&request).is_err() {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
     if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
+    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
     let Ok(closer) = write.try_clone() else {
-        return;
+        return true;
     };
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
     crate::vmess::pump_relay_carried(client, reader, write, &close, send, recv);
+    true
 }
 
 fn dial_vmess_grpc(
@@ -2462,25 +2630,30 @@ fn dial_vmess_grpc(
     uplink: TcpStream,
     vmess: &VmessOut,
     target: &SocketAddr,
-    path: &str,
-) {
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let path = attempt.path;
     let Some((mut reader, writer)) = crate::grpc::connect(uplink, &vmess.host, path) else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
     if !writer.send(&request) {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
     if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
+    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
     crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
 }
 
 fn dial_vmess_ws(
@@ -2488,21 +2661,25 @@ fn dial_vmess_ws(
     uplink: TcpStream,
     vmess: &VmessOut,
     target: &SocketAddr,
-    path: &str,
-    ed: u32,
-) {
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let path = attempt.path;
+    let ed = attempt.ed;
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
     let Some((mut reader, writer)) = crate::ws::connect(uplink, &vmess.host, path, ed, &request)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
+    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
     crate::vmess::pump_relay_carried(
@@ -2513,64 +2690,141 @@ fn dial_vmess_ws(
         send,
         recv,
     );
+    true
 }
 
-fn dial_vmess(client: &TcpStream, mut uplink: TcpStream, vmess: &VmessOut, target: &SocketAddr) {
-    match &vmess.carrier {
-        Carrier::Ws { path, ed } => dial_vmess_ws(client, uplink, vmess, target, path, *ed),
-        Carrier::Xhttp { path } => {
-            let Some((mut reader, writer)) = crate::xhttp::connect(uplink, &vmess.host, path)
-            else {
+fn dial_vmess(
+    client: &TcpStream,
+    server: &SocketAddr,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+    ladder: &Ladder,
+) {
+    let params = stream_params(&vmess.carrier);
+    let explicit = rung_of(&vmess.carrier);
+    if explicit.is_none() {
+        let Some(uplink) = dial_or_report(server) else {
+            return;
+        };
+        if dial_vmess_headed(client, uplink, vmess, target) {
+            return;
+        }
+    }
+    let start = ladder_start(ladder, &vmess.carrier);
+    let (rungs, count) = Rung::climb_from(start);
+    for rung in &rungs[..count] {
+        let attempt = if *rung == Rung::Raw {
+            RungAttempt {
+                rung: *rung,
+                path: "",
+                ed: 0,
+                explicit: Some(*rung) == explicit,
+            }
+        } else if let Some((path, ed)) = params {
+            RungAttempt {
+                rung: *rung,
+                path,
+                ed,
+                explicit: Some(*rung) == explicit,
+            }
+        } else {
+            break;
+        };
+        let uplink = match dial(server) {
+            Ok(uplink) => uplink,
+            Err(failure) => {
+                let _stop = ladder.record_failure(*rung, &failure);
+                note_dial_failure(server, failure);
                 return;
+            }
+        };
+        if dial_vmess_rung(client, uplink, vmess, target, &attempt, ladder) {
+            return;
+        }
+    }
+}
+
+fn dial_vmess_headed(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+) -> bool {
+    let Carrier::HttpHeader { path } = &vmess.carrier else {
+        return true;
+    };
+    let Some((mut reader, mut write)) = crate::httpheader::connect(uplink, &vmess.host, path)
+    else {
+        return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
+    };
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return !Failure::new(Stage::SocketConnected, Kind::Local).worth_retrying();
+    };
+    if write.write_all(&request).is_err() {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    }
+    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    }
+    let Ok(closer) = write.try_clone() else {
+        return true;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    crate::vmess::pump_relay_carried(client, reader, write, &close, send, recv);
+    true
+}
+
+fn dial_vmess_rung(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    match attempt.rung {
+        Rung::Ws => dial_vmess_ws(client, uplink, vmess, target, attempt, ladder),
+        Rung::HttpUpgrade => dial_vmess_httpupgrade(client, uplink, vmess, target, attempt, ladder),
+        Rung::Grpc => dial_vmess_grpc(client, uplink, vmess, target, attempt, ladder),
+        Rung::Xhttp => {
+            let rung = attempt.rung;
+            let Some((mut reader, writer)) =
+                crate::xhttp::connect(uplink, &vmess.host, attempt.path)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             let Some((request, send, recv, response_key, response_iv, auth)) =
                 crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
             };
             if !writer.send(&request) {
-                return;
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return;
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             let closer = writer.clone();
             let close: std::sync::Arc<dyn Fn() + Send + Sync> =
                 std::sync::Arc::new(move || closer.finish());
             let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
             crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
+            true
         }
-        Carrier::HttpHeader { path } => {
-            let Some((mut reader, mut write)) =
-                crate::httpheader::connect(uplink, &vmess.host, path)
-            else {
-                return;
-            };
-            let Some((request, send, recv, response_key, response_iv, auth)) =
-                crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
-            else {
-                return;
-            };
-            if write.write_all(&request).is_err() {
-                return;
-            }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return;
-            }
-            let Ok(closer) = write.try_clone() else {
-                return;
-            };
-            let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-                let _ = closer.shutdown(Shutdown::Both);
-            });
-            crate::vmess::pump_relay_carried(client, reader, write, &close, send, recv);
-        }
-        Carrier::Raw => {
+        Rung::Raw => {
+            let rung = attempt.rung;
+            let mut uplink = uplink;
             let Some((send, recv, response_key, response_iv, auth)) =
                 crate::vmess::client_handshake(&mut uplink, &vmess.id, vmess.cipher, target)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
             };
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             crate::vmess::pump_relay(
                 client,
                 &uplink,
@@ -2578,13 +2832,7 @@ fn dial_vmess(client: &TcpStream, mut uplink: TcpStream, vmess: &VmessOut, targe
                 recv,
                 Some((response_key, response_iv, auth)),
             );
-        }
-        refused_carriers!() => {}
-        Carrier::HttpUpgrade { path } => {
-            dial_vmess_httpupgrade(client, uplink, vmess, target, path);
-        }
-        Carrier::Grpc { path } => {
-            dial_vmess_grpc(client, uplink, vmess, target, path);
+            true
         }
     }
 }
@@ -2600,73 +2848,236 @@ fn trojan_header(key: &[u8; 56], cmd: u8, target: &SocketAddr) -> Vec<u8> {
     header
 }
 
-fn dial_trojan(client: &TcpStream, mut uplink: TcpStream, trojan: &TrojanOut, target: &SocketAddr) {
+fn dial_trojan(
+    client: &TcpStream,
+    server: &SocketAddr,
+    trojan: &TrojanOut,
+    target: &SocketAddr,
+    ladder: &Ladder,
+) {
     let header = trojan_header(&trojan.key, 1, target);
-    match &trojan.carrier {
-        Carrier::Ws { path, ed } => {
+    let params = stream_params(&trojan.carrier);
+    let explicit = rung_of(&trojan.carrier);
+    if explicit.is_none() {
+        let Some(uplink) = dial_or_report(server) else {
+            return;
+        };
+        if dial_trojan_headed(client, uplink, trojan, target, &header) {
+            return;
+        }
+    }
+    let start = ladder_start(ladder, &trojan.carrier);
+    let (rungs, count) = Rung::climb_from(start);
+    for rung in &rungs[..count] {
+        let attempt = if *rung == Rung::Raw {
+            RungAttempt {
+                rung: *rung,
+                path: "",
+                ed: 0,
+                explicit: Some(*rung) == explicit,
+            }
+        } else if let Some((path, ed)) = params {
+            RungAttempt {
+                rung: *rung,
+                path,
+                ed,
+                explicit: Some(*rung) == explicit,
+            }
+        } else {
+            break;
+        };
+        let uplink = match dial(server) {
+            Ok(uplink) => uplink,
+            Err(failure) => {
+                let _stop = ladder.record_failure(*rung, &failure);
+                note_dial_failure(server, failure);
+                return;
+            }
+        };
+        if dial_trojan_rung(client, uplink, trojan, target, &header, &attempt, ladder) {
+            return;
+        }
+    }
+}
+
+fn dial_trojan_headed(
+    client: &TcpStream,
+    uplink: TcpStream,
+    trojan: &TrojanOut,
+    _target: &SocketAddr,
+    header: &[u8],
+) -> bool {
+    let Carrier::HttpHeader { path } = &trojan.carrier else {
+        return true;
+    };
+    let Some((reader, mut write)) = crate::httpheader::connect(uplink, &trojan.host, path) else {
+        return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
+    };
+    if write.write_all(header).is_err() {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    }
+    crate::proxy::relay_carried(reader, &write, client);
+    true
+}
+
+fn dial_trojan_rung(
+    client: &TcpStream,
+    uplink: TcpStream,
+    trojan: &TrojanOut,
+    _target: &SocketAddr,
+    header: &[u8],
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    match rung {
+        Rung::Ws => {
             let Some((reader, writer)) =
-                crate::ws::connect(uplink, &trojan.host, path, *ed, &header)
+                crate::ws::connect(uplink, &trojan.host, attempt.path, attempt.ed, header)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             crate::proxy::relay_sink(reader, &writer, client, |_| {});
+            true
         }
-        Carrier::Raw => {
-            if uplink.write_all(&header).is_err() {
-                return;
+        Rung::Raw => {
+            let mut uplink = uplink;
+            if uplink.write_all(header).is_err() {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             relay(client, &uplink);
+            true
         }
-        refused_carriers!() => {}
-        Carrier::HttpUpgrade { path } => {
-            let Some((reader, mut write)) = crate::httpupgrade::connect(uplink, &trojan.host, path)
+        Rung::HttpUpgrade => {
+            let Some((reader, mut write)) =
+                crate::httpupgrade::connect(uplink, &trojan.host, attempt.path)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if write.write_all(&header).is_err() {
-                return;
+            if write.write_all(header).is_err() {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             crate::proxy::relay_carried(reader, &write, client);
+            true
         }
-        Carrier::Grpc { path } => {
-            let Some((reader, writer)) = crate::grpc::connect(uplink, &trojan.host, path) else {
-                return;
+        Rung::Grpc => {
+            let Some((reader, writer)) = crate::grpc::connect(uplink, &trojan.host, attempt.path)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if !writer.send(&header) {
-                return;
+            if !writer.send(header) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            true
         }
-        Carrier::Xhttp { path } => {
-            let Some((reader, writer)) = crate::xhttp::connect(uplink, &trojan.host, path) else {
-                return;
-            };
-            if !writer.send(&header) {
-                return;
-            }
-            crate::proxy::relay_sink_drained(reader, &writer, client);
-        }
-        Carrier::HttpHeader { path } => {
-            let Some((reader, mut write)) = crate::httpheader::connect(uplink, &trojan.host, path)
+        Rung::Xhttp => {
+            let Some((reader, writer)) = crate::xhttp::connect(uplink, &trojan.host, attempt.path)
             else {
-                return;
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if write.write_all(&header).is_err() {
-                return;
+            if !writer.send(header) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
-            crate::proxy::relay_carried(reader, &write, client);
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            crate::proxy::relay_sink_drained(reader, &writer, client);
+            true
         }
     }
 }
 
 fn dial_shadowsocks(
     client: &TcpStream,
+    server: &SocketAddr,
+    ss: &ShadowsocksOut,
+    target: &SocketAddr,
+    ladder: &Ladder,
+) {
+    let params = stream_params(&ss.carrier);
+    let explicit = rung_of(&ss.carrier);
+    if explicit.is_none() {
+        let Some(uplink) = dial_or_report(server) else {
+            return;
+        };
+        if dial_ss_headed(client, uplink, ss, target) {
+            return;
+        }
+    }
+    let start = ladder_start(ladder, &ss.carrier);
+    let (rungs, count) = Rung::climb_from(start);
+    for rung in &rungs[..count] {
+        let attempt = if *rung == Rung::Raw {
+            RungAttempt {
+                rung: *rung,
+                path: "",
+                ed: 0,
+                explicit: Some(*rung) == explicit,
+            }
+        } else if let Some((path, ed)) = params {
+            RungAttempt {
+                rung: *rung,
+                path,
+                ed,
+                explicit: Some(*rung) == explicit,
+            }
+        } else {
+            break;
+        };
+        let uplink = match dial(server) {
+            Ok(uplink) => uplink,
+            Err(failure) => {
+                let _stop = ladder.record_failure(*rung, &failure);
+                note_dial_failure(server, failure);
+                return;
+            }
+        };
+        if dial_ss_rung(client, uplink, ss, target, &attempt, ladder) {
+            return;
+        }
+    }
+}
+
+fn dial_ss_headed(
+    client: &TcpStream,
     uplink: TcpStream,
     ss: &ShadowsocksOut,
     target: &SocketAddr,
-) {
-    match &ss.carrier {
-        Carrier::Raw => {
+) -> bool {
+    let Carrier::HttpHeader { path } = &ss.carrier else {
+        return true;
+    };
+    let Some((reader, mut writer)) = crate::httpheader::connect(uplink, &ss.host, path) else {
+        return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
+    };
+    let Some((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    };
+    let Ok(closer) = writer.try_clone() else {
+        return true;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
+}
+
+fn dial_ss_rung(
+    client: &TcpStream,
+    uplink: TcpStream,
+    ss: &ShadowsocksOut,
+    target: &SocketAddr,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    match attempt.rung {
+        Rung::Raw => {
             let mut uplink = uplink;
             let Some((send, recv)) = crate::shadowsocks::client_send_handshake(
                 &mut uplink,
@@ -2674,26 +3085,16 @@ fn dial_shadowsocks(
                 &ss.method,
                 target,
             ) else {
-                return;
+                return climb_or_hold(ladder, attempt.rung, Stage::RequestSent, Kind::Dropped);
             };
+            note_success(ladder, attempt.rung, Stage::RequestSent, attempt.explicit);
             crate::shadowsocks::pump_relay(client, &uplink, send, recv);
+            true
         }
-        refused_carriers!() => {}
-        Carrier::Ws { path, .. } => {
-            dial_ss_ws(client, uplink, ss, target, path);
-        }
-        Carrier::HttpUpgrade { path } => {
-            dial_ss_httpupgrade(client, uplink, ss, target, path);
-        }
-        Carrier::Grpc { path } => {
-            dial_ss_grpc(client, uplink, ss, target, path);
-        }
-        Carrier::Xhttp { path } => {
-            dial_ss_xhttp(client, uplink, ss, target, path);
-        }
-        Carrier::HttpHeader { path } => {
-            dial_ss_httpheader(client, uplink, ss, target, path);
-        }
+        Rung::Ws => dial_ss_ws(client, uplink, ss, target, attempt, ladder),
+        Rung::HttpUpgrade => dial_ss_httpupgrade(client, uplink, ss, target, attempt, ladder),
+        Rung::Grpc => dial_ss_grpc(client, uplink, ss, target, attempt, ladder),
+        Rung::Xhttp => dial_ss_xhttp(client, uplink, ss, target, attempt, ladder),
     }
 }
 
@@ -2702,19 +3103,24 @@ fn dial_ss_ws(
     uplink: TcpStream,
     ss: &ShadowsocksOut,
     target: &SocketAddr,
-    path: &str,
-) {
-    let Some((reader, mut writer)) = crate::ws::connect(uplink, &ss.host, path, 0, &[]) else {
-        return;
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let Some((reader, mut writer)) = crate::ws::connect(uplink, &ss.host, attempt.path, 0, &[])
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
 }
 
 fn dial_ss_httpupgrade(
@@ -2722,23 +3128,28 @@ fn dial_ss_httpupgrade(
     uplink: TcpStream,
     ss: &ShadowsocksOut,
     target: &SocketAddr,
-    path: &str,
-) {
-    let Some((reader, mut writer)) = crate::httpupgrade::connect(uplink, &ss.host, path) else {
-        return;
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let Some((reader, mut writer)) = crate::httpupgrade::connect(uplink, &ss.host, attempt.path)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
     let Ok(closer) = writer.try_clone() else {
-        return;
+        return true;
     };
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
 }
 
 fn dial_ss_grpc(
@@ -2746,19 +3157,23 @@ fn dial_ss_grpc(
     uplink: TcpStream,
     ss: &ShadowsocksOut,
     target: &SocketAddr,
-    path: &str,
-) {
-    let Some((reader, mut writer)) = crate::grpc::connect(uplink, &ss.host, path) else {
-        return;
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let Some((reader, mut writer)) = crate::grpc::connect(uplink, &ss.host, attempt.path) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
 }
 
 fn dial_ss_xhttp(
@@ -2766,45 +3181,25 @@ fn dial_ss_xhttp(
     uplink: TcpStream,
     ss: &ShadowsocksOut,
     target: &SocketAddr,
-    path: &str,
-) {
-    let Some((reader, mut writer)) = crate::xhttp::connect(uplink, &ss.host, path) else {
-        return;
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let Some((reader, mut writer)) = crate::xhttp::connect(uplink, &ss.host, attempt.path) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
-        return;
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
     let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
-}
-
-fn dial_ss_httpheader(
-    client: &TcpStream,
-    uplink: TcpStream,
-    ss: &ShadowsocksOut,
-    target: &SocketAddr,
-    path: &str,
-) {
-    let Some((reader, mut writer)) = crate::httpheader::connect(uplink, &ss.host, path) else {
-        return;
-    };
-    let Some((send, recv)) =
-        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
-    else {
-        return;
-    };
-    let Ok(closer) = writer.try_clone() else {
-        return;
-    };
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        let _ = closer.shutdown(Shutdown::Both);
-    });
-    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
 }
 
 fn serve_trojan(mut stream: TcpStream, key: &[u8; 56], freedom: bool) {
@@ -3074,21 +3469,31 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
     let endpoint = format!("{address}:{port}");
     let server = endpoint.to_socket_addrs().ok().and_then(|mut it| it.next());
     let Some(server) = server else { return };
-    let Some(uplink) = dial_or_report(&server) else {
-        return;
-    };
+    dial_socks_outbound(&client, out, &server, &target);
+}
+
+fn dial_socks_outbound(
+    client: &TcpStream,
+    out: &Outbound,
+    server: &SocketAddr,
+    target: &SocketAddr,
+) {
+    let ladder = Ladder::global();
     match out {
         Outbound::Vless(vless) => {
             if vless.mux {
-                dial_vless_mux(&client, uplink, vless, &target);
+                let Some(uplink) = dial_or_report(server) else {
+                    return;
+                };
+                dial_vless_mux(client, uplink, vless, target);
             } else {
-                dial_vless(&client, uplink, vless, &target);
+                dial_vless(client, server, vless, target, ladder);
             }
         }
-        Outbound::Vmess(vmess) => dial_vmess(&client, uplink, vmess, &target),
-        Outbound::Trojan(trojan) => dial_trojan(&client, uplink, trojan, &target),
+        Outbound::Vmess(vmess) => dial_vmess(client, server, vmess, target, ladder),
+        Outbound::Trojan(trojan) => dial_trojan(client, server, trojan, target, ladder),
         Outbound::Shadowsocks(shadowsocks) => {
-            dial_shadowsocks(&client, uplink, shadowsocks, &target);
+            dial_shadowsocks(client, server, shadowsocks, target, ladder);
         }
         Outbound::Foxy(_) | Outbound::Freedom => {}
     }
@@ -6658,6 +7063,9 @@ mod tests {
         assert_eq!(out.host, "192.0.2.1");
     }
 
+    // A ladder walk dials one uplink per rung, so a test server serves the bound rather than one connection.
+    const LADDER_TEST_UPLINKS: usize = 6;
+
     #[test]
     fn socks_dials_vmess_over_xhttp_to_echo() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -6681,8 +7089,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            crate::vmess::serve_xhttp(stream, "/share", &id, true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                crate::vmess::serve_xhttp(stream, "/share", &id, true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -6812,8 +7222,10 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         let owned = path.to_owned();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve(stream, password, method, &owned, true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                serve(stream, password, method, &owned, true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8065,8 +8477,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            crate::vmess::serve_ws(stream, "/tunnel", &id, true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                crate::vmess::serve_ws(stream, "/tunnel", &id, true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8128,8 +8542,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            crate::vmess::serve_httpupgrade(stream, "/tunnel", &id, true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                crate::vmess::serve_httpupgrade(stream, "/tunnel", &id, true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8190,8 +8606,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            crate::vmess::serve_grpc(stream, "/TunnelService/Tun", &id, true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                crate::vmess::serve_grpc(stream, "/TunnelService/Tun", &id, true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8251,8 +8669,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8312,8 +8732,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan_httpupgrade(stream, &trojan_key("secret"), "/tunnel", true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                serve_trojan_httpupgrade(stream, &trojan_key("secret"), "/tunnel", true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8372,8 +8794,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan_grpc(stream, &trojan_key("secret"), "/Tun", true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                serve_trojan_grpc(stream, &trojan_key("secret"), "/Tun", true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8432,8 +8856,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan_xhttp(stream, &trojan_key("secret"), "/tunnel", true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                serve_trojan_xhttp(stream, &trojan_key("secret"), "/tunnel", true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8492,8 +8918,10 @@ mod tests {
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan_httpheader(stream, &trojan_key("secret"), "/tunnel", true);
+            for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
+                let Ok(stream) = stream else { continue };
+                serve_trojan_httpheader(stream, &trojan_key("secret"), "/tunnel", true);
+            }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -8639,6 +9067,88 @@ mod tests {
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let source = Arc::new(Mutex::new(None));
         assert!(dial_udp_uplink(&vless, &dest, &relay, source).is_none());
+    }
+
+    #[test]
+    fn the_ladder_climbs_from_raw_to_ws_and_relays() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = server.local_addr().expect("addr").port();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        thread::spawn(move || {
+            for stream in server.incoming() {
+                let Ok(stream) = stream else { continue };
+                thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                    let mut head = [0u8; 4];
+                    loop {
+                        match stream.peek(&mut head) {
+                            Ok(4) => break,
+                            Ok(_) => thread::sleep(Duration::from_millis(1)),
+                            Err(_) => return,
+                        }
+                    }
+                    if head != *b"GET " {
+                        return;
+                    }
+                    let Some((mut reader, writer)) = crate::ws::accept(stream, "/ladder") else {
+                        return;
+                    };
+                    let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                        return;
+                    };
+                    if got != id || cmd != 1 || !writer.send(&[0, 0]) {
+                        return;
+                    }
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if !writer.send(&buf[..n]) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let ladder = Arc::new(Ladder::new());
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Ws {
+                path: "/ladder".to_owned(),
+                ed: 0,
+            },
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+        };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let dial_ladder = Arc::clone(&ladder);
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(&stream, &server_addr, &vless, &target, &dial_ladder);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("timeout");
+        client.write_all(b"hello-ladder").expect("writes");
+        let mut back = [0u8; 12];
+        client.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"hello-ladder");
+        assert_eq!(ladder.current(), Rung::Ws);
+        assert_eq!(ladder.climbs(), 1);
+        assert_eq!(ladder.attempts(Rung::Raw), 1);
+        assert_eq!(ladder.attempts(Rung::Ws), 1);
+        assert_eq!(ladder.useful(Rung::Ws), 1);
     }
 
     const QUIC_TEST_TIMEOUT: Duration = Duration::from_secs(120);

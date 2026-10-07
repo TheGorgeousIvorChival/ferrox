@@ -1,4 +1,235 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Rung {
+    Raw = 0,
+    Ws = 1,
+    Xhttp = 2,
+    Grpc = 3,
+    HttpUpgrade = 4,
+}
+
+impl Rung {
+    pub const ALL: [Self; 5] = [
+        Self::Raw,
+        Self::Ws,
+        Self::Xhttp,
+        Self::Grpc,
+        Self::HttpUpgrade,
+    ];
+
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            Self::Raw => Some(Self::Ws),
+            Self::Ws => Some(Self::Xhttp),
+            Self::Xhttp => Some(Self::Grpc),
+            Self::Grpc => Some(Self::HttpUpgrade),
+            Self::HttpUpgrade => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn previous(self) -> Option<Self> {
+        match self {
+            Self::Raw => None,
+            Self::Ws => Some(Self::Raw),
+            Self::Xhttp => Some(Self::Ws),
+            Self::Grpc => Some(Self::Xhttp),
+            Self::HttpUpgrade => Some(Self::Grpc),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Ws,
+            2 => Self::Xhttp,
+            3 => Self::Grpc,
+            4 => Self::HttpUpgrade,
+            _ => Self::Raw,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Ws => "ws",
+            Self::Xhttp => "xhttp",
+            Self::Grpc => "grpc",
+            Self::HttpUpgrade => "httpupgrade",
+        }
+    }
+
+    #[must_use]
+    pub const fn climb_from(start: Self) -> ([Self; 5], usize) {
+        let mut rungs = [Self::Raw; 5];
+        let mut count = 0;
+        let mut rung = start;
+        loop {
+            rungs[count] = rung;
+            count += 1;
+            match rung.next() {
+                Some(above) => rung = above,
+                None => break,
+            }
+        }
+        (rungs, count)
+    }
+}
+
+impl fmt::Display for Rung {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+// Useful successes at the current rung before a cheaper one is re-probed.
+const DESCEND_AFTER_SUCCESSES: u32 = 16;
+
+#[derive(Debug, Default)]
+struct LadderCounts {
+    attempts: [u64; 5],
+    useful: [u64; 5],
+    climbs: u64,
+    descents: u64,
+}
+
+#[derive(Debug)]
+pub struct Ladder {
+    packed: AtomicU64,
+    locked: Mutex<LadderCounts>,
+}
+
+impl Ladder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            packed: AtomicU64::new(0),
+            locked: Mutex::new(LadderCounts::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn global() -> &'static Self {
+        static LADDER: OnceLock<Ladder> = OnceLock::new();
+        LADDER.get_or_init(Self::new)
+    }
+
+    fn unpack(packed: u64) -> (Rung, u32) {
+        (Rung::from_u8(packed as u8), (packed >> 8) as u32)
+    }
+
+    fn pack(current: Rung, successes: u32) -> u64 {
+        (u64::from(successes) << 8) | u64::from(current.as_u8())
+    }
+
+    #[must_use]
+    pub fn current(&self) -> Rung {
+        Self::unpack(self.packed.load(Ordering::Relaxed)).0
+    }
+
+    #[must_use]
+    pub fn start_rung(&self) -> Rung {
+        let (current, successes) = Self::unpack(self.packed.load(Ordering::Relaxed));
+        if successes >= DESCEND_AFTER_SUCCESSES {
+            current.previous().unwrap_or(current)
+        } else {
+            current
+        }
+    }
+
+    #[must_use]
+    pub fn record_success(&self, rung: Rung, stage: Stage, explicit: bool) -> Option<(Rung, u32)> {
+        let Ok(mut counts) = self.locked.lock() else {
+            return None;
+        };
+        counts.attempts[rung.as_u8() as usize] =
+            counts.attempts[rung.as_u8() as usize].saturating_add(1);
+        if !stage.is_useful_progress() {
+            return None;
+        }
+        counts.useful[rung.as_u8() as usize] =
+            counts.useful[rung.as_u8() as usize].saturating_add(1);
+        let (current, successes) = Self::unpack(self.packed.load(Ordering::Relaxed));
+        if rung == current {
+            let successes = successes.saturating_add(1);
+            self.packed
+                .store(Self::pack(current, successes), Ordering::Relaxed);
+            None
+        } else if rung < current
+            && (explicit
+                || Some(rung) == current.previous() && successes >= DESCEND_AFTER_SUCCESSES)
+        {
+            self.packed.store(Self::pack(rung, 0), Ordering::Relaxed);
+            counts.descents = counts.descents.saturating_add(1);
+            Some((current, successes))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn record_failure(&self, rung: Rung, failure: &Failure) -> Option<Rung> {
+        let Ok(mut counts) = self.locked.lock() else {
+            return None;
+        };
+        counts.attempts[rung.as_u8() as usize] =
+            counts.attempts[rung.as_u8() as usize].saturating_add(1);
+        if !failure.worth_retrying() {
+            return None;
+        }
+        let (current, _) = Self::unpack(self.packed.load(Ordering::Relaxed));
+        if rung == current {
+            let above = current.next()?;
+            self.packed.store(Self::pack(above, 0), Ordering::Relaxed);
+            counts.climbs = counts.climbs.saturating_add(1);
+            Some(above)
+        } else {
+            self.packed.store(Self::pack(current, 0), Ordering::Relaxed);
+            rung.next()
+        }
+    }
+
+    #[must_use]
+    pub fn attempts(&self, rung: Rung) -> u64 {
+        self.locked
+            .lock()
+            .map_or(0, |counts| counts.attempts[rung.as_u8() as usize])
+    }
+
+    #[must_use]
+    pub fn useful(&self, rung: Rung) -> u64 {
+        self.locked
+            .lock()
+            .map_or(0, |counts| counts.useful[rung.as_u8() as usize])
+    }
+
+    #[must_use]
+    pub fn climbs(&self) -> u64 {
+        self.locked.lock().map_or(0, |counts| counts.climbs)
+    }
+
+    #[must_use]
+    pub fn descents(&self) -> u64 {
+        self.locked.lock().map_or(0, |counts| counts.descents)
+    }
+}
+
+impl Default for Ladder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -377,5 +608,203 @@ mod tests {
             TransportKind::Xdrive => "xdrive",
             TransportKind::Other => "made-up",
         }
+    }
+
+    #[test]
+    fn rungs_climb_in_ladder_order_and_fit_one_byte() {
+        assert_eq!(Rung::ALL.len(), 5);
+        let mut rung = Rung::Raw;
+        for (index, want) in Rung::ALL.iter().enumerate() {
+            assert_eq!(rung, *want);
+            assert_eq!(rung.as_u8() as usize, index);
+            assert_eq!(Rung::from_u8(index as u8), *want);
+            rung = rung.next().unwrap_or(Rung::HttpUpgrade);
+        }
+        assert_eq!(Rung::HttpUpgrade.next(), None);
+        assert_eq!(Rung::Raw.previous(), None);
+        assert_eq!(Rung::from_u8(99), Rung::Raw);
+    }
+
+    #[test]
+    fn a_session_climbs_each_rung_once_and_no_further() {
+        let (rungs, count) = Rung::climb_from(Rung::Raw);
+        assert_eq!(count, 5);
+        assert_eq!(rungs, Rung::ALL);
+        let (rungs, count) = Rung::climb_from(Rung::Grpc);
+        assert_eq!(count, 2);
+        assert_eq!(rungs[..count], [Rung::Grpc, Rung::HttpUpgrade]);
+        let (_, count) = Rung::climb_from(Rung::HttpUpgrade);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_retryable_failure_climbs_and_a_final_one_holds() {
+        let ladder = Ladder::new();
+        let failure = Failure::new(Stage::SocketConnected, Kind::Dropped);
+        assert_eq!(ladder.record_failure(Rung::Raw, &failure), Some(Rung::Ws));
+        assert_eq!(ladder.current(), Rung::Ws);
+        assert_eq!(ladder.climbs(), 1);
+        assert_eq!(ladder.record_failure(Rung::HttpUpgrade, &failure), None);
+    }
+
+    #[test]
+    fn a_refusal_and_a_local_build_error_hold_the_rung() {
+        let ladder = Ladder::new();
+        assert_eq!(
+            ladder.record_failure(
+                Rung::Raw,
+                &Failure::new(Stage::SocketConnected, Kind::Refused)
+            ),
+            None
+        );
+        assert_eq!(
+            ladder.record_failure(
+                Rung::Raw,
+                &Failure::new(Stage::SocketConnected, Kind::Local)
+            ),
+            None
+        );
+        assert_eq!(ladder.current(), Rung::Raw);
+        assert_eq!(ladder.climbs(), 0);
+    }
+
+    #[test]
+    fn progress_after_first_byte_never_climbs() {
+        let ladder = Ladder::new();
+        assert_eq!(
+            ladder.record_failure(Rung::Raw, &Failure::new(Stage::FirstByte, Kind::Dropped)),
+            None
+        );
+        assert_eq!(ladder.current(), Rung::Raw);
+    }
+
+    #[test]
+    fn sixteen_useful_successes_earn_a_cheaper_probe() {
+        let ladder = Ladder::new();
+        assert_eq!(
+            ladder.record_failure(
+                Rung::Raw,
+                &Failure::new(Stage::SocketConnected, Kind::Unreachable),
+            ),
+            Some(Rung::Ws)
+        );
+        assert_eq!(ladder.current(), Rung::Ws);
+        for _ in 0..15 {
+            assert_eq!(
+                ladder.record_success(Rung::Ws, Stage::FirstByte, false),
+                None
+            );
+            assert_eq!(ladder.start_rung(), Rung::Ws);
+        }
+        assert_eq!(
+            ladder.record_success(Rung::Ws, Stage::FirstByte, false),
+            None
+        );
+        assert_eq!(ladder.start_rung(), Rung::Raw);
+        assert_eq!(
+            ladder.record_success(Rung::Raw, Stage::FirstByte, false),
+            Some((Rung::Ws, 16))
+        );
+        assert_eq!(ladder.current(), Rung::Raw);
+        assert_eq!(ladder.descents(), 1);
+    }
+
+    #[test]
+    fn a_failed_probe_restarts_the_success_count() {
+        let ladder = Ladder::new();
+        assert_eq!(
+            ladder.record_failure(
+                Rung::Raw,
+                &Failure::new(Stage::SocketConnected, Kind::Unreachable),
+            ),
+            Some(Rung::Ws)
+        );
+        for _ in 0..16 {
+            assert_eq!(
+                ladder.record_success(Rung::Ws, Stage::FirstByte, false),
+                None
+            );
+        }
+        assert_eq!(ladder.start_rung(), Rung::Raw);
+        assert_eq!(
+            ladder.record_failure(
+                Rung::Raw,
+                &Failure::new(Stage::SocketConnected, Kind::Unreachable),
+            ),
+            Some(Rung::Ws)
+        );
+        assert_eq!(ladder.current(), Rung::Ws);
+        assert_eq!(ladder.start_rung(), Rung::Ws);
+        assert_eq!(ladder.descents(), 0);
+    }
+
+    #[test]
+    fn shallow_successes_never_earn_a_probe() {
+        let ladder = Ladder::new();
+        assert_eq!(
+            ladder.record_failure(
+                Rung::Raw,
+                &Failure::new(Stage::SocketConnected, Kind::Unreachable),
+            ),
+            Some(Rung::Ws)
+        );
+        for _ in 0..100 {
+            assert_eq!(
+                ladder.record_success(Rung::Ws, Stage::RequestSent, false),
+                None
+            );
+        }
+        assert_eq!(ladder.start_rung(), Rung::Ws);
+        assert_eq!(ladder.descents(), 0);
+        assert_eq!(ladder.useful(Rung::Ws), 0);
+        assert_eq!(ladder.attempts(Rung::Ws), 100);
+    }
+
+    #[test]
+    fn an_explicit_success_adopts_down_past_unprobed_rungs() {
+        let ladder = Ladder::new();
+        let unreachable = Failure::new(Stage::SocketConnected, Kind::Unreachable);
+        assert_eq!(
+            ladder.record_failure(Rung::Raw, &unreachable),
+            Some(Rung::Ws)
+        );
+        assert_eq!(
+            ladder.record_failure(Rung::Ws, &unreachable),
+            Some(Rung::Xhttp)
+        );
+        assert_eq!(
+            ladder.record_failure(Rung::Xhttp, &unreachable),
+            Some(Rung::Grpc)
+        );
+        assert_eq!(
+            ladder.record_failure(Rung::Grpc, &unreachable),
+            Some(Rung::HttpUpgrade)
+        );
+        assert_eq!(ladder.current(), Rung::HttpUpgrade);
+        assert_eq!(
+            ladder.record_success(Rung::Raw, Stage::FirstByte, true),
+            Some((Rung::HttpUpgrade, 0))
+        );
+        assert_eq!(ladder.current(), Rung::Raw);
+        assert_eq!(ladder.descents(), 1);
+    }
+
+    #[test]
+    fn fallback_rates_count_every_attempt_and_useful_one() {
+        let ladder = Ladder::new();
+        assert_eq!(
+            ladder.record_success(Rung::Raw, Stage::FirstByte, false),
+            None
+        );
+        assert_eq!(
+            ladder.record_failure(
+                Rung::Raw,
+                &Failure::new(Stage::SocketConnected, Kind::Dropped),
+            ),
+            Some(Rung::Ws)
+        );
+        assert_eq!(ladder.attempts(Rung::Raw), 2);
+        assert_eq!(ladder.useful(Rung::Raw), 1);
+        assert_eq!(ladder.useful(Rung::Ws), 0);
     }
 }

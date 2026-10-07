@@ -585,7 +585,7 @@ Whichever it is, put it in one place the script reads: a floor under `ran`, so a
 ## P27 · Build the recovery ladder the failure taxonomy was cut for
 
 **When to use:** When `failure::Stage` and `failure::Kind` exist and the next row in `docs/zeronet-comparison.md` §6 wants a second exit. `ferrox-core/src/failure.rs` types why a dial stopped and `proxy.rs` reports it, but nothing *acts* on it yet: `dial_or_report` counts and prints, and eleven arms still give up on the first failure.
-**Status:** todo
+**Status:** doing
 **Leverage:** 5
 **Effort:** large
 **Gates:** `cargo test --workspace`; CI: `ci.yml` green on all three runners, and `conformance.yml` still refusing a tally of zero
