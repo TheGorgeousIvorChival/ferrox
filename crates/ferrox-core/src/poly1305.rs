@@ -673,27 +673,19 @@ impl Poly1305 {
             hv[3] = o3;
             hv[4] = o4;
 
-            let w = |blk: &[u8], at: usize| {
-                u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]])
-            };
-            let limbs = |blk: &[u8]| {
-                [
-                    w(blk, 0) & M26_U32,
-                    (w(blk, 3) >> 2) & M26_U32,
-                    (w(blk, 6) >> 4) & M26_U32,
-                    (w(blk, 9) >> 6) & M26_U32,
-                    (w(blk, 12) >> 8) + HIBIT26,
-                ]
-            };
-            let l0 = limbs(&g[0..16]);
-            let l1 = limbs(&g[16..32]);
-            let l2 = limbs(&g[32..48]);
-            let l3 = limbs(&g[48..64]);
-            for ((((hvp, a), b), c), d) in hv.iter_mut().zip(l0).zip(l1).zip(l2).zip(l3) {
-                *hvp = _mm256_add_epi64(
-                    *hvp,
-                    _mm256_setr_epi64x(a.into(), b.into(), c.into(), d.into()),
-                );
+            let wide = std::array::from_fn::<u64, 20, _>(|i| {
+                let (j, lane) = (i / 4, i % 4);
+                let at = lane * 16 + 3 * j;
+                let word = u32::from_le_bytes([g[at], g[at + 1], g[at + 2], g[at + 3]]);
+                u64::from(if j == 4 {
+                    (word >> 8) + HIBIT26
+                } else {
+                    (word >> (2 * j)) & M26_U32
+                })
+            });
+            for (j, hvp) in hv.iter_mut().enumerate() {
+                let limb = unsafe { _mm256_loadu_si256(wide.as_ptr().add(4 * j).cast()) };
+                *hvp = _mm256_add_epi64(*hvp, limb);
             }
 
             groups = &groups[64..];
