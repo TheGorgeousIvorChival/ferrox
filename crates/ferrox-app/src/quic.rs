@@ -68,6 +68,17 @@ const SEND_WAIT: Duration = Duration::from_secs(10);
 static TRUST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
+pub(crate) static QUIC_SERIAL: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn quic_serial() -> std::sync::MutexGuard<'static, ()> {
+    match QUIC_SERIAL.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
 pub(crate) static QSTAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
@@ -109,10 +120,19 @@ fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
     written
 }
 
+static B64_VALUE: [u8; 256] = {
+    let mut table = [u8::MAX; 256];
+    let mut slot = 0;
+    while slot < 64 {
+        table[B64[slot] as usize] = slot as u8;
+        slot += 1;
+    }
+    table
+};
+
 fn base64_value(byte: u8) -> Option<u8> {
-    B64.iter()
-        .position(|digit| *digit == byte)
-        .map(|slot| slot as u8)
+    let slot = B64_VALUE[usize::from(byte)];
+    (slot != u8::MAX).then_some(slot)
 }
 
 fn base64_decode(text: &[u8], out: &mut Vec<u8>) -> bool {
@@ -192,15 +212,29 @@ pub(crate) fn parse_ca_pem(pem: &[u8]) -> Vec<Vec<u8>> {
     certs
 }
 
-fn stage_trust_file(bundle: &[u8]) -> Option<std::path::PathBuf> {
+// create_new is O_EXCL, so a name already sitting in a shared tmp is a failure
+// rather than a file to truncate; following one would hand BoringSSL a trust
+// bundle this process did not write.
+fn stage_trust_file(bundle: &[u8]) -> Option<(std::path::PathBuf, String)> {
     let name = format!(
         "ferrox-quic-roots-{}-{}.pem",
         std::process::id(),
         TRUST_SEQ.fetch_add(1, Ordering::Relaxed)
     );
     let path = std::env::temp_dir().join(name);
-    std::fs::write(&path, bundle).ok()?;
-    Some(path)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    std::io::Write::write_all(&mut file, bundle).ok()?;
+    let text = path.to_str()?.to_owned();
+    Some((path, text))
 }
 
 pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
@@ -211,8 +245,7 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
     for root in roots {
         bundle.extend_from_slice(&der_to_pem(root, "CERTIFICATE"));
     }
-    let path = stage_trust_file(&bundle)?;
-    let path_text = path.to_str()?.to_owned();
+    let (path, path_text) = stage_trust_file(&bundle)?;
     let config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .ok()
         .and_then(|mut config| {
@@ -751,6 +784,69 @@ mod tests {
     }
 
     #[test]
+    fn the_base64_table_agrees_with_the_alphabet() {
+        for byte in 0..=u8::MAX {
+            let scanned = B64
+                .iter()
+                .position(|digit| *digit == byte)
+                .map_or(u8::MAX, |slot| slot as u8);
+            assert_eq!(B64_VALUE[usize::from(byte)], scanned, "byte {byte:#04x}");
+        }
+        for (slot, digit) in B64.iter().enumerate() {
+            assert_eq!(base64_value(*digit), Some(slot as u8));
+        }
+        for byte in [b'=', b' ', b'\n', b'!', 0, 0xff] {
+            assert_eq!(base64_value(byte), None);
+        }
+    }
+
+    #[test]
+    fn staging_refuses_a_name_something_else_already_holds() {
+        let _serial = quic_serial();
+        let (path, text) = stage_trust_file(b"mine").expect("stages");
+        assert_eq!(text, path.to_string_lossy());
+        let planted = std::env::temp_dir().join(format!(
+            "ferrox-quic-roots-{}-{}.pem",
+            std::process::id(),
+            TRUST_SEQ.load(Ordering::Relaxed)
+        ));
+        std::fs::write(&planted, b"planted").expect("plants");
+        assert!(stage_trust_file(b"mine").is_none());
+        assert_eq!(std::fs::read(&planted).expect("reads"), b"planted");
+        std::fs::remove_file(&path).expect("removes");
+        std::fs::remove_file(&planted).expect("removes");
+    }
+
+    #[test]
+    fn a_staged_trust_bundle_never_survives_its_loader() {
+        let _serial = quic_serial();
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()]).expect("mints");
+        let roots = parse_ca_pem(minted.cert.pem().as_bytes());
+        let staged = TRUST_SEQ.load(Ordering::Relaxed);
+        for _ in 0..4 {
+            assert!(quiche_config(&roots).is_some());
+        }
+        assert_eq!(TRUST_SEQ.load(Ordering::Relaxed), staged + 4);
+        assert_eq!(staged_bundles(staged), Vec::<String>::new());
+    }
+
+    fn staged_bundles(from: u64) -> Vec<String> {
+        let prefix = format!("ferrox-quic-roots-{}-", std::process::id());
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&prefix))
+            .filter_map(|n| n[prefix.len()..].strip_suffix(".pem")?.parse::<u64>().ok())
+            .filter(|seq| *seq >= from)
+            .map(|seq| seq.to_string())
+            .collect()
+    }
+
+    #[test]
     fn config_refuses_without_trust() {
         assert!(quiche_config(&[]).is_none());
         assert!(quiche_config(&[vec![0u8; 16]]).is_none());
@@ -758,6 +854,7 @@ mod tests {
 
     #[test]
     fn config_loads_a_minted_anchor() {
+        let _serial = quic_serial();
         let minted =
             rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()]).expect("mints");
         let roots = parse_ca_pem(minted.cert.pem().as_bytes());

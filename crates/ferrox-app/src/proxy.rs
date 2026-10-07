@@ -7387,13 +7387,8 @@ mod tests {
         let out = find_vless_outbound(&bare, Mimic::Xray).expect("finds anchorless quic");
         assert!(out.quic_roots.is_none());
     }
-    static QUIC_DIAL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn quic_serial() -> std::sync::MutexGuard<'static, ()> {
-        match QUIC_DIAL_SERIAL.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        crate::quic::quic_serial()
     }
 
     fn quic_retry_dial(once: fn(), attempts: u32) {
