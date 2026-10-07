@@ -1430,9 +1430,15 @@ mod tests {
 
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, writer) =
-            crate::ws::connect(stream, &format!("127.0.0.1:{port}"), path, 0, &[])
-                .expect("carries");
+        let (mut reader, writer) = crate::ws::connect(
+            stream,
+            &format!("127.0.0.1:{port}"),
+            path,
+            0,
+            &[],
+            ferrox_core::transport::Mimic::Xray,
+        )
+        .expect("carries");
 
         let (request, data_key, data_iv, auth) =
             request_bytes(&id, Cipher::Chacha, &target, 1).expect("request");

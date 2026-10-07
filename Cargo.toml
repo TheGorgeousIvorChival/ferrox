@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/ferrox-core",
   "crates/ferrox-bench",
+  "crates/ferrox-prompt",
   "crates/ferrox-app",
 ]
 

@@ -31,7 +31,17 @@ step "fixture safety"
 step "windows binary paths"
 ./scripts/check-windows-binary-paths.sh
 
+step "prompt library"
+cargo run --locked --quiet -p ferrox-prompt -- check
+
 step "tests"
 cargo test --workspace --locked
+
+# Same flags ops.yml blesses under: line tables only, nothing else, because a
+# different RUSTFLAGS is a different program and the counts in expected-ops.txt
+# are counts of that one.
+step "operation counts"
+RUSTFLAGS="-C debuginfo=line-tables-only" \
+    ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
 
 printf '\nall local checks green\n'

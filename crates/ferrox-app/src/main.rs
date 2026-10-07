@@ -20,7 +20,7 @@ fn usage() -> ! {
     eprintln!("  ferrox-app run <vless://...>     check + TCP reachability (sends nothing)");
     eprintln!("  ferrox-app version                print the serving binary's version");
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
-    eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
+    eprintln!("  ferrox-app run -c <config.json> [--mimic xray|sing-box|zray]   serve inbounds until killed");
     std::process::exit(2);
 }
 
@@ -118,10 +118,16 @@ fn main() {
             let next = args.next().unwrap_or_else(|| usage());
             if next == "-c" || next == "-config" {
                 let file = args.next().unwrap_or_else(|| usage());
-                if args.next().is_some() {
-                    usage();
+                let mut mimic = ferrox_core::transport::Mimic::default();
+                match (args.next(), args.next()) {
+                    (None, None) => {}
+                    (Some(flag), Some(mode)) if flag == "--mimic" => {
+                        mimic = ferrox_core::transport::Mimic::from_flag(&mode)
+                            .unwrap_or_else(|| usage());
+                    }
+                    _ => usage(),
                 }
-                proxy::serve_file(&file);
+                proxy::serve_file(&file, mimic);
             }
             if args.next().is_some() {
                 usage();

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 mode="${1:?usage: count-ops.sh report|check ...}"
-command -v valgrind >/dev/null || { echo "count-ops: valgrind not installed" >&2; exit 2; }
+command -v valgrind >/dev/null || { echo "count-ops: valgrind not installed (apt-get install valgrind strace / brew install valgrind)" >&2; exit 2; }
 
 outdir="$(mktemp -d)"
 trap 'rm -rf "$outdir"' EXIT
