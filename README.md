@@ -16,6 +16,7 @@ A from-scratch proxy core, built to be **bit-identical to the implementations it
 
 - **One algorithm, four widths.** The record layer is one generic function over a `Lanes` trait — portable arrays, NEON, SSE2, AVX2 — so backends execute the *same source* and cannot disagree. The portable path is safe Rust, so Miri interprets the ladder and the SIMD modules stay five instructions each whose only failure mode is a wrong answer.
 - **Rewrite, not port.** The minimal subset covering the matrix, proven faster down to the parsing. One line of comment per item at most, no changelogs — checked by `scripts/check-comments.sh`. The shared protocol is `crates/ferrox-prompt/prompts.md`.
+- **Counts prove, durations suggest.** Instruction counts are gated exact; allocation counts, copy counts and syscall counts are gated exactly too, and each method page names the checker for every number it states. A count nobody has measured is written `UNBLESSED`, which is a claim that is open, not a number.
 - **One TLS stack, one interface.** `TlsProvider` is implemented by rustls, and the provider *is* `Read + Write`, so nothing above can depend on the stack underneath. No feature to select, no build without TLS.
 - **quiche is the default QUIC, not a preference.** Whenever a rung needs QUIC and quiche is feasible, quiche; anything else must name the rung, the library, and the measurement that won.
 - **The reference is not as fast as it looks.** Comparators often ship SIMD behind a cfg nothing sets, so part of any speedup is the baseline not using its path. Every report prints both backends in the header; a ratio quoted without both names is not a measurement.
@@ -37,6 +38,7 @@ A from-scratch proxy core, built to be **bit-identical to the implementations it
 | parsers never panic on untrusted bytes | seeded cases over every untrusted entry point, printed on failure so a red run replays anywhere |
 | dependency licence and provenance | `deny.toml` + `scripts/check-dependency-policy.sh`; GPL/AGPL comparators are refused as dependencies |
 | roadmap coherence | `ferrox-prompt check`: no duplicate id, no gate-less slice, no cycle, no renamed `**Touches:**` path |
+| every method page's counts match one manifest | `scripts/check-method-docs.sh` against `scripts/method-counts.txt` — a number edited in a page without editing the manifest fails, and a manifest row with no page fails |
 
 Not claimed: that this is the fastest implementation. A benchmark measures a configuration at a point in time and decays. What is built instead is the machinery that notices.
 
@@ -45,6 +47,55 @@ Not claimed: that this is the fastest implementation. A benchmark measures a con
 ```
 
 That is what `ci.yml` runs. Running it first is how a lint stops costing a queue.
+
+## Method pages
+
+Every connection method this tree implements has a page under
+[`docs/function/`](docs/function). Each one carries the same four numbers —
+**ops** (retired instructions), **syscalls**, **memory copies**, and **time** —
+each with the name of the checker that produces it, a `graph TD` of the data
+path, and what was removed against Xray-core, sing-box and ZeroNet.
+
+Every number in those tables is a row in
+[`scripts/method-counts.txt`](scripts/method-counts.txt), and
+`scripts/check-method-docs.sh` fails if a page and that file disagree. That is
+the whole mechanism: a count that is not in the manifest is not a claim, and a
+claim with no checker is not made.
+
+| method | page | syscalls | copies per byte | ops | time |
+| --- | --- | --- | --- | --- | --- |
+| record layer (ChaCha20) | [record-layer](docs/function/record-layer.md) | 0 | 0 (in place) | `UNBLESSED` | not measured |
+| Shadowsocks AEAD | [shadowsocks](docs/function/shadowsocks.md) | **1 write per 16 KiB read**, 2 reads per chunk | 1 written, **0** read | `UNBLESSED` | not measured |
+| VMess AEAD | [vmess](docs/function/vmess.md) | **1 write per 32 KiB read** (4 frames) | 1 written, **0** read | `UNBLESSED` | not measured |
+| VLESS TCP | [vless](docs/function/vless.md) | 1 write per header, 0 framing after | 1 (the relay's own) | `UNBLESSED` | not measured |
+| Trojan TCP | [trojan](docs/function/trojan.md) | 1 write per header, 0 framing after | 1 (the relay's own) | `UNBLESSED` | not measured |
+| XTLS Vision | [xtls-vision](docs/function/xtls-vision.md) | 0 framing after the switch | **2** framed, **0** after the switch | `UNBLESSED` | not measured |
+| Mux.Cool + XUDP | [mux-cool](docs/function/mux-cool.md) | 1 write per frame | **0** written, 1 read | `UNBLESSED` | not measured |
+| WebSocket | [carrier-websocket](docs/function/carrier-websocket.md) | **1 read per 32 KiB window** (64 frames), 1 write per frame | 0 unmasked write, 1 masked | `UNBLESSED` | not measured |
+| HTTPUpgrade | [carrier-httpupgrade](docs/function/carrier-httpupgrade.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
+| HTTP masquerade | [carrier-httpheader](docs/function/carrier-httpheader.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
+| gRPC | [carrier-grpc](docs/function/carrier-grpc.md) | 1 write per message | 1 written, 1 read | `UNBLESSED` | not measured |
+| xHTTP | [carrier-xhttp](docs/function/carrier-xhttp.md) | 1 write per chunk | 1 written | `UNBLESSED` | not measured |
+| QUIC | [carrier-quic](docs/function/carrier-quic.md) | 1 handshake per server | quiche's | `UNBLESSED` | not measured |
+| REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake, rustls | per handshake, rustls | `UNBLESSED` | not measured |
+| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place | `UNBLESSED` | not measured |
+
+Two columns read "not measured" on every row, and that is the honest state
+rather than a gap in the table:
+
+- **ops.** `scripts/expected-ops.txt` still blesses exactly one symbol in the
+  whole tree, `der_to_pem 2653`, and it is a PEM formatting helper rather than a
+  carrier. `scripts/method-ops.txt` is the open list: `ops.yml` measures every
+  symbol on it on every run and publishes the numbers as the `method-ops`
+  artefact, which is what turns a row from `UNBLESSED` into a number somebody
+  can read and decide to bless. Blessing one means reading the diff that moved
+  it, never copying a measurement to silence the gate.
+- **time.** Every duration in this repository comes from a named runner:
+  `bench.yml`, `parity.yml`, `compare.yml`, `speedtest.yml` and
+  `benchmark-matrix.yml`. A number produced off a laptop behind a VPN is a
+  measurement of the tunnel, so no page quotes one that no CI artefact has
+  produced. The gates that *are* deterministic — allocation counts, copy counts,
+  syscall counts — are gated, and those are the numbers the pages lead with.
 
 ## Connection methods
 
@@ -61,30 +112,34 @@ They are not the same, and where they differ the table says so. `Support::Planne
 
 ### A — proxy protocols (the share-link world)
 
-| # | method | link | binary | detail |
-| --- | --- | --- | --- | --- |
-| 1 | VLESS TCP REALITY `xtls-rprx-vision` | `vless-tcp-reality-vision` | **server only** | Server role is complete: `shortId`/`X25519` auth (`crates/ferrox-core/src/tls/reality.rs:197`), Vision framing (`crates/ferrox-app/src/vision.rs`), over raw + gRPC + ws + xhttp + httpUpgrade + http header (`proxy.rs:1078`). No `dest`/`show` fallback, by design. The **client is not wired**: an outbound is only accepted when `security` is empty or `none` (`proxy.rs:4262`), so a REALITY outbound is skipped rather than dialled. `run` opens TCP and drops it. |
-| 2 | VLESS TCP TLS (Vision optional) | planned — *"parses, dials after the reality rung lands"* | **server only** | Serves `streamSettings.tlsSettings.certificates[0].{certificateFile,keyFile}` through rustls (`proxy.rs:991`, `proxy.rs:1443`), PEM in PKCS8/SEC1/PKCS1 (`tls/mod.rs:94`), Vision optional on `flow`. A rustls **client** role exists in core (`tls/mod.rs:199`) and is exercised by core tests; no config path dials it. |
-| 3 | VLESS TCP none, private/loopback only | `vless-tcp-none` | implemented | Both roles, TCP + UDP both directions, plus Mux: client `proxy.rs:1555`, server `proxy.rs:538`. Reachable only for hosts that fail `is_public_host` (`transport.rs:280`) — that check is the gate, not a heuristic. |
-| 4 | VLESS/TROJAN `security=none` to public (PattNG ext.) | unsafe opt-in — *"security=none to a public address (`PattNG` extension): explicit opt-in required"* | refused | `Support::UnsafeRequiresOptIn`, `check` exits 3. The flag type exists (`policy.rs:17`, `UnsafeOptIn::allow_plaintext_to_public`) and nothing constructs it yet: the gate is parse-level only, so it has never been exercised with consent. |
-| 5 | TROJAN TCP | *no `trojan://` link parser* | implemented, plaintext | Both roles over raw + ws + httpUpgrade + gRPC + xhttp + http header, TCP and UDP (`proxy.rs:2283`, `proxy.rs:2074`). **`security` is never read** for trojan outbounds (`proxy.rs:3961`), so this row is plaintext TCP with a password — an earlier README here claimed "TROJAN TCP TLS" and was wrong. UDP is raw-carrier only. |
-| 6 | VMess TCP (AEAD) | — (config-driven) | implemented | Both roles; ciphers `aes-128-gcm` → AES-GCM, `chacha20-ietf-poly1305`/`chacha20-poly1305` → ChaCha, `none`/unknown → Auto = ChaCha (`vmess.rs:19`). UDP both roles, **raw carrier only** (`proxy.rs:1643` refuses anything else). Carriers implemented for VMess too: raw, ws, xhttp, http header, httpUpgrade, gRPC (`vmess.rs:1091`–`1185`). |
-| 7 | Shadowsocks TCP/UDP | — (config-driven) | implemented | `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305` plus the Xray spellings (`shadowsocks.rs:17`); key length 16/32. **MD5 chain only** (`MasterKey::new`, `shadowsocks.rs:183`) — `2022-blake3-aes-256-gcm`, xchacha and rc4-md5 are rejected by name (`shadowsocks.rs:239`). UDP both roles, raw carrier only, per-datagram salt. |
-| 8 | VLESS over ws | `vless-ws` | implemented | Both roles (`proxy.rs:1491`, `proxy.rs:444`); TLS and REALITY layered underneath (`proxy.rs:1012`, `proxy.rs:1108`). |
-| 9 | VLESS over xhttp | `vless-xhttp` | implemented, one mode | Both roles. One mode only: POST plus `Transfer-Encoding: chunked` (`xhttp.rs:264`) — padding and placement rules per mode are not implemented. A slice in `prompts.md` still says this carrier has no implementation; that line is stale. |
-| 10 | VLESS over gRPC | `vless-grpc` | implemented | Both roles, full HTTP/2 + HPACK, `T_DATA`/`T_HEADERS`/`T_SETTINGS` (`grpc.rs`, 1292 lines). Path built as `/<service>/Tun`, default `/Tun` (`proxy.rs:4175`). |
-| 11 | VLESS over httpUpgrade | `vless-httpupgrade` | implemented | Both roles (`proxy.rs:1502`, `proxy.rs:462`). |
-| 12 | VLESS http masquerade / header | `vless-tcp` | implemented | Both roles (`proxy.rs:1541`, `proxy.rs:516`); selected by `tcpSettings.header.type == "http"` (`proxy.rs:4206`). |
-| 13 | VLESS over QUIC | `vless-quic` | client only | Dial + pool, one handshake per server (`quic.rs:591`, `quic.rs:671`), quiche with ALPN `h3`, roots required from `caCertFile` — without them the dial returns `None` (`quic.rs:206`). The **server role is refused** (`refused_carriers!`, `proxy.rs:534`). Reached only from a SOCKS inbound without Mux. |
-| 14 | KCP / mKCP | `vless-kcp` | implemented, TCP only | Both roles for VLESS, VMess, Trojan and Shadowsocks over plaintext KCP, plus VLESS over KCP under TLS and REALITY (`proxy.rs` `serve_*_kcp`/`dial_*_kcp`); `kcpSettings` (`mtu`, `tti`, capacities, multiplier, window, both casings) parsed into `kcp::Config` (`proxy.rs` `kcp_config`). The core rung stays oracle-proven against pinned Go `xray-core/transport/internet/kcp` (`kcp/oracle.rs`). UDP and Mux stay raw-carrier-only tree-wide, so they refuse KCP like every other carrier. |
-| 15 | `?ed=N` early data, ws | — | implemented, both roles | One parse for both roles (`transport::EarlyData`), one allocation per encode; client adds the `Sec-WebSocket-Protocol` line (`ws.rs:435`), server decodes and replays it (`ws.rs:384`). |
-| 16 | `?ed=N` early data, httpUpgrade | — | parsed, **not carried** | `?ed=N` is stripped from the path (`proxy.rs:4146`) and the budget is a path-level test only (`httpupgrade.rs:109`); nothing sends or decodes early data on this carrier. The earlier README's "both roles" was true for ws only. |
-| 17 | `cipherSuites` (PattNG ext.) | — | **not parsed** | Never read anywhere in `crates/`; survives only as an opaque entry of `VlessLink.params`. Parsed-but-carried was the claim; carried is not true. |
-| 18 | `unsafe-*` fingerprints (PattNG ext.) | unsafe opt-in — *"unsafe fingerprint requested: re-run with explicit opt-in"* | refused | `fp` starting `unsafe-`, or `allowUnsafeFp=1` (`vless.rs:90`). There is no uTLS or ClientHello shaping in this tree at all, so nothing would be spoofed even if consent were given. |
-| 19 | Hysteria | planned — *"parses, dial needs its own QUIC stack and congestion glue"* | refused | Name only: `TransportKind::Hysteria` and `Carrier::Hysteria`, both in the refused set. |
-| 20 | MASQUE CONNECT-IP (RFC 9484) | planned — *"parses, dial needs a QUIC stack"* | refused | Name only: `TransportKind::Masque`, `Carrier::Masque`. quiche is pinned as the default stack for this rung when it lands. |
-| 21 | TUIC / AnyTLS / ShadowTLS / Snell / Naive / SSH / OpenConnect / OpenVPN | parse to `TransportKind::Other` — *"unknown type: parses, transport not scheduled"* | refused | Zero occurrences in `crates/`. They are refused by falling into `Other`, not by a hand-written list, so there is no per-protocol reason string to quote for them. |
-| 22 | Mux / XUDP / `multi` | — | implemented, **raw carrier only** | The codec is complete — `Status`/`Network`/`Target`/`Outgoing`/`Incoming`, `global_id`, `CHUNK_MAX` (`mux.rs`) — and it is wired in both roles when `mux.enabled` is true. XUDP rides the mux: a `Network::Udp` target opens a UDP socket keyed by the frame's `global_id`, datagrams arrive as `Keep` frames carrying their own destination, and replies return as `Keep` frames carrying their source. The client sends one XUDP session per SOCKS association instead of dialling a carrier per destination. Both roles encode the mux request the way upstream does — command 3, no address (`vless_mux_header`) — so a real Xray peer agrees on the wire; `KeepAlive` is a no-op and the cap is `DEFAULT_CAP` 8 sessions. |
+Every implemented row links to its page: the counts, the data-path graph, and
+what was removed against the three pinned implementations live there, not here.
+This table is the verdict; the page is the evidence.
+
+| # | method | link | binary | page | notes |
+| --- | --- | --- | --- | --- | --- |
+| 1 | VLESS TCP REALITY `xtls-rprx-vision` | `vless-tcp-reality-vision` | **server only** | [vless](docs/function/vless.md) · [xtls-vision](docs/function/xtls-vision.md) · [reality-tls](docs/function/reality-tls.md) | Server role is complete: `shortId`/`X25519` auth (`crates/ferrox-core/src/tls/reality.rs:197`), Vision framing (`crates/ferrox-app/src/vision.rs`), over raw + gRPC + ws + xhttp + httpUpgrade + http header (`proxy.rs:1078`). No `dest`/`show` fallback, by design. The **client is not wired**: an outbound is only accepted when `security` is empty or `none` (`proxy.rs:4262`), so a REALITY outbound is skipped rather than dialled. `run` opens TCP and drops it. |
+| 2 | VLESS TCP TLS (Vision optional) | planned — *"parses, dials after the reality rung lands"* | **server only** | [reality-tls](docs/function/reality-tls.md) | Serves `streamSettings.tlsSettings.certificates[0].{certificateFile,keyFile}` through rustls (`proxy.rs:991`, `proxy.rs:1443`), PEM in PKCS8/SEC1/PKCS1 (`tls/mod.rs:94`), Vision optional on `flow`. A rustls **client** role exists in core (`tls/mod.rs:199`) and is exercised by core tests; no config path dials it. |
+| 3 | VLESS TCP none, private/loopback only | `vless-tcp-none` | implemented | [vless](docs/function/vless.md) | Both roles, TCP + UDP both directions, plus Mux: client `proxy.rs:1555`, server `proxy.rs:538`. Reachable only for hosts that fail `is_public_host` (`transport.rs:280`) — that check is the gate, not a heuristic. |
+| 4 | VLESS/TROJAN `security=none` to public (PattNG ext.) | unsafe opt-in — *"security=none to a public address (`PattNG` extension): explicit opt-in required"* | refused | — | `Support::UnsafeRequiresOptIn`, `check` exits 3. The flag type exists (`policy.rs:17`, `UnsafeOptIn::allow_plaintext_to_public`) and nothing constructs it yet: the gate is parse-level only, so it has never been exercised with consent. |
+| 5 | TROJAN TCP | *no `trojan://` link parser* | implemented, plaintext | [trojan](docs/function/trojan.md) | Both roles over raw + ws + httpUpgrade + gRPC + xhttp + http header, TCP and UDP (`proxy.rs:2283`, `proxy.rs:2074`). **`security` is never read** for trojan outbounds (`proxy.rs:3961`), so this row is plaintext TCP with a password — an earlier README here claimed "TROJAN TCP TLS" and was wrong. UDP is raw-carrier only. |
+| 6 | VMess TCP (AEAD) | — (config-driven) | implemented | [vmess](docs/function/vmess.md) | Both roles; ciphers `aes-128-gcm` → AES-GCM, `chacha20-ietf-poly1305`/`chacha20-poly1305` → ChaCha, `none`/unknown → Auto = ChaCha (`vmess.rs:19`). UDP both roles, **raw carrier only** (`proxy.rs:1643` refuses anything else). Carriers implemented for VMess too: raw, ws, xhttp, http header, httpUpgrade, gRPC (`vmess.rs:1091`–`1185`). |
+| 7 | Shadowsocks TCP/UDP | — (config-driven) | implemented | [shadowsocks](docs/function/shadowsocks.md) | `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305` plus the Xray spellings (`shadowsocks.rs:17`); key length 16/32. **MD5 chain only** (`MasterKey::new`, `shadowsocks.rs:183`) — `2022-blake3-aes-256-gcm`, xchacha and rc4-md5 are rejected by name (`shadowsocks.rs:239`). UDP both roles, raw carrier only, per-datagram salt. |
+| 8 | VLESS over ws | `vless-ws` | implemented | [carrier-websocket](docs/function/carrier-websocket.md) | Both roles (`proxy.rs:1491`, `proxy.rs:444`); TLS and REALITY layered underneath (`proxy.rs:1012`, `proxy.rs:1108`). |
+| 9 | VLESS over xhttp | `vless-xhttp` | implemented, one mode | [carrier-xhttp](docs/function/carrier-xhttp.md) | Both roles. One mode only: POST plus `Transfer-Encoding: chunked` (`xhttp.rs:264`) — padding and placement rules per mode are not implemented. A slice in `prompts.md` still says this carrier has no implementation; that line is stale. |
+| 10 | VLESS over gRPC | `vless-grpc` | implemented | [carrier-grpc](docs/function/carrier-grpc.md) | Both roles, full HTTP/2 + HPACK, `T_DATA`/`T_HEADERS`/`T_SETTINGS` (`grpc.rs`, 1292 lines). Path built as `/<service>/Tun`, default `/Tun` (`proxy.rs:4175`). |
+| 11 | VLESS over httpUpgrade | `vless-httpupgrade` | implemented | [carrier-httpupgrade](docs/function/carrier-httpupgrade.md) | Both roles (`proxy.rs:1502`, `proxy.rs:462`). |
+| 12 | VLESS http masquerade / header | `vless-tcp` | implemented | [carrier-httpheader](docs/function/carrier-httpheader.md) | Both roles (`proxy.rs:1541`, `proxy.rs:516`); selected by `tcpSettings.header.type == "http"` (`proxy.rs:4206`). |
+| 13 | VLESS over QUIC | `vless-quic` | client only | [carrier-quic](docs/function/carrier-quic.md) | Dial + pool, one handshake per server (`quic.rs:591`, `quic.rs:671`), quiche with ALPN `h3`, roots required from `caCertFile` — without them the dial returns `None` (`quic.rs:206`). The **server role is refused** (`refused_carriers!`, `proxy.rs:534`). Reached only from a SOCKS inbound without Mux. |
+| 14 | KCP / mKCP | `vless-kcp` | implemented, TCP only | [kcp](docs/function/kcp.md) | Both roles for VLESS, VMess, Trojan and Shadowsocks over plaintext KCP, plus VLESS over KCP under TLS and REALITY (`proxy.rs` `serve_*_kcp`/`dial_*_kcp`); `kcpSettings` (`mtu`, `tti`, capacities, multiplier, window, both casings) parsed into `kcp::Config` (`proxy.rs` `kcp_config`). The core rung stays oracle-proven against pinned Go `xray-core/transport/internet/kcp` (`kcp/oracle.rs`). UDP and Mux stay raw-carrier-only tree-wide, so they refuse KCP like every other carrier. |
+| 15 | `?ed=N` early data, ws | — | implemented, both roles | [carrier-websocket](docs/function/carrier-websocket.md) | One parse for both roles (`transport::EarlyData`), one allocation per encode; client adds the `Sec-WebSocket-Protocol` line (`ws.rs:435`), server decodes and replays it (`ws.rs:384`). |
+| 16 | `?ed=N` early data, httpUpgrade | — | parsed, **not carried** | [carrier-httpupgrade](docs/function/carrier-httpupgrade.md) | `?ed=N` is stripped from the path (`proxy.rs:4146`) and the budget is a path-level test only (`httpupgrade.rs:109`); nothing sends or decodes early data on this carrier. The earlier README's "both roles" was true for ws only. |
+| 17 | `cipherSuites` (PattNG ext.) | — | **not parsed** | — | Never read anywhere in `crates/`; survives only as an opaque entry of `VlessLink.params`. Parsed-but-carried was the claim; carried is not true. |
+| 18 | `unsafe-*` fingerprints (PattNG ext.) | unsafe opt-in — *"unsafe fingerprint requested: re-run with explicit opt-in"* | refused | [reality-tls](docs/function/reality-tls.md) | `fp` starting `unsafe-`, or `allowUnsafeFp=1` (`vless.rs:90`). There is no uTLS or ClientHello shaping in this tree at all, so nothing would be spoofed even if consent were given. |
+| 19 | Hysteria | planned — *"parses, dial needs its own QUIC stack and congestion glue"* | refused | — | Name only: `TransportKind::Hysteria` and `Carrier::Hysteria`, both in the refused set. |
+| 20 | MASQUE CONNECT-IP (RFC 9484) | planned — *"parses, dial needs a QUIC stack"* | refused | [carrier-quic](docs/function/carrier-quic.md) | Name only: `TransportKind::Masque`, `Carrier::Masque`. quiche is pinned as the default stack for this rung when it lands. |
+| 21 | TUIC / AnyTLS / ShadowTLS / Snell / Naive / SSH / OpenConnect / OpenVPN | parse to `TransportKind::Other` — *"unknown type: parses, transport not scheduled"* | refused | — | Zero occurrences in `crates/`. They are refused by falling into `Other`, not by a hand-written list, so there is no per-protocol reason string to quote for them. |
+| 22 | Mux / XUDP / `multi` | — | implemented, **raw carrier only** | [mux-cool](docs/function/mux-cool.md) | The codec is complete — `Status`/`Network`/`Target`/`Outgoing`/`Incoming`, `global_id`, `CHUNK_MAX` (`mux.rs`) — and it is wired in both roles when `mux.enabled` is true. XUDP rides the mux: a `Network::Udp` target opens a UDP socket keyed by the frame's `global_id`, datagrams arrive as `Keep` frames carrying their own destination, and replies return as `Keep` frames carrying their source. The client sends one XUDP session per SOCKS association instead of dialling a carrier per destination. Both roles encode the mux request the way upstream does — command 3, no address (`vless_mux_header`) — so a real Xray peer agrees on the wire; `KeepAlive` is a no-op and the cap is `DEFAULT_CAP` 8 sessions. |
 
 ### B — PattNG in full (what the fork wires)
 
@@ -192,9 +247,27 @@ crates/ferrox-core       record layer, ChaCha20 core, AES-GCM, TLS interface + r
 crates/ferrox-bench      counting allocator, gates, benchmark report, comparator
 crates/ferrox-app        ZeroNet-compatible app on ferrox-core (MIT)
 crates/ferrox-prompt     roadmap advisor; reads prompts.md, the only place a slice is written down
+docs/function            one page per connection method: ops, syscalls, copies, time, data-path graph
 upstream/                pins plus derived reading copies, re-fetched by scripts/fetch-upstream.sh
-scripts/                 pin checking, upstream fetching, gate and policy checks
+scripts/                 pin checking, upstream fetching, gate and policy checks, count manifests
 ```
+
+## Adding a method, or changing one
+
+A new connection method lands with its page, or the page and the code drift and
+the checker says so. The page needs four numbers with a checker each, a
+`graph TD` of the data path, and a `## Time` section that either cites a
+workflow or says the number is not measured yet:
+
+```bash
+printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-counts.txt
+./scripts/check-method-docs.sh
+```
+
+`UNBLESSED` is the value this repository already uses for a count nobody has
+measured: the named checker prints the real number on the next CI run and the
+claim stays open until it has been read. It is not a number and must never be
+quoted as one.
 
 ## Driving this with an agent
 

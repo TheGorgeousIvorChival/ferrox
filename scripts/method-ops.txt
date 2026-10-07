@@ -1,0 +1,24 @@
+# Per-method retired-instruction counts, for ops.yml to report.
+#
+# `scripts/count-ops.sh check` gates the one blessed row in
+# `scripts/expected-ops.txt`. This file is the open list: ops.yml measures every
+# row here on every run and publishes the numbers, which is what turns a row in
+# `scripts/method-counts.txt` from UNBLESSED into a number somebody can read and
+# decide to bless. A symbol that inlined into its caller under release will not
+# appear in a callgrind profile; that row is reported as not found and the next
+# name up is the one to try.
+#
+# `doc  test filter  symbol`
+record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::record::fill_exact
+record-layer  record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted  ferrox_core::record::fill_exact_with_head
+shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::seal_into
+shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::open_in_place
+vmess  vmess::tests::frames_seal_to_stable_bytes  vmess::stage_frames
+vmess  vmess::tests::frames_seal_to_stable_bytes  vmess::read_frame
+trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode_trojan_request
+vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
+xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
+carrier-websocket  ws::tests::a_read_covers_a_window_not_one_frame_header  ws::WsReader::pull
+carrier-websocket  ws::tests::frames_round_trip_masked_and_plain  ws::write_frame
+mux-cool  mux::tests::a_new_frame_is_the_bytes_the_fields_add_up_to  ferrox_core::mux::Frame::encode
+kcp  kcp::oracle::the_scripted_core_matches_the_pinned_go  ferrox_core::kcp::Segment::serialize

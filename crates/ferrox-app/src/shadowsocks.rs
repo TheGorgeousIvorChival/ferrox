@@ -27,7 +27,7 @@ pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom
     let Some(mut recv) = Cipher::from_master_key(method, &master, &salt[..salt_len]) else {
         return;
     };
-    let mut first = Vec::with_capacity(MAX_CHUNK + TAG_LEN);
+    let mut first = wire_buffer();
     let Some(first) = open_chunk(&mut stream, &mut recv, &mut first) else {
         return;
     };
@@ -190,7 +190,7 @@ fn accept_on(
     let mut salt = [0u8; SALT_LEN];
     read_exact(reader, &mut salt[..salt_len]).ok()?;
     let mut recv = Cipher::from_master_key(method, &master, &salt[..salt_len])?;
-    let mut first = Vec::with_capacity(MAX_CHUNK + TAG_LEN);
+    let mut first = wire_buffer();
     let first = open_chunk(reader, &mut recv, &mut first)?;
     let (target, used) = parse_addr_header(first)?;
     let mut uplink = TcpStream::connect_timeout(&target, Duration::from_secs(8)).ok()?;
@@ -218,7 +218,7 @@ pub(crate) fn client_send_handshake(
     let mut addr = Vec::with_capacity(20);
     push_addr(&mut addr, target, 4);
     addr.extend_from_slice(&target.port().to_be_bytes());
-    let mut staging = Vec::with_capacity(addr.len());
+    let mut staging = Vec::with_capacity(staging_room(addr.len()));
     seal_all(&mut send, &addr, &mut staging, uplink).ok()?;
     Some((send, Recv::Waiting(method, master)))
 }
@@ -267,7 +267,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
         let mut buf = vec![0u8; READ_CHUNK];
-        let mut staging = Vec::with_capacity(MAX_CHUNK);
+        let mut staging = Vec::with_capacity(staging_room(READ_CHUNK));
         while let Ok(read) = plain_read.read(&mut buf) {
             if read == 0 {
                 break;
@@ -293,7 +293,7 @@ pub(crate) fn pump_relay_carried<R, W>(
             cipher
         }
     };
-    let mut chunk = Vec::with_capacity(MAX_CHUNK + TAG_LEN);
+    let mut chunk = wire_buffer();
     while let Some(payload) = open_chunk(&mut reader, &mut recv, &mut chunk) {
         if plain_write.write_all(payload).is_err() {
             break;
@@ -363,38 +363,55 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     }
 }
 
+/// Bytes one wire chunk can never exceed: `MAX_CHUNK` of payload plus its tag.
+pub(crate) const WIRE_MAX: usize = MAX_CHUNK + TAG_LEN;
+
+/// One relay read's worth of staging, sized so `seal_all` never reallocates:
+/// the payload, plus a length chunk and two tags per `MAX_CHUNK` piece.
+pub(crate) fn staging_room(read_len: usize) -> usize {
+    read_len + read_len.div_ceil(MAX_CHUNK) * (LENGTH_LEN + 2 * TAG_LEN)
+}
+
+/// A chunk buffer sized once. `open_chunk` writes into a prefix of it, so no
+/// read ever grows or re-zeroes it.
+pub(crate) fn wire_buffer() -> Vec<u8> {
+    vec![0u8; WIRE_MAX]
+}
+
+/// Every chunk of one read is sealed into `staging` and handed to `out` in a
+/// single write: the wire bytes are the same stream, four times fewer syscalls.
 fn seal_all(
     send: &mut Cipher,
     plain: &[u8],
     staging: &mut Vec<u8>,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
+    if plain.is_empty() {
+        return Ok(());
+    }
+    staging.clear();
+    staging.reserve(staging_room(plain.len()));
     for chunk in plain.chunks(MAX_CHUNK) {
         let length = (chunk.len() as u16).to_be_bytes();
-        seal_into(send, &length, staging, out)?;
-        seal_into(send, chunk, staging, out)?;
+        seal_into(send, &length, staging)?;
+        seal_into(send, chunk, staging)?;
     }
-    Ok(())
+    out.write_all(staging)
 }
 
-fn seal_into(
-    send: &mut Cipher,
-    plain: &[u8],
-    staging: &mut Vec<u8>,
-    out: &mut dyn Write,
-) -> std::io::Result<()> {
-    staging.clear();
+fn seal_into(send: &mut Cipher, plain: &[u8], staging: &mut Vec<u8>) -> std::io::Result<()> {
     if send.seal_into(plain, staging).is_none() {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
     }
-    out.write_all(staging)?;
     Ok(())
 }
 
+/// Read one wire chunk out of `chunk`'s prefix. `chunk` is the caller's, sized
+/// [`WIRE_MAX`] once, and is opened in place — no allocation, no zero-fill.
 fn open_chunk<'a>(
     stream: &mut dyn Read,
     recv: &mut Cipher,
-    chunk: &'a mut Vec<u8>,
+    chunk: &'a mut [u8],
 ) -> Option<&'a [u8]> {
     use crate::proxy::read_exact;
     let mut length = [0u8; LENGTH_LEN + TAG_LEN];
@@ -403,13 +420,13 @@ fn open_chunk<'a>(
         return None;
     }
     let size = usize::from(u16::from_be_bytes([length[0], length[1]]));
-    if size > MAX_CHUNK {
+    if size + TAG_LEN > chunk.len() {
         return None;
     }
-    chunk.resize(size + TAG_LEN, 0);
-    read_exact(stream, chunk).ok()?;
-    let plain = open_into(recv, chunk)?;
-    Some(&chunk[..plain])
+    let wire = &mut chunk[..size + TAG_LEN];
+    read_exact(stream, wire).ok()?;
+    let plain = open_into(recv, wire)?;
+    Some(&wire[..plain])
 }
 
 fn open_into(recv: &mut Cipher, chunk: &mut [u8]) -> Option<usize> {
@@ -565,7 +582,7 @@ mod tests {
                     Cipher::from_master_key(method, &master, &peer[..salt_len]).expect("derives")
                 }
             };
-            let mut buf = Vec::with_capacity(MAX_CHUNK + TAG_LEN);
+            let mut buf = wire_buffer();
             let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens");
             assert_eq!(back, &b"ping"[..], "{name}");
         }
@@ -643,7 +660,7 @@ mod tests {
                 }
             };
             seal_all(&mut send, b"ping", &mut Vec::new(), writer).expect("seals");
-            let mut buf = Vec::with_capacity(MAX_CHUNK + TAG_LEN);
+            let mut buf = wire_buffer();
             let back = open_chunk(reader, &mut recv, &mut buf).expect("opens");
             assert_eq!(back, &b"ping"[..]);
         }
@@ -704,6 +721,51 @@ mod tests {
     }
 
     #[test]
+    fn one_relay_read_becomes_one_write_and_reads_back_whole() {
+        struct Counting<'a> {
+            seen: &'a mut Vec<u8>,
+            writes: usize,
+        }
+        impl Write for Counting<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.seen.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut send = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let plain: Vec<u8> = (0..READ_CHUNK).map(|i| (i % 251) as u8).collect();
+        let mut staging = Vec::with_capacity(staging_room(READ_CHUNK));
+        let mut seen = Vec::new();
+        let writes = {
+            let mut out = Counting {
+                seen: &mut seen,
+                writes: 0,
+            };
+            seal_all(&mut send, &plain, &mut staging, &mut out).expect("seals");
+            out.writes
+        };
+        assert_eq!(writes, 1, "a relay read is sealed and written once");
+
+        let mut recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut cursor = std::io::Cursor::new(&seen);
+        let mut wire = wire_buffer();
+        let mut got = 0usize;
+        while got < plain.len() {
+            let back = open_chunk(&mut cursor, &mut recv, &mut wire).expect("opens");
+            assert_eq!(back, &plain[got..got + back.len()]);
+            got += back.len();
+        }
+        assert_eq!(got, plain.len(), "every byte came back");
+    }
+
+    #[test]
     fn chunks_open_that_seal_sealed_and_reject_damage() {
         let salt = [7u8; SALT_LEN];
         let method = Method::Aes256Gcm;
@@ -713,7 +775,7 @@ mod tests {
         seal_all(&mut send, b"length-is-framing", &mut staging, &mut wire).expect("seals");
         let mut recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
         let mut cursor = std::io::Cursor::new(&wire);
-        let mut buf = Vec::with_capacity(MAX_CHUNK + TAG_LEN);
+        let mut buf = wire_buffer();
         let back = open_chunk(&mut cursor, &mut recv, &mut buf).expect("opens");
         assert_eq!(back, &b"length-is-framing"[..]);
 
@@ -722,7 +784,7 @@ mod tests {
         tampered[last] ^= 1;
         let mut damaged = std::io::Cursor::new(&tampered);
         let mut fresh = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
-        assert!(open_chunk(&mut damaged, &mut fresh, &mut Vec::new()).is_none());
+        assert!(open_chunk(&mut damaged, &mut fresh, &mut wire_buffer()).is_none());
     }
 
     #[test]

@@ -31,6 +31,9 @@ step "fixture safety"
 step "windows binary paths"
 ./scripts/check-windows-binary-paths.sh
 
+step "method docs"
+./scripts/check-method-docs.sh
+
 step "prompt library"
 cargo run --locked --quiet -p ferrox-prompt -- check
 

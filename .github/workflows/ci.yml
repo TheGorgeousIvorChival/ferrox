@@ -11,6 +11,9 @@ on:
       - "crates/**/*.rs"
       - "crates/**/*.toml"
       - "scripts/**"
+      - "docs/**"
+      - "README.md"
+      - "AGENTS.md"
       - ".github/workflows/**"
   workflow_dispatch:
 
@@ -47,7 +50,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: the gates that do not need a toolchain
         env:
-          GATES: check-leak-surface check-comments check-fixture-safety check-dependency-policy check-windows-binary-paths
+          GATES: check-leak-surface check-comments check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs
         run: |
           for gate in $GATES; do
             ( "./scripts/$gate.sh" > "/tmp/$gate.log" 2>&1; echo $? > "/tmp/$gate.rc" ) &
