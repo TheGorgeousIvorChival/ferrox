@@ -587,44 +587,23 @@ fn encode_target(out: &mut Vec<u8>, target: &SocketAddr) {
 }
 
 fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
-    if *cursor + 3 > header.len() {
-        return None;
-    }
-    let port = u16::from_be_bytes([header[*cursor], header[*cursor + 1]]);
-    *cursor += 2;
-    match header[*cursor] {
-        1 => {
-            *cursor += 1;
-            if *cursor + 4 > header.len() {
-                return None;
-            }
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&header[*cursor..*cursor + 4]);
-            *cursor += 4;
-            Some(SocketAddr::new(std::net::IpAddr::V4(ip.into()), port))
+    let port = u16::from_be_bytes(header.get(*cursor..*cursor + 2)?.try_into().ok()?);
+    let rest = &header[*cursor + 2..];
+    let kind = match rest.first()? {
+        1 => crate::proxy::AddrKind::V4,
+        2 => crate::proxy::AddrKind::Domain,
+        3 => crate::proxy::AddrKind::V6,
+        _ => return None,
+    };
+    let (body, used) = crate::proxy::parse_addr_body(rest, kind)?;
+    *cursor += 2 + used;
+    Some(match body {
+        crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
+        crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
+        crate::proxy::AddrBody::Domain(host) => {
+            format!("{host}:{port}").to_socket_addrs().ok()?.next()?
         }
-        2 => {
-            *cursor += 1;
-            let len = usize::from(*header.get(*cursor)?);
-            *cursor += 1;
-            if *cursor + len > header.len() {
-                return None;
-            }
-            let host = std::str::from_utf8(&header[*cursor..*cursor + len]).ok()?;
-            *cursor += len;
-            format!("{host}:{port}").to_socket_addrs().ok()?.next()
-        }
-        3 => {
-            *cursor += 1;
-            if *cursor + 16 > header.len() {
-                return None;
-            }
-            let ip: [u8; 16] = header[*cursor..*cursor + 16].try_into().unwrap();
-            *cursor += 16;
-            Some(SocketAddr::new(std::net::IpAddr::V6(ip.into()), port))
-        }
-        _ => None,
-    }
+    })
 }
 
 type RequestParts = (Vec<u8>, [u8; 16], [u8; 16], u8);
