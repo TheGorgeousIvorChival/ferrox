@@ -8620,6 +8620,27 @@ mod tests {
         assert!(dial_udp_uplink(&vless, &dest, &relay, source).is_none());
     }
 
+    #[test]
+    fn hysteria_dial_udp_uplink_is_none() {
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: 9,
+            id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                auth: String::new(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+            }),
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+        };
+        let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let source = Arc::new(Mutex::new(None));
+        assert!(dial_udp_uplink(&vless, &dest, &relay, source).is_none());
+    }
+
     const QUIC_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
     const QUIC_TEST_POLL: Duration = Duration::from_millis(100);
