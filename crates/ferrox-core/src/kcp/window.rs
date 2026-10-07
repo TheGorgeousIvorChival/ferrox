@@ -137,11 +137,21 @@ impl ReceivingWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AckEntry {
+    number: u32,
+    timestamp: u32,
+    next_flush: u32,
+}
+
+// Upstream bounds an ack's number list and the deferred-candidate buffer
+// separately, and they are separate limits that happen to share a value.
+const FLUSH_CANDIDATES: usize = 128;
+
 #[derive(Debug, Default)]
 pub struct AckList {
-    numbers: Vec<u32>,
-    timestamps: Vec<u32>,
-    next_flush: Vec<u32>,
+    entries: Vec<AckEntry>,
+    candidates: Vec<u32>,
     dirty: bool,
 }
 
@@ -152,36 +162,34 @@ impl AckList {
     }
 
     pub fn add(&mut self, number: u32, timestamp: u32) {
-        self.numbers.push(number);
-        self.timestamps.push(timestamp);
-        self.next_flush.push(0);
+        self.entries.push(AckEntry {
+            number,
+            timestamp,
+            next_flush: 0,
+        });
         self.dirty = true;
     }
 
     pub fn clear(&mut self, una: u32) {
-        let mut count = 0usize;
-        for i in 0..self.numbers.len() {
-            if self.numbers[i] < una {
+        let mut kept = 0;
+        for i in 0..self.entries.len() {
+            if self.entries[i].number < una {
                 continue;
             }
-            if i != count {
-                self.numbers[count] = self.numbers[i];
-                self.timestamps[count] = self.timestamps[i];
-                self.next_flush[count] = self.next_flush[i];
+            if i != kept {
+                self.entries[kept] = self.entries[i];
             }
-            count += 1;
+            kept += 1;
         }
-        if count < self.numbers.len() {
-            self.numbers.truncate(count);
-            self.timestamps.truncate(count);
-            self.next_flush.truncate(count);
+        if kept < self.entries.len() {
+            self.entries.truncate(kept);
             self.dirty = true;
         }
     }
 
     #[must_use]
     pub fn is_pending(&self) -> bool {
-        !self.numbers.is_empty()
+        !self.entries.is_empty()
     }
 
     pub fn flush(
@@ -191,22 +199,19 @@ impl AckList {
         limit: usize,
         write: &mut impl FnMut(&mut AckSegment),
     ) {
-        let mut flush_candidates = Vec::new();
         let mut seg = AckSegment::new(limit);
-        for i in 0..self.numbers.len() {
-            if self.next_flush[i] > current {
-                if flush_candidates.len() < 128 {
-                    flush_candidates.push(self.numbers[i]);
+        let timeout = (rto / 2).max(20);
+        self.candidates.clear();
+        for entry in &mut self.entries {
+            if entry.next_flush > current {
+                if self.candidates.len() < FLUSH_CANDIDATES {
+                    self.candidates.push(entry.number);
                 }
                 continue;
             }
-            seg.put_number(self.numbers[i]);
-            seg.put_timestamp(self.timestamps[i]);
-            let mut timeout = rto / 2;
-            if timeout < 20 {
-                timeout = 20;
-            }
-            self.next_flush[i] = current + timeout;
+            seg.put_number(entry.number);
+            seg.put_timestamp(entry.timestamp);
+            entry.next_flush = current + timeout;
             if seg.is_full() {
                 write(&mut seg);
                 seg = AckSegment::new(limit);
@@ -214,11 +219,11 @@ impl AckList {
             }
         }
         if self.dirty || !seg.is_empty() {
-            for number in flush_candidates {
+            for index in 0..self.candidates.len() {
                 if seg.is_full() {
                     break;
                 }
-                seg.put_number(number);
+                seg.put_number(self.candidates[index]);
             }
             write(&mut seg);
             self.dirty = false;
@@ -277,7 +282,31 @@ mod tests {
         l.add(5, 10);
         l.add(7, 20);
         l.clear(7);
-        assert_eq!(l.numbers, vec![7]);
+        assert_eq!(
+            l.entries.iter().map(|e| e.number).collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert_eq!(l.entries[0].timestamp, 20);
+    }
+
+    #[test]
+    fn the_ack_list_reuses_its_scratch_across_flushes() {
+        let mut l = AckList::new();
+        l.add(1, 100);
+        l.add(2, 110);
+        l.flush(0, 100, 300, &mut |_: &mut AckSegment| {});
+        for current in 1..50u32 {
+            l.flush(current, 100, 300, &mut |_: &mut AckSegment| {});
+            assert_eq!(l.candidates, vec![1, 2]);
+        }
+        l.flush(50, 100, 300, &mut |_: &mut AckSegment| {});
+        let scratch = l.candidates.as_ptr();
+        for current in 51..100u32 {
+            l.flush(current, 100, 300, &mut |_: &mut AckSegment| {});
+            assert_eq!(l.candidates, vec![1, 2]);
+        }
+        assert_eq!(l.candidates.as_ptr(), scratch);
+        assert_eq!(l.entries.len(), 2);
     }
 
     #[test]
