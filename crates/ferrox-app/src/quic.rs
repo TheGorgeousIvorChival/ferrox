@@ -28,15 +28,38 @@ struct PooledState {
     next_id: u64,
 }
 
+/// The shared connection one flow rides, its socket, the local address its
+/// packets come from, and the bidirectional stream id this flow opened.
+pub(crate) type PooledStream = (
+    Arc<Mutex<quiche::Connection>>,
+    Arc<UdpSocket>,
+    SocketAddr,
+    u64,
+);
+
 #[derive(Clone)]
 struct PooledConn {
     conn: Arc<Mutex<quiche::Connection>>,
     table: Arc<Mutex<PooledState>>,
     sock: Arc<UdpSocket>,
+    key: Arc<QuicServer>,
 }
 
 struct QuicPool {
     inner: Mutex<HashMap<QuicServer, PooledConn>>,
+}
+
+impl QuicPool {
+    /// The connection already open to this edge, if there is one.
+    fn stream(&self, dial: &QuicDial) -> Option<PooledConn> {
+        let key = QuicServer {
+            address: dial.address.clone(),
+            port: dial.port,
+            host: dial.host.clone(),
+            roots: dial.roots.clone(),
+        };
+        self.inner.lock().ok()?.get(&key).cloned()
+    }
 }
 
 static QUIC_POOL: OnceLock<QuicPool> = OnceLock::new();
@@ -53,7 +76,7 @@ const SCID_LEN: usize = 16;
 
 const MAX_DATAGRAM: usize = 1350;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
@@ -263,14 +286,14 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>]) -> Option<quiche::Config> {
     config
 }
 
-fn flush_egress(conn: &mut quiche::Connection, sock: &UdpSocket) {
+pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &UdpSocket) {
     let mut out = [0u8; MAX_DATAGRAM];
     while let Ok((written, info)) = conn.send(&mut out) {
         let _ = sock.send_to(&out[..written], info.to);
     }
 }
 
-fn pump_once(
+pub(crate) fn pump_once(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
     local: SocketAddr,
@@ -299,7 +322,7 @@ fn pump_once(
     true
 }
 
-fn drive_handshake(
+pub(crate) fn drive_handshake(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
     local: SocketAddr,
@@ -318,7 +341,7 @@ fn drive_handshake(
     Some(())
 }
 
-fn stream_send_all(
+pub(crate) fn stream_send_all(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
     stream: u64,
@@ -356,7 +379,7 @@ fn stream_send_all(
     true
 }
 
-fn stream_recv_exact(
+pub(crate) fn stream_recv_exact(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
     local: SocketAddr,
@@ -389,7 +412,10 @@ fn stream_recv_exact(
     (out.len() == want).then_some(out)
 }
 
-fn udp_to_server(address: &str, port: u16) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
+pub(crate) fn udp_to_server(
+    address: &str,
+    port: u16,
+) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
     let peer = format!("{address}:{port}").to_socket_addrs().ok()?.next()?;
     let sock = if peer.is_ipv6() {
         UdpSocket::bind("[::]:0").ok()?
@@ -400,7 +426,7 @@ fn udp_to_server(address: &str, port: u16) -> Option<(UdpSocket, SocketAddr, Soc
     Some((sock, peer, local))
 }
 
-fn handshake(
+pub(crate) fn handshake(
     sock: &UdpSocket,
     peer: SocketAddr,
     local: SocketAddr,
@@ -699,6 +725,57 @@ pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAd
     uplink_stream(&pooled, &key, id, client);
 }
 
+/// The pooled connection for an edge, built on first use and shared after that,
+/// plus a fresh bidirectional stream id on it. The Foxy lane asks for one of
+/// these instead of building a connection per flow, because that is the whole
+/// point of the QUIC carrier: one handshake carries many tunnels.
+pub(crate) fn pooled_stream(dial: &QuicDial) -> Option<PooledStream> {
+    let pooled = pool().stream(dial).or_else(|| {
+        let fresh = build_pooled(dial)?;
+        let Ok(mut pool) = pool().inner.lock() else {
+            return Some(fresh);
+        };
+        if let Some(live) = pool.get(fresh.key.as_ref()) {
+            return Some(live.clone());
+        }
+        pool.insert(fresh.key.as_ref().clone(), fresh.clone());
+        Some(fresh)
+    })?;
+    let id = {
+        let Ok(mut table) = pooled.table.lock() else {
+            return None;
+        };
+        if table.opening.len() >= MAX_STREAMS as usize {
+            return None;
+        }
+        let id = table.next_id;
+        table.next_id += 4;
+        table.opening.insert(id);
+        id
+    };
+    let local = pooled.sock.local_addr().ok()?;
+    Some((
+        Arc::clone(&pooled.conn),
+        Arc::clone(&pooled.sock),
+        local,
+        id,
+    ))
+}
+
+/// Hands a stream back to the pool once its tunnel is over, and closes the
+/// connection when it was the last stream on it.
+pub(crate) fn release_stream(dial: &QuicDial, id: u64) {
+    let key = QuicServer {
+        address: dial.address.clone(),
+        port: dial.port,
+        host: dial.host.clone(),
+        roots: dial.roots.clone(),
+    };
+    let pooled = pool().stream(dial);
+    let Some(pooled) = pooled else { return };
+    leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), &key, id);
+}
+
 fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = udp_to_server(&dial.address, dial.port)?;
@@ -720,6 +797,12 @@ fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
         conn: shared,
         table,
         sock: Arc::new(sock),
+        key: Arc::new(QuicServer {
+            address: dial.address.clone(),
+            port: dial.port,
+            host: dial.host.clone(),
+            roots: dial.roots.clone(),
+        }),
     })
 }
 
