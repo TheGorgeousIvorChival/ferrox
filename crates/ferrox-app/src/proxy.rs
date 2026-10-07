@@ -9348,7 +9348,7 @@ mod tests {
         });
         let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
             .expect("timeout");
         client
     }
