@@ -2818,6 +2818,9 @@ fn dial_vmess_rung(
         }
         Rung::Raw => {
             let rung = attempt.rung;
+            if !attempt.explicit {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
             let mut uplink = uplink;
             let Some((send, recv, response_key, response_iv, auth)) =
                 crate::vmess::client_handshake(&mut uplink, &vmess.id, vmess.cipher, target)
@@ -2942,6 +2945,9 @@ fn dial_trojan_rung(
             true
         }
         Rung::Raw => {
+            if !attempt.explicit {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
             let mut uplink = uplink;
             if uplink.write_all(header).is_err() {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
@@ -3078,6 +3084,9 @@ fn dial_ss_rung(
 ) -> bool {
     match attempt.rung {
         Rung::Raw => {
+            if !attempt.explicit {
+                return climb_or_hold(ladder, attempt.rung, Stage::RequestSent, Kind::Dropped);
+            }
             let mut uplink = uplink;
             let Some((send, recv)) = crate::shadowsocks::client_send_handshake(
                 &mut uplink,
