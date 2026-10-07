@@ -53,7 +53,13 @@ impl TransportKind {
     pub const fn is_dialled(self) -> bool {
         matches!(
             self,
-            Self::Tcp | Self::Ws | Self::Xhttp | Self::Grpc | Self::Quic | Self::HttpUpgrade
+            Self::Tcp
+                | Self::Ws
+                | Self::Xhttp
+                | Self::Grpc
+                | Self::Quic
+                | Self::HttpUpgrade
+                | Self::Kcp
         )
     }
 }
@@ -104,23 +110,30 @@ impl EarlyData {
         let Some((base, query)) = head.split_once('?') else {
             return untouched();
         };
-        let is_ed = |pair: &str| pair.split_once('=').is_some_and(|(key, _)| key == "ed");
-        let first = query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(key, _)| *key == "ed")
-            .map_or("", |(_, value)| value);
+        let mut first: Option<&str> = None;
+        let mut out = base.to_owned();
+        let mut sep = '?';
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = pair.split_once('=') {
+                if key == "ed" {
+                    if first.is_none() {
+                        first = Some(value);
+                    }
+                    continue;
+                }
+            }
+            out.push(sep);
+            out.push_str(pair);
+            sep = '&';
+        }
+        let Some(first) = first else {
+            return untouched();
+        };
         if first.is_empty() {
             return untouched();
-        }
-        let kept = query
-            .split('&')
-            .filter(|pair| !pair.is_empty() && !is_ed(pair))
-            .collect::<Vec<_>>();
-        let mut out = base.to_owned();
-        if !kept.is_empty() {
-            out.push('?');
-            out.push_str(&kept.join("&"));
         }
         if let Some(fragment) = fragment {
             out.push('#');
@@ -138,11 +151,14 @@ fn atoi(text: &str) -> i64 {
         Some(digits) => (true, digits),
         None => (false, text.strip_prefix('+').unwrap_or(text)),
     };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if digits.is_empty() {
         return 0;
     }
     let mut value: i64 = 0;
     for byte in digits.bytes() {
+        if !byte.is_ascii_digit() {
+            return 0;
+        }
         let Some(next) = value
             .checked_mul(10)
             .and_then(|value| value.checked_add(i64::from(byte - b'0')))
@@ -160,14 +176,38 @@ fn atoi(text: &str) -> i64 {
 
 const URL_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+const fn digit_table() -> [u8; 256] {
+    let mut table = [255u8; 256];
+    let mut c = b'A';
+    while c <= b'Z' {
+        table[c as usize] = c - b'A';
+        c += 1;
+    }
+    c = b'a';
+    while c <= b'z' {
+        table[c as usize] = c - b'a' + 26;
+        c += 1;
+    }
+    c = b'0';
+    while c <= b'9' {
+        table[c as usize] = c - b'0' + 52;
+        c += 1;
+    }
+    table[b'+' as usize] = 62;
+    table[b'-' as usize] = 62;
+    table[b'/' as usize] = 63;
+    table[b'_' as usize] = 63;
+    table
+}
+
+const DIGIT_TABLE: [u8; 256] = digit_table();
+
 fn digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' | b'-' => Some(62),
-        b'/' | b'_' => Some(63),
-        _ => None,
+    let v = DIGIT_TABLE[byte as usize];
+    if v == 255 {
+        None
+    } else {
+        Some(v)
     }
 }
 
