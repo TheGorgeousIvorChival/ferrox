@@ -263,6 +263,7 @@ macro_rules! refused_carriers {
             | Carrier::Hysteria
             | Carrier::Masque
             | Carrier::Xdrive
+            | Carrier::Http
             | Carrier::Unknown
     };
 }
@@ -280,6 +281,7 @@ enum Carrier {
     Hysteria,
     Masque,
     Xdrive,
+    Http,
     Unknown,
 }
 
@@ -4943,6 +4945,7 @@ fn stream_carrier(settings: Option<&Json>) -> Carrier {
         Some("hysteria") => Carrier::Hysteria,
         Some("masque") => Carrier::Masque,
         Some("xdrive") => Carrier::Xdrive,
+        Some("http" | "h2" | "h3") => Carrier::Http,
         None | Some("" | "raw" | "tcp") => match tcp_http_path(settings) {
             Some(path) => Carrier::HttpHeader { path },
             None => Carrier::Raw,
@@ -5024,7 +5027,7 @@ fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
         Carrier::Hysteria => "hysteriaSettings",
         Carrier::Masque => "masqueSettings",
         Carrier::Xdrive => "xdriveSettings",
-        Carrier::Unknown | Carrier::Raw => "",
+        Carrier::Unknown | Carrier::Raw | Carrier::Http => "",
     };
     let host = settings
         .and_then(|s| s.get(key))
@@ -7950,9 +7953,9 @@ mod tests {
             ("xdrive", "Xdrive"),
             ("raw", "Raw"),
             ("tcp", "Raw"),
-            ("h2", "Unknown"),
-            ("h3", "Unknown"),
-            ("http", "Unknown"),
+            ("h2", "Http"),
+            ("h3", "Http"),
+            ("http", "Http"),
             ("futureNet", "Unknown"),
         ];
         for (network, want) in cases {
@@ -7970,6 +7973,7 @@ mod tests {
                 Carrier::Hysteria => "Hysteria",
                 Carrier::Masque => "Masque",
                 Carrier::Xdrive => "Xdrive",
+                Carrier::Http => "Http",
                 Carrier::Unknown => "Unknown",
             };
             assert_eq!(tag, want, "{network} should map to {want}");
