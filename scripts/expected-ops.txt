@@ -13,4 +13,4 @@
 # inlining even with line tables, so gate the caller that survives, not the
 # leaf that does not. The syscall table the script prints alongside is
 # information, not a gate.
-der_to_pem 2640
+der_to_pem 2653
