@@ -23,11 +23,17 @@ impl Json {
         }
     }
 
-    pub(crate) fn as_port(&self) -> Option<u16> {
+    pub(crate) fn as_u32(&self) -> Option<u32> {
         match self {
-            Self::Num(n) if n.fract() == 0.0 && (0.0..=65535.0).contains(n) => Some(*n as u16),
+            Self::Num(n) if n.fract() == 0.0 && (0.0..=4_294_967_295.0).contains(n) => {
+                Some(*n as u32)
+            }
             _ => None,
         }
+    }
+
+    pub(crate) fn as_port(&self) -> Option<u16> {
+        self.as_u32().and_then(|n| u16::try_from(n).ok())
     }
 
     pub(crate) fn as_arr(&self) -> Option<&[Json]> {
