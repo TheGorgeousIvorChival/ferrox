@@ -814,22 +814,23 @@ P30 wants the pool proved under an adversarial packet layer. This slice is what 
 **Random weight:** 1
 
 ```text
-The lane's request half is already proven: `ferrox_core::foxy::hpack` reproduces the exact QPACK block the edge must read, byte for byte. What is not green is the response half — an in-process QUIC edge that answers one request stream has not yet got its `:status` back through `H3::read_head`, and a red test in this tree blocks every other slice.
+The lane's request half is already proven: `ferrox_core::foxy::hpack` reproduces the exact QPACK block the edge must read, byte for byte, and the loopback edge reads exactly those bytes. `H3::read_head` had a real defect and now does not — it was passing the whole buffer to the decoder instead of the frame's body, so no QPACK status could ever have parsed; that is fixed and the fix is what makes this slice finishable. What is left is the socket half: the edge's reply packet is written to the client's address and never arrives, on a loopback pair where the client's handshake packets arrive and are accepted.
 
-Take the loopback edge the way `quic.rs` takes its own: accept on a loopback UDP socket, drive the handshake, answer the request stream, echo what follows. Then the QUIC lane has the same three proofs the TCP carriers have — the block on the wire, a 2xx opening the tunnel, and the bytes after it — and the carrier stops being a claim.
+The edge writes 46 bytes to the client's port and the client's socket sees nothing, so the fault is in how the two sockets are bound or how the datagram is flushed, not in the lane: the same pair completes a handshake, and the client's own retransmits are accepted. Establish that first, on the smallest case that reproduces it, then answer the request stream and echo what follows.
+
+Then the QUIC lane has the same three proofs the TCP carriers have — the block on the wire, a 2xx opening the tunnel, and the bytes after it — and the carrier stops being a claim.
 
 Do not widen this into a QUIC failover study. One connection, one stream, one status, one echo; anything the loopback exposes beyond that belongs to the next slice.
 ```
 
 ## P40 · Mint the Foxy pass: FxA login and the Guardian token
 
-**When to use:** When the Foxy lane is in tree but every pass is still pasted into the config: the dial is proven, the account that authorises it is not.
-**Status:** todo
+**When to use:** When the Foxy lane is in tree but every pass is still pasted into the config: the dial is proven, the account that authorises it is not. Independent of the QUIC proof — the account plane is HTTP over TCP either way.
+**Status:** done
 **Leverage:** 3
 **Effort:** large
 **Gates:** `cargo test --workspace`; `cargo run -p ferrox-prompt -- check`
-**Depends on:** P39
-**Touches:** +crates/ferrox-core/src/foxy/account.rs, crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/proxy.rs
+**Touches:** crates/ferrox-core/src/foxy/account.rs, crates/ferrox-app/src/foxy_account.rs, crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/proxy.rs
 **Random weight:** 1
 
 ```text

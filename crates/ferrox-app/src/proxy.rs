@@ -232,6 +232,7 @@ enum Outbound {
 /// with the split-tunnel list that decides what does not go through it at all.
 #[derive(Debug, Clone)]
 struct FoxyOut {
+    account: Option<std::sync::Arc<crate::foxy_account::Account>>,
     country: String,
     carrier: crate::foxy::Carrier,
     candidates: Vec<ferrox_core::foxy::Candidate>,
@@ -2919,6 +2920,23 @@ fn foxy_socks_reply(reply: u8) -> [u8; 10] {
 /// Opens the tunnel on the first edge that answers, and relays. Every edge of
 /// the pinned country is a candidate, so a refusal moves to the next one rather
 /// than to another country.
+/// Replaces the pass on the clock the pass itself names. One thread per lane,
+/// started once, and it stops as soon as the pass can no longer be replaced.
+fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
+    thread::spawn(move || loop {
+        thread::sleep(account.renews_in());
+        if let Err(denied) = account.renew() {
+            eprintln!("foxy: the pass could not be replaced: {denied}");
+            if matches!(
+                denied,
+                crate::foxy_account::Denied::Token | crate::foxy_account::Denied::Quota
+            ) {
+                return;
+            }
+        }
+    });
+}
+
 fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
     if foxy_splits(foxy, asked) {
         let Some(target) = asked.socket() else { return };
@@ -2944,7 +2962,10 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
             carrier: foxy.carrier,
             roots: foxy.roots.clone(),
             pins: foxy.pins.clone(),
-            pass: foxy.pass.clone(),
+            pass: foxy
+                .account
+                .as_ref()
+                .map_or_else(|| foxy.pass.clone(), |account| account.current()),
         };
         let quic = match foxy.carrier {
             crate::foxy::Carrier::H3 => crate::quic::pooled_stream(&foxy_quic_dial(foxy, &edge)),
@@ -4640,6 +4661,57 @@ fn foxy_edge(outbound: &Json, country: &str, city: &str) -> Option<ferrox_core::
     })
 }
 
+/// The account a `foxy` outbound names: an account to sign in with, or a pass
+/// pasted in. Either way it becomes one `Account` whose pass the renewal thread
+/// owns, so the dial and the renewal read the same value.
+fn foxy_account(
+    email: &str,
+    password: &str,
+    configured: &str,
+    roots: &[Vec<u8>],
+) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
+    let pass = ferrox_core::foxy::Pass {
+        token: configured.to_owned(),
+        expires_at: None,
+        quota_remaining: None,
+        quota_reset: None,
+    };
+    if email.is_empty() && pass.token.is_empty() {
+        return None;
+    }
+    let account = std::sync::Arc::new(crate::foxy_account::Account {
+        fxa: crate::foxy_account::Endpoint::parse(
+            ferrox_core::foxy::account::FXA_SERVER,
+            roots.to_vec(),
+        )?,
+        guardian: crate::foxy_account::Endpoint::parse(
+            ferrox_core::foxy::account::GUARDIAN_SERVER,
+            roots.to_vec(),
+        )?,
+        auth: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_account::Auth {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: 0,
+        })),
+        pass: std::sync::Arc::new(std::sync::Mutex::new(pass.clone())),
+    });
+    if !email.is_empty() && pass.token.is_empty() {
+        if let Err(denied) = account.sign_in(email, password) {
+            eprintln!("foxy: the account did not sign in: {denied}");
+            return None;
+        }
+    }
+    Some(account)
+}
+
+fn foxy_text(settings: Option<&Json>, key: &str) -> String {
+    settings
+        .and_then(|s| s.get(key))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
 fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     let empty = Vec::new();
     for outbound in root
@@ -4651,23 +4723,21 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             continue;
         }
         let settings = outbound.get("settings");
-        let pass = settings
-            .and_then(|s| s.get("pass"))
-            .and_then(Json::as_str)?
-            .to_owned();
-        if pass.is_empty() {
+        let configured = foxy_text(settings, "pass");
+        let email = foxy_text(settings, "email");
+        let password = foxy_text(settings, "password");
+        if configured.is_empty() && email.is_empty() {
             continue;
         }
-        let country = settings
-            .and_then(|s| s.get("country"))
-            .and_then(Json::as_str)
-            .unwrap_or("US")
-            .to_owned();
-        let city = settings
-            .and_then(|s| s.get("city"))
-            .and_then(Json::as_str)
-            .unwrap_or("")
-            .to_owned();
+        let country = {
+            let code = foxy_text(settings, "country");
+            if code.is_empty() {
+                "US".to_owned()
+            } else {
+                code
+            }
+        };
+        let city = foxy_text(settings, "city");
         let roots = settings
             .and_then(|s| s.get("caCertFile"))
             .and_then(Json::as_str)
@@ -4686,26 +4756,35 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
                     .ok()
                     .and_then(|mut addrs| addrs.next())
             });
+        let account = foxy_account(&email, &password, &configured, &roots);
+        let pass = account.as_ref().map_or_else(
+            || ferrox_core::foxy::Pass {
+                token: configured.clone(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+            |account| account.current(),
+        );
+        if let Some(account) = &account {
+            start_renewal(std::sync::Arc::clone(account));
+        }
         return Some(FoxyOut {
+            account,
             candidates: foxy_edge(outbound, &country, &city).into_iter().collect(),
             stored: None,
             country,
             carrier: foxy_carrier(settings),
             roots,
             pins,
-            pass: ferrox_core::foxy::Pass {
-                token: pass,
-                expires_at: None,
-                quota_remaining: None,
-                quota_reset: None,
-            },
+            pass,
             edge_address,
             direct_ports: foxy_ports(settings.and_then(|s| s.get("directPorts"))),
             direct_suffixes: foxy_strings(settings.and_then(|s| s.get("directDomains"))),
-            exit_probe: settings
-                .and_then(|s| s.get("exitProbe"))
-                .and_then(Json::as_str)
-                .map(str::to_owned),
+            exit_probe: match foxy_text(settings, "exitProbe") {
+                probe if probe.is_empty() => None,
+                probe => Some(probe),
+            },
         });
     }
     None

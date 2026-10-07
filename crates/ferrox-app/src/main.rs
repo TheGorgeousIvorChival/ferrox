@@ -1,4 +1,5 @@
 mod foxy;
+mod foxy_account;
 mod grpc;
 mod httpheader;
 mod httpupgrade;
