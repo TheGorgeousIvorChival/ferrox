@@ -2,6 +2,7 @@ use crate::aead::{chacha20_poly1305_decrypt_in_place, chacha20_poly1305_seal_in_
 
 pub const TAG_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
+pub const XNONCE_LEN: usize = 24;
 pub const LENGTH_LEN: usize = 2;
 pub const MAX_CHUNK: usize = 0x3FFF;
 
@@ -10,6 +11,7 @@ pub enum Method {
     Aes128Gcm,
     Aes256Gcm,
     Chacha20Poly1305,
+    XChacha20Poly1305,
 }
 
 impl Method {
@@ -21,6 +23,7 @@ impl Method {
             "chacha20-ietf-poly1305" | "aead_chacha20_poly1305" | "chacha20-poly1305" => {
                 Self::Chacha20Poly1305
             }
+            "xchacha20-ietf-poly1305" | "aead_xchacha20_poly1305" => Self::XChacha20Poly1305,
             _ => return None,
         })
     }
@@ -29,7 +32,7 @@ impl Method {
     pub const fn key_len(self) -> usize {
         match self {
             Self::Aes128Gcm => 16,
-            Self::Aes256Gcm | Self::Chacha20Poly1305 => 32,
+            Self::Aes256Gcm | Self::Chacha20Poly1305 | Self::XChacha20Poly1305 => 32,
         }
     }
 
@@ -39,6 +42,7 @@ impl Method {
             Self::Aes128Gcm => "aes-128-gcm",
             Self::Aes256Gcm => "aes-256-gcm",
             Self::Chacha20Poly1305 => "chacha20-ietf-poly1305",
+            Self::XChacha20Poly1305 => "xchacha20-ietf-poly1305",
         }
     }
 }
@@ -61,6 +65,7 @@ enum Aead {
     Aes128(Box<crate::aesgcm::Aes128Gcm>),
     Aes256(Box<crate::aesgcm::Aes256Gcm>),
     ChaCha,
+    XChaCha,
 }
 
 impl std::fmt::Debug for Aead {
@@ -69,6 +74,7 @@ impl std::fmt::Debug for Aead {
             Self::Aes128(_) => "aes-128-gcm",
             Self::Aes256(_) => "aes-256-gcm",
             Self::ChaCha => "chacha20-ietf-poly1305",
+            Self::XChaCha => "xchacha20-ietf-poly1305",
         })
     }
 }
@@ -98,6 +104,7 @@ impl Cipher {
                 key[..key_len].try_into().ok()?,
             ))),
             Method::Chacha20Poly1305 => Aead::ChaCha,
+            Method::XChacha20Poly1305 => Aead::XChaCha,
         };
         Some(Self {
             method,
@@ -123,6 +130,23 @@ impl Cipher {
         nonce
     }
 
+    fn xnonce(&self) -> [u8; XNONCE_LEN] {
+        let mut nonce = [0u8; XNONCE_LEN];
+        nonce[..8].copy_from_slice(&self.counter.to_le_bytes());
+        nonce
+    }
+
+    fn xpair(&self) -> ([u8; 32], [u8; NONCE_LEN]) {
+        let xnonce = self.xnonce();
+        let subkey = crate::chacha::hchacha(
+            &self.key,
+            &xnonce[..16].try_into().expect("xnonce holds sixteen"),
+        );
+        let mut inner = [0u8; NONCE_LEN];
+        inner[4..].copy_from_slice(&xnonce[16..]);
+        (subkey, inner)
+    }
+
     pub fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Option<()> {
         let nonce = self.nonce();
         let at = out.len();
@@ -132,6 +156,10 @@ impl Cipher {
             Aead::Aes128(cipher) => cipher.seal_in_place(&nonce, b"", body),
             Aead::Aes256(cipher) => cipher.seal_in_place(&nonce, b"", body),
             Aead::ChaCha => chacha20_poly1305_seal_in_place(&self.key, &nonce, b"", body),
+            Aead::XChaCha => {
+                let (subkey, inner) = self.xpair();
+                chacha20_poly1305_seal_in_place(&subkey, &inner, b"", body)
+            }
         };
         out.extend_from_slice(&tag);
         self.advance()
@@ -150,6 +178,10 @@ impl Cipher {
             Aead::Aes256(cipher) => cipher.open_in_place(&nonce, b"", body, &tag).map(|_| ()),
             Aead::ChaCha => {
                 chacha20_poly1305_decrypt_in_place(&self.key, &nonce, b"", body, &tag).map(|_| ())
+            }
+            Aead::XChaCha => {
+                let (subkey, inner) = self.xpair();
+                chacha20_poly1305_decrypt_in_place(&subkey, &inner, b"", body, &tag).map(|_| ())
             }
         };
         opened?;
@@ -227,6 +259,8 @@ mod tests {
             ("chacha20-ietf-poly1305", Method::Chacha20Poly1305),
             ("aead_chacha20_poly1305", Method::Chacha20Poly1305),
             ("chacha20-poly1305", Method::Chacha20Poly1305),
+            ("xchacha20-ietf-poly1305", Method::XChacha20Poly1305),
+            ("aead_xchacha20_poly1305", Method::XChacha20Poly1305),
             ("  AES-256-GCM  ", Method::Aes256Gcm),
         ] {
             assert_eq!(Method::parse(name), Some(want), "{name}");
@@ -240,9 +274,9 @@ mod tests {
             "",
             "aes",
             "aes-192-gcm",
-            "xchacha20-ietf-poly1305",
-            "aead_xchacha20_poly1305",
+            "2022-blake3-aes-128-gcm",
             "2022-blake3-aes-256-gcm",
+            "2022-blake3-chacha20-poly1305",
             "rc4-md5",
             "chacha20",
             "none",
@@ -357,6 +391,7 @@ mod tests {
             Method::Aes128Gcm,
             Method::Aes256Gcm,
             Method::Chacha20Poly1305,
+            Method::XChacha20Poly1305,
         ] {
             let salt = [0x77u8; 32];
             let mut sender = Cipher::new(method, "secret", &salt).expect("derives");
@@ -394,7 +429,11 @@ mod tests {
             .expect("derives")
             .seal_into(b"ping", &mut sealed)
             .expect("seals");
-        for method in [Method::Aes128Gcm, Method::Chacha20Poly1305] {
+        for method in [
+            Method::Aes128Gcm,
+            Method::Chacha20Poly1305,
+            Method::XChacha20Poly1305,
+        ] {
             assert!(
                 Cipher::new(method, "secret", &salt)
                     .expect("derives")
@@ -409,6 +448,18 @@ mod tests {
                 .open_in_place(&mut sealed.clone())
                 .is_none(),
             "and a wrong password cannot either"
+        );
+        let mut xsealed = Vec::new();
+        Cipher::new(Method::XChacha20Poly1305, "secret", &salt)
+            .expect("derives")
+            .seal_into(b"ping", &mut xsealed)
+            .expect("seals");
+        assert!(
+            Cipher::new(Method::Chacha20Poly1305, "secret", &salt)
+                .expect("derives")
+                .open_in_place(&mut xsealed.clone())
+                .is_none(),
+            "chacha cannot open an xchacha chunk"
         );
     }
 
@@ -435,6 +486,7 @@ mod tests {
             (Method::Aes128Gcm, 16usize),
             (Method::Aes256Gcm, 32),
             (Method::Chacha20Poly1305, 32),
+            (Method::XChacha20Poly1305, 32),
         ] {
             let salt = [0x09u8; 32];
             let cipher = Cipher::new(method, "secret", &salt).expect("derives");
@@ -444,6 +496,51 @@ mod tests {
                 .expand(b"ss-subkey", &mut want[..len])
                 .expect("expands");
             assert_eq!(&cipher.key[..len], &want[..len], "{method}");
+        }
+    }
+
+    #[test]
+    fn the_xnonce_is_a_little_endian_counter_in_the_first_eight_bytes() {
+        let cipher =
+            Cipher::new(Method::XChacha20Poly1305, "secret", &[0x5a; 32]).expect("derives");
+        assert_eq!(cipher.xnonce(), [0u8; XNONCE_LEN], "chunk zero is all zero");
+        let mut probe =
+            Cipher::new(Method::XChacha20Poly1305, "secret", &[0x5a; 32]).expect("derives");
+        for counter in [1u64, 255, 256, u64::from(u32::MAX)] {
+            probe.counter = counter - 1;
+            probe.advance().expect("advances");
+            let mut want = [0u8; XNONCE_LEN];
+            want[..8].copy_from_slice(&counter.to_le_bytes());
+            assert_eq!(probe.xnonce(), want, "chunk {counter}");
+        }
+    }
+
+    #[test]
+    fn xchacha_is_byte_identical_to_the_crate_it_replaces() {
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+        let salts = [[0x77u8; 32], [0x00u8; 32], [0xffu8; 32]];
+        for salt in &salts {
+            let sender = Cipher::new(Method::XChacha20Poly1305, "secret", salt).expect("derives");
+            let session: [u8; 32] = sender.key;
+            let reference = XChaCha20Poly1305::new_from_slice(&session).expect("key");
+            for len in [0usize, 1, 15, 16, 17, 63, 64, 65, 300, 1024] {
+                let mut probe =
+                    Cipher::new(Method::XChacha20Poly1305, "secret", salt).expect("derives");
+                let plain: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(41)).collect();
+                let mut wire = Vec::new();
+                probe.seal_into(&plain, &mut wire).expect("seals");
+                let (ct, tag) = wire.split_at(len);
+                let mut want_ct = plain.clone();
+                let want_tag = reference
+                    .encrypt_in_place_detached(
+                        XNonce::from_slice(&[0u8; XNONCE_LEN]),
+                        b"",
+                        &mut want_ct,
+                    )
+                    .expect("seals");
+                assert_eq!(ct, &want_ct[..], "ciphertext len {len}");
+                assert_eq!(tag, &want_tag[..], "tag len {len}");
+            }
         }
     }
 }

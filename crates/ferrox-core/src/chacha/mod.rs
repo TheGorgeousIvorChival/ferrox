@@ -42,6 +42,47 @@ pub(crate) fn as_i32_bits(word: u32) -> i32 {
 
 const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
+pub(crate) fn hchacha(key: &[u8; 32], input: &[u8; 16]) -> [u8; 32] {
+    let mut s = [0u32; 16];
+    s[..4].copy_from_slice(&CONSTANTS);
+    for (i, w) in s[4..12].iter_mut().enumerate() {
+        *w = u32::from_le_bytes(key[i * 4..i * 4 + 4].try_into().expect("key is 32 bytes"));
+    }
+    for (i, w) in s[12..].iter_mut().enumerate() {
+        *w = u32::from_le_bytes(
+            input[i * 4..i * 4 + 4]
+                .try_into()
+                .expect("input is 16 bytes"),
+        );
+    }
+    for _ in 0..10 {
+        qr(&mut s, 0, 4, 8, 12);
+        qr(&mut s, 1, 5, 9, 13);
+        qr(&mut s, 2, 6, 10, 14);
+        qr(&mut s, 3, 7, 11, 15);
+        qr(&mut s, 0, 5, 10, 15);
+        qr(&mut s, 1, 6, 11, 12);
+        qr(&mut s, 2, 7, 8, 13);
+        qr(&mut s, 3, 4, 9, 14);
+    }
+    let mut out = [0u8; 32];
+    for (i, w) in s[..4].iter().chain(s[12..].iter()).enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
+fn qr(s: &mut [u32; 16], idx_a: usize, idx_b: usize, idx_c: usize, idx_d: usize) {
+    s[idx_a] = s[idx_a].wrapping_add(s[idx_b]);
+    s[idx_d] = (s[idx_d] ^ s[idx_a]).rotate_left(16);
+    s[idx_c] = s[idx_c].wrapping_add(s[idx_d]);
+    s[idx_b] = (s[idx_b] ^ s[idx_c]).rotate_left(12);
+    s[idx_a] = s[idx_a].wrapping_add(s[idx_b]);
+    s[idx_d] = (s[idx_d] ^ s[idx_a]).rotate_left(8);
+    s[idx_c] = s[idx_c].wrapping_add(s[idx_d]);
+    s[idx_b] = (s[idx_b] ^ s[idx_c]).rotate_left(7);
+}
+
 #[cfg(target_arch = "x86_64")]
 const GROUP_STATES: usize = 4;
 #[cfg(target_arch = "aarch64")]
