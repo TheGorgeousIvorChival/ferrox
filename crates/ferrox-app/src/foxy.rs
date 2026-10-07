@@ -484,14 +484,16 @@ impl H3 {
         self.deadline = Instant::now() + HEADER_TIMEOUT;
         let mut head = Vec::with_capacity(64);
         while Instant::now() < self.deadline {
-            let mut chunk = [0u8; 4096];
             let id = self.stream;
-            let read = self.with_conn(move |conn| conn.stream_recv(id, &mut chunk));
+            let read = self.with_conn(|conn| {
+                let mut chunk = [0u8; 4096];
+                conn.stream_recv(id, &mut chunk).map(|read| (read, chunk))
+            });
             let Some(read) = read else {
                 return Err(Failure::Io);
             };
             match read {
-                Ok((n, fin)) => {
+                Ok(((n, fin), chunk)) => {
                     head.extend_from_slice(&chunk[..n]);
                     if fin {
                         break;
@@ -505,10 +507,11 @@ impl H3 {
                 }
                 Err(_) => return Err(Failure::Stream),
             }
-            let Some((frame, body)) = frames::h3_frame(&head, &mut 0)
-                .filter(|frame| frame.length as usize <= head.len())
-                .map(|frame| (frame, &head[..]))
-            else {
+            let mut at = 0usize;
+            let Some(frame) = frames::h3_frame(&head, &mut at) else {
+                continue;
+            };
+            let Some(body) = head.get(at..at + frame.length as usize) else {
                 continue;
             };
             if let frames::H3Event::Headers { block, .. } = frames::h3_event(frame, body) {
