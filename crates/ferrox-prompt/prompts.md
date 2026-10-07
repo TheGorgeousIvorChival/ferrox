@@ -18,7 +18,7 @@ One prompt per `## P<n> · <title>` section. The numbers are the roadmap: the to
 | `**Random weight:**` | no | 0-9, for `--rotate`; 0 excludes it from draws, absent means 1 |
 | `**Prompt protocol:**` | no | a rule that applies to this slice alone, layered under the shared protocol |
 
-Paths under `upstream/<name>/` are pinned reading copies for agents, fetched by `scripts/fetch-upstream.sh`: `xray-core`, `sing-box`, `amneziawg-go`, `amnezia-client`, `xray-rust`, `pattng`, `zeronet`, `mqvpn`, `aether`, `zeptun`, `slipstream`, `quiche`. They never appear in `**Touches:**` — checkouts are derived artifacts, and a touch naming one fails the gate wherever it was never fetched.
+Paths under `upstream/<name>/` are pinned reading copies for agents, fetched by `scripts/fetch-upstream.sh`: `xray-core`, `sing-box`, `amneziawg-go`, `amnezia-client`, `xray-rust`, `pattng`, `zeronet`, `mqvpn`, `aether`, `zeptun`, `slipstream`, `quiche`, `lxbox`. They never appear in `**Touches:**` — checkouts are derived artifacts, and a touch naming one fails the gate wherever it was never fetched.
 
 Placeholders are `{name}` or `{name=default}`. A name with a default is filled by it. A name without one is a decision this tool refuses to invent: `next` prints the exact command to run and exits 2 rather than sending an agent a prompt with a hole in it, and `--allow-unfilled` renders the hole loudly at the top of the prompt instead of silently. The body is the single fenced block in the section: a second fenced block is an error rather than a fallback, because "first block" and "last block" are both guesswork that quietly renders the wrong text; add-ons are the extension mechanism and they are single lines:
 
@@ -874,3 +874,40 @@ Decide what the gate is for before deciding how to fix it. Two honest readings, 
 
 Until one of those lands, do not re-bless on a single measurement. The 2640 reading is not evidence of a smaller `der_to_pem`; it is evidence that the instrument reads differently twice.
 ```
+
+## P42 · Make the account plane reachable, or say why it cannot be
+
+**When to use:** When `foxy-live.yml` reports `handshake api.accounts.firefox.com: bad certificate: UnknownIssuer` while the settings host beside it verifies: the lane wants to sign in for real and cannot.
+**Status:** todo
+**Leverage:** 4
+**Effort:** medium
+**Gates:** `foxy-live.yml` reports a sign-in and a minted pass
+**Touches:** crates/ferrox-app/src/foxy_account.rs, crates/ferrox-app/src/quic.rs
+**Random weight:** 1
+
+```text
+Measured on both `ubuntu-24.04` and `ubuntu-latest`, from the same 121-anchor bundle: `api.accounts.firefox.com` serves a leaf issued by `Let's Encrypt YR1` and the chain does not verify, while `firefox.settings.services.mozilla.com` on `YR2` verifies from the same store at the same moment. A strict verifier cannot invent the missing link, so the choices are three and one of them is honest: take the chain the edge serves and check it against the store rather than the trust store alone, name the intermediate that is absent and fail with that name, or pin the host's SPKI — `spkiPins` already exists and a Firefox host is exactly where a pin belongs. What is not on the list is retrying with verification off.
+
+The loopback account plane is proven end to end, so nothing about this is about the login's shape. It is about one certificate on one host, and the lane now says which.
+
+```
+
+## P43 · Carry MASQUE CONNECT-UDP over the HTTP/2 edge that answers
+
+**When to use:** When the country is pinned, the pass is minted, and every carrier is refused: the published edge answers TCP and ignores QUIC, so the carrier that would reach it is HTTP/2 carrying a MASQUE datagram rather than HTTP/3 carrying a stream.
+**Status:** todo
+**Leverage:** 5
+**Effort:** large
+**Gates:** a loopback MASQUE edge proving CONNECT-UDP through the tunnel; `foxy-live.yml` reporting a tunnel and its exit country
+**Touches:** crates/ferrox-core/src/foxy/mod.rs, crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+What the live run measured, on the account's own published list: the United States edge is `*.fastly-masque.net` on port 2499. TCP to that authority answers. An HTTP/3 handshake on UDP 2499 does not complete. So the edge publishes MASQUE over HTTP/2, which is what the reference rewrite does and what the Android client cannot do at all — the name in the host is the edge telling you, and the port is the Fastly MASQUE port the reference names.
+
+That makes this a superset rather than a port: CONNECT-UDP carries datagrams, so a tunnel over it carries UDP and the lane's SOCKS UDP front has something to hand to, which neither reference has. HTTP/3 stays in the tree as the carrier for edges that speak it — the carrier is not wrong, this edge is not for it — and `auto` already orders the carriers, so a country whose edges answer differently needs no new configuration.
+
+Do not widen this into a general MASQUE stack. One endpoint, one `:protocol = connect-udp`, one datagram in and one out, plus the exit proof. Whether the datagram capsule is the reference's own shape is a question the endpoint answers faster than this file can.
+
+```
+
