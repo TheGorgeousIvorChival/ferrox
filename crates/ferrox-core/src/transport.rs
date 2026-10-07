@@ -37,7 +37,7 @@ impl TransportKind {
     #[must_use]
     pub fn from_link(t: &str) -> Self {
         match t {
-            "" | "tcp" => Self::Tcp,
+            "" | "tcp" | "raw" => Self::Tcp,
             "ws" | "websocket" => Self::Ws,
             "xhttp" | "splithttp" => Self::Xhttp,
             "grpc" => Self::Grpc,
@@ -315,6 +315,14 @@ mod tests {
             Security::from_link("none", "192.0.2.1"),
             Security::NoneToPublic
         );
+    }
+
+    #[test]
+    fn raw_link_is_tcp() {
+        assert_eq!(TransportKind::from_link("raw"), TransportKind::Tcp);
+        assert_eq!(TransportKind::from_link("tcp"), TransportKind::Tcp);
+        assert_eq!(TransportKind::from_link(""), TransportKind::Tcp);
+        assert!(TransportKind::from_link("raw").is_dialled());
     }
 
     #[test]

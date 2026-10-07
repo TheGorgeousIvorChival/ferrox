@@ -622,7 +622,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 const fn hex_val(b: u8) -> Option<u8> {
@@ -826,6 +826,34 @@ mod tests {
         .expect("parses");
         assert!(matches!(l.support(), Support::Planned { .. }));
         assert!(!l.is_first_method());
+    }
+
+    #[test]
+    fn raw_link_matches_tcp() {
+        let raw = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:80?security=none&encryption=none&type=raw#plain",
+        )
+        .expect("parses");
+        assert_eq!(raw.transport_kind(), TransportKind::Tcp);
+        assert!(raw.is_none_private_method());
+        assert_eq!(
+            raw.support(),
+            Support::Implemented {
+                method: "vless-tcp-none"
+            }
+        );
+        let vision = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=reality&encryption=none&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&type=raw&flow=xtls-rprx-vision&sni=example.com&sid=a8#x",
+        )
+        .expect("parses");
+        assert!(vision.is_first_method());
+    }
+
+    #[test]
+    fn percent_decode_keeps_lossy_bytes() {
+        assert_eq!(percent_decode("%2F"), "/");
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}");
     }
 
     #[test]

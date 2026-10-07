@@ -4694,26 +4694,28 @@ fn x25519_pair() -> (String, String) {
 }
 
 fn b64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let mut word = 0u32;
-        for &byte in chunk {
-            word = (word << 8) | u32::from(byte);
-        }
-        word <<= 8 * (3 - chunk.len());
-        let mut shift = 18;
-        for _ in 0..=chunk.len() {
-            out.push(ALPHABET[((word >> shift) & 0x3F) as usize] as char);
-            shift -= 6;
-        }
-    }
+    let mut out = String::new();
+    ferrox_core::transport::early_encode_into(&mut out, bytes);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn b64url_matches_the_shared_encoder() {
+        for (bytes, want) in [
+            (&b""[..], ""),
+            (&b"foobar"[..], "Zm9vYmFy"),
+            (&[0xff, 0xff, 0x00][..], "__8A"),
+        ] {
+            assert_eq!(b64url(bytes), want);
+            let mut shared = String::new();
+            ferrox_core::transport::early_encode_into(&mut shared, bytes);
+            assert_eq!(b64url(bytes), shared);
+        }
+    }
 
     #[test]
     fn a_head_split_across_segments_is_read_whole() {
