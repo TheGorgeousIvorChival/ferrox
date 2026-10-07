@@ -154,6 +154,7 @@ pub struct Connection {
     since: Instant,
     data_input: Notifier,
     data_output: Notifier,
+    update: Notifier,
     rd: Mutex<Option<Instant>>,
     wd: Mutex<Option<Instant>>,
     mss: u32,
@@ -196,6 +197,7 @@ impl Connection {
             since: Instant::now(),
             data_input: Notifier::new(),
             data_output: Notifier::new(),
+            update: Notifier::new(),
             rd: Mutex::new(None),
             wd: Mutex::new(None),
             mss,
@@ -207,15 +209,20 @@ impl Connection {
         let weak = Arc::downgrade(&conn);
         thread::spawn(move || {
             let mut last_uncond = Instant::now();
+            let mut seen = u64::MAX;
             loop {
                 let Some(conn) = weak.upgrade() else { break };
                 let draining =
                     conn.state() == State::Terminating || conn.state() == State::PeerTerminating;
-                thread::sleep(if draining {
+                let idle = if draining {
                     Duration::from_secs(1)
                 } else {
                     Duration::from_millis(u64::from(config.tti))
-                });
+                };
+                if conn.update.gen() == seen {
+                    conn.update.wait_since(seen, Some(idle));
+                }
+                seen = conn.update.gen();
                 if conn.state() == State::Terminated {
                     break;
                 }
@@ -256,6 +263,7 @@ impl Connection {
                 self.sending.lock().unwrap().close_write();
                 self.data_input.signal();
                 self.data_output.signal();
+                self.wake_update();
                 self.terminated.store(true, Ordering::SeqCst);
                 self.terminate();
             }
@@ -328,7 +336,7 @@ impl Connection {
                 }
             }
         }
-        self.poke();
+        self.wake_update();
     }
 }
 
@@ -503,6 +511,7 @@ impl Connection {
 
     pub fn write(&self, b: &[u8]) -> Result<usize, ConnError> {
         let mut offset = 0;
+        let mut pushed = false;
         while offset < b.len() {
             if self.state() != State::Active {
                 return Err(ConnError::Closed);
@@ -515,11 +524,18 @@ impl Connection {
                 .unwrap()
                 .push(b[offset..offset + n].to_vec())
             {
+                if pushed {
+                    self.wake_update();
+                    pushed = false;
+                }
                 self.wait_for_data_output(snap)?;
                 continue;
             }
-            self.poke();
+            pushed = true;
             offset += n;
+        }
+        if pushed {
+            self.wake_update();
         }
         Ok(b.len())
     }
@@ -547,9 +563,8 @@ impl Connection {
         self.ctx.meta.remote
     }
 
-    fn poke(&self) {
-        self.data_input.signal();
-        self.data_output.signal();
+    fn wake_update(&self) {
+        self.update.signal();
     }
 }
 
