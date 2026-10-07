@@ -512,7 +512,7 @@ fn planned_reason(link: &VlessLink) -> &'static str {
         TransportKind::HttpUpgrade => {
             "vless-httpupgrade: carrier dials; the security above is what is missing"
         }
-        TransportKind::Kcp => "vless-kcp: parses, dial needs a KCP differential",
+        TransportKind::Kcp => "vless-kcp: carrier dials; the security above is what is missing",
         TransportKind::Hysteria => {
             "vless-hysteria: parses, dial needs its own QUIC stack and congestion glue"
         }
@@ -533,6 +533,7 @@ fn carrier_method(kind: TransportKind) -> Option<&'static str> {
         TransportKind::Grpc => "vless-grpc",
         TransportKind::Quic => "vless-quic",
         TransportKind::HttpUpgrade => "vless-httpupgrade",
+        TransportKind::Kcp => "vless-kcp",
         _ => return None,
     })
 }

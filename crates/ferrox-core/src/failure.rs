@@ -306,7 +306,9 @@ mod tests {
             (TransportKind::Ws, "type=ws"),
             (TransportKind::Xhttp, "type=xhttp"),
             (TransportKind::Grpc, "type=grpc"),
+            (TransportKind::Quic, "type=quic"),
             (TransportKind::HttpUpgrade, "type=httpupgrade"),
+            (TransportKind::Kcp, "type=kcp"),
         ] {
             assert!(kind.is_dialled(), "{kind:?} is claimed dialled");
             let link = VlessLink::parse(&format!(
@@ -324,7 +326,6 @@ mod tests {
     #[test]
     fn an_undialled_carrier_stays_planned_with_its_reason() {
         for query in [
-            "type=kcp",
             "type=hysteria",
             "type=masque",
             "type=xdrive",
