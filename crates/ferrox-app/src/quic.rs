@@ -427,15 +427,15 @@ pub(crate) fn stream_recv_exact(
 }
 
 /// The trust anchors this machine trusts, read from the bundle the platform
-/// ships rather than from a new dependency.
+/// ships, falling back to the platform store itself.
 ///
 /// A lane that dials a pinned address with its own CA never needs these; a lane
 /// that talks to a publicly trusted host cannot work without them, because an
-/// empty root store is not "trust the platform" — it is trust nothing. The
-/// bundles are file paths: on Windows the system store is not a file, so the
-/// Git-bundled PEMs are tried and `caCertFile` remains where a Windows user
-/// names their anchors outright. `SSL_CERT_FILE` is honoured everywhere
-/// because that is what OpenSSL-shaped tooling already promises.
+/// empty root store is not "trust the platform" — it is trust nothing. File
+/// bundles come first because they are the cheapest read; the native store
+/// (Windows schannel, macOS keychain, iOS) covers the platforms where trust
+/// is not a file. `caCertFile` remains where a user names anchors outright,
+/// and `SSL_CERT_FILE` is honoured everywhere.
 pub(crate) fn system_roots() -> Vec<Vec<u8>> {
     const BUNDLES: [&str; 10] = [
         "/etc/ssl/cert.pem",
@@ -482,6 +482,18 @@ pub(crate) fn system_roots() -> Vec<Vec<u8>> {
         if !roots.is_empty() {
             return roots;
         }
+    }
+    // The platform store itself (Windows schannel, macOS keychain, iOS): file
+    // bundles cover the unix and Git layouts above, this covers the rest.
+    let native = rustls_native_certs::load_native_certs();
+    let roots: Vec<Vec<u8>> = native
+        .certs
+        .into_iter()
+        .map(|cert| cert.to_vec())
+        .filter(|der| !der.is_empty())
+        .collect();
+    if !roots.is_empty() {
+        return roots;
     }
     Vec::new()
 }
