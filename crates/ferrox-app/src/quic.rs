@@ -516,15 +516,23 @@ fn pump(
     loop {
         ready.clear();
         {
+            let took = Instant::now();
             let Ok(mut conn) = shared.lock() else {
                 return;
             };
+            #[cfg(test)]
+            qstage(format!("pump-lock {}ms", took.elapsed().as_millis()));
             if conn.is_closed() {
                 return;
             }
+            let polled = Instant::now();
             if !pump_once(&mut conn, sock, local, PUMP_POLL) {
+                #[cfg(test)]
+                qstage(format!("pump-gone {}ms", polled.elapsed().as_millis()));
                 return;
             }
+            #[cfg(test)]
+            qstage(format!("pump-once {}ms", polled.elapsed().as_millis()));
             for id in conn.readable() {
                 let half = {
                     let Ok(table) = table.lock() else {
@@ -641,17 +649,33 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStr
     };
     let mut chunk = [0u8; 8192];
     loop {
+        let read_at = Instant::now();
         match plain.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                #[cfg(test)]
+                qstage(format!(
+                    "{} t={} up-read {id} {n} waited {}ms",
+                    key.port,
+                    qms(),
+                    read_at.elapsed().as_millis()
+                ));
                 let mut rest = &chunk[..n];
                 let deadline = Instant::now() + SEND_WAIT;
                 let sent = loop {
+                    let waited = Instant::now();
                     let Ok(mut conn) = pooled.conn.lock() else {
                         #[cfg(test)]
                         qstage(format!("{} t={} up-lock-none {id}", key.port, qms()));
                         break false;
                     };
+                    #[cfg(test)]
+                    qstage(format!(
+                        "{} t={} up-lock {id} {}ms",
+                        key.port,
+                        qms(),
+                        waited.elapsed().as_millis()
+                    ));
                     if conn.is_closed() {
                         #[cfg(test)]
                         qstage(format!("{} t={} up-closed {id}", key.port, qms()));
