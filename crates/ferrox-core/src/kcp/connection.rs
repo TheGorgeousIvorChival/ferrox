@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 
 use super::config::Config;
 use super::roundtrip::RoundTripInfo;
-use super::segment::{AckSegment, CmdOnlySegment, Command, DataSegment, Segment, SegmentOption};
+#[cfg(test)]
+use super::segment::DataSegment;
+use super::segment::{
+    serialize_data, AckSegment, CmdOnlySegment, Command, OutgoingHeader, Segment, SegmentOption,
+};
 use super::worker::{ReceivingWorker, SendingWorker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +147,10 @@ impl Ctx {
         Err(last.unwrap_or_else(|| io::Error::other("segment write")))
     }
 
-    pub(crate) fn emit_data(&self, d: &DataSegment) -> io::Result<()> {
-        self.emit(|buf| d.serialize(buf))
+    /// The sender's path: the payload is a borrowed slice of the sending
+    /// window's arena, so nothing here owns a copy of it.
+    pub(crate) fn emit_data_parts(&self, header: OutgoingHeader, payload: &[u8]) -> io::Result<()> {
+        self.emit(|buf| serialize_data(header, payload, buf))
     }
 
     pub(crate) fn emit_ack(&self, a: &AckSegment) -> io::Result<()> {
@@ -524,12 +530,7 @@ impl Connection {
             }
             let snap = self.data_output.gen();
             let n = (b.len() - offset).min(self.mss as usize);
-            if !self
-                .sending
-                .lock()
-                .unwrap()
-                .push(b[offset..offset + n].to_vec())
-            {
+            if !self.sending.lock().unwrap().push(&b[offset..offset + n]) {
                 if pushed {
                     self.wake_update();
                     pushed = false;

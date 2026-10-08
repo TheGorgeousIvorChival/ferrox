@@ -79,7 +79,7 @@ claim with no checker is not made.
 | QUIC | [carrier-quic](docs/function/carrier-quic.md) | 1 handshake per server | quiche's | `UNBLESSED` | not measured |
 | Hysteria v2 | [carrier-hysteria](docs/function/carrier-hysteria.md) | 1 handshake per flow | 1 backlog plus the relay's own | `UNBLESSED` | not measured |
 | REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake, rustls | per handshake, rustls | `UNBLESSED` | not measured |
-| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place | `UNBLESSED` | not measured |
+| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, **1 send buffer for the whole window** (was one per 1 332 B) | `UNBLESSED` | not measured |
 
 Two columns read "not measured" on every row, and that is the honest state
 rather than a gap in the table:
@@ -116,6 +116,8 @@ a number, so only the first table below appears in `scripts/method-counts.txt`.
 | [kcp](docs/function/kcp.md) | a `Vec<Vec<u8>>` per `read`, and a second deadline lock per wait | argued |
 | [carrier-websocket](docs/function/carrier-websocket.md) | an unbounded `realloc` chain in the read-ahead buffer | argued |
 | [carrier-xhttp](docs/function/carrier-xhttp.md) | a framing read syscall per chunk, and a second one that moved two bytes | `read-syscalls-per-16KiB-chunk 2`, by the reader's own read counter; **measured 33 reads for 16 chunks against 49** |
+| [kcp](docs/function/kcp.md) | a `malloc`/`free` per 1 332 bytes sent — about **9 400 pairs a second per direction** at 100 Mbps | `send-payload-buffers-per-window 1` and `send-payload-reallocations-per-window 0`, by arena capacity over 64 rounds |
+| [kcp](docs/function/kcp.md) | an 18-byte header staging array and three per-segment stores, per segment | `segment-header-staging-copies-per-segment 0` |
 | [vmess](docs/function/vmess.md) | a silent truncation of any relay read wider than one batch | argued; `stage_frames` now refuses, and nothing reaches the wire when it does |
 | [xtls-vision](docs/function/xtls-vision.md) | nothing removed — a row *renamed* because its gate did not cover the page's subject | `seal-open-staging-allocations 0` now names `vless::VisionSeal`, not `vision::Link` |
 
@@ -151,6 +153,12 @@ not evidence:
   no allocation gate. `carrier-xhttp` had no read-syscall row at all, which is
   why the 3→2 change could not be claimed; `Reader` is now generic over `Read`
   and counts its own reads, and the row exists.
+- **The send arena's own gate found a leak, which is the argument for having
+  one.** `trim()` returned early when `base == 0` — the state of a window
+  acknowledged down to empty between bursts — so the reclaim-everything branch
+  was unreachable and the arena reached 681 984 bytes for 8 live 1 332-byte
+  segments. Capacity is the witness for "one buffer, reused", and it is the same
+  witness that caught the leak.
 - **NOT removed:** KCP still sends one datagram per 1 332-byte segment, because
   batching would change the bytes on the wire. The mux uplink still copies every
   payload byte once, because removing that copy means splitting

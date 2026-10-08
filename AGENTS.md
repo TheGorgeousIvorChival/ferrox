@@ -86,6 +86,13 @@ not call the slice complete.
   read the test the manifest row names and ask what it actually executes — a row
   that has never been observed is worse than an `UNBLESSED` one, because it reads
   as a number.
+- **An allocator claim is gated by capacity, and capacity catches the leak the
+  change would otherwise ship.** `send-payload-reallocations-per-window 0` is
+  witnessed by the arena's own `capacity()` over 64 push/acknowledge rounds: a
+  per-segment `Vec` cannot hold capacity steady, and a trim that stopped firing
+  shows up as a number that only goes up. The same test found that `trim()`
+  returning early on `base == 0` made the reclaim branch unreachable. **Write the
+  capacity assertion before the buffer, not after.**
 - **A loopback test cannot gate a syscall count, and a scheduler-dependent count
   is not a gate at all.** Drive the counter from an in-memory stream that always
   answers the whole buffer, where the number is exact; assert only the bytes

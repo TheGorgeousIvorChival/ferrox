@@ -124,6 +124,9 @@ kcp command-only-segment-bytes 16 ferrox-core-kcp::tests::the_command_only_layou
 kcp oracle-runs-against-the-pinned-go 1 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
 kcp rto-cap-seconds 10 ferrox-core-kcp::tests::rto_is_capped_at_ten_seconds_and_widened
 kcp app-rows-serving-over-kcp 4 ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback
+kcp send-payload-buffers-per-window 1 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp send-payload-reallocations-per-window 0 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
 kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
 kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
 trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven

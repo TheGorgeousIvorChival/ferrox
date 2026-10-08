@@ -92,17 +92,46 @@ impl DataSegment {
     }
 
     pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
-        let mut header = [0u8; DATA_SEGMENT_OVERHEAD as usize];
-        header[0..2].copy_from_slice(&self.conv.to_be_bytes());
-        header[2] = Command::Data.to_byte();
-        header[3] = self.option.to_byte();
-        header[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
-        header[8..12].copy_from_slice(&self.number.to_be_bytes());
-        header[12..16].copy_from_slice(&self.sending_next.to_be_bytes());
-        header[16..18].copy_from_slice(&(self.payload.len() as u16).to_be_bytes());
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&self.payload);
+        serialize_data(
+            OutgoingHeader {
+                conv: self.conv,
+                option: self.option,
+                timestamp: self.timestamp,
+                number: self.number,
+                sending_next: self.sending_next,
+            },
+            &self.payload,
+            out,
+        );
     }
+}
+
+/// The five fields a data segment's wire header carries. Split out so the
+/// sender can hand the header over by value while the payload stays a borrowed
+/// slice of whatever buffer holds it — the sender's payload is a range into an
+/// arena, not an owned `Vec` per segment.
+#[derive(Debug, Clone, Copy)]
+pub struct OutgoingHeader {
+    pub conv: u16,
+    pub option: SegmentOption,
+    pub timestamp: u32,
+    pub number: u32,
+    pub sending_next: u32,
+}
+
+/// Writes the 18 header bytes and then the payload, straight into `out`. The
+/// header used to be staged in a stack array and copied; at 18 bytes per 1 332
+/// that is one memcpy per segment the arena made unnecessary.
+pub(crate) fn serialize_data(header: OutgoingHeader, payload: &[u8], out: &mut Vec<u8>) {
+    out.reserve(DATA_SEGMENT_OVERHEAD as usize + payload.len());
+    out.extend_from_slice(&header.conv.to_be_bytes());
+    out.push(Command::Data.to_byte());
+    out.push(header.option.to_byte());
+    out.extend_from_slice(&header.timestamp.to_be_bytes());
+    out.extend_from_slice(&header.number.to_be_bytes());
+    out.extend_from_slice(&header.sending_next.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +422,60 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The sender writes a data segment from a borrowed payload slice while the
+    /// oracle and every segment test write it from an owned one. Both must put
+    /// the same bytes on the wire at every length and offset, so the refactor
+    /// that removed the per-segment allocation cannot have changed the framing.
+    #[test]
+    fn a_borrowed_payload_serialises_identically_to_an_owned_one() {
+        let mut checked = 0usize;
+        for len in [
+            0usize, 1, 2, 15, 16, 17, 63, 64, 65, 127, 128, 1400, 8171, 8192,
+        ] {
+            for option in [SegmentOption::NONE, SegmentOption::CLOSE] {
+                for (number, timestamp, sending_next) in
+                    [(0u32, 0u32, 0u32), (1, 2, 3), (u32::MAX, 7, 11)]
+                {
+                    let payload: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x5A).collect();
+                    let owned = DataSegment {
+                        conv: 0xbeef,
+                        option,
+                        timestamp,
+                        number,
+                        sending_next,
+                        payload: payload.clone(),
+                        ..Default::default()
+                    };
+                    let mut from_owned = Vec::new();
+                    Segment::Data(owned.clone()).serialize(&mut from_owned);
+                    let mut from_slice = Vec::new();
+                    serialize_data(
+                        OutgoingHeader {
+                            conv: owned.conv,
+                            option: owned.option,
+                            timestamp: owned.timestamp,
+                            number: owned.number,
+                            sending_next: owned.sending_next,
+                        },
+                        &owned.payload,
+                        &mut from_slice,
+                    );
+                    assert_eq!(from_owned, from_slice, "len {len} {option:?}");
+                    assert_eq!(
+                        from_owned.len(),
+                        DATA_SEGMENT_OVERHEAD as usize + len,
+                        "len {len}: the header is still {DATA_SEGMENT_OVERHEAD} bytes"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= 84,
+            "the sweep should be dense, not a sample: {checked}"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use super::roundtrip::RoundTripInfo;
-use super::segment::{AckSegment, DataSegment, Segment};
+use super::segment::{serialize_data, AckSegment, OutgoingHeader, Segment};
 use super::window::{AckList, SendingWindow};
 
 fn hex(bytes: &[u8]) -> String {
@@ -15,9 +15,12 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn emit_data(lines: &mut Vec<String>, seg: &mut DataSegment) {
+/// The oracle writes through the *shipped* sender path — a borrowed payload
+/// slice — so the pinned Go bytes it compares against are pinned against the
+/// code that actually goes on the wire, not against a test-only wrapper.
+fn emit_data(lines: &mut Vec<String>, header: OutgoingHeader, payload: &[u8]) {
     let mut buf = Vec::new();
-    Segment::Data(seg.clone()).serialize(&mut buf);
+    serialize_data(header, payload, &mut buf);
     lines.push(format!("SEG {}", hex(&buf)));
 }
 
@@ -50,14 +53,14 @@ fn the_scripted_core_matches_the_pinned_go() {
             }
             "sw_push" => {
                 let n: u32 = parts[1].parse().unwrap();
-                sw.push(n, parts[2..].join(" ").into_bytes());
+                sw.push(n, parts[2..].join(" ").as_bytes());
             }
             "sw_flush" => {
                 let cur: u32 = parts[1].parse().unwrap();
                 let rto: u32 = parts[2].parse().unwrap();
                 let max: u32 = parts[3].parse().unwrap();
-                let rate = sw.flush(cur, rto, max, &mut |seg: &mut DataSegment| {
-                    emit_data(&mut lines, seg);
+                let rate = sw.flush(cur, rto, max, &mut |header, payload| {
+                    emit_data(&mut lines, header, payload);
                 });
                 if let Some(rate) = rate {
                     lines.push(format!("loss {rate}"));
