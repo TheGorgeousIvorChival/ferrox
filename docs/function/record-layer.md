@@ -162,8 +162,17 @@ What is **not** removed, and is named rather than claimed:
   as a shipping threshold and `the_neon_halves_are_the_three_limbs_at_every_length_around_the_threshold`
   gates on it. A reader of those two tests believes a shorter aarch64 rung ships.
   It does not. The shipping ladders are `{128 stride-2, 1024 two-lane, 4096
-  NEON-4}` on aarch64 and `{128 stride-2, 4096 AVX2}` on x86_64, so any page
-  that quotes a threshold has to say which architecture it means.
+  NEON-4}` on aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64, so any page
+  that quotes a threshold has to say which architecture it means — the two do
+  not agree, and the x86 AVX2 rung moved to 1 KiB in `815eeb2` because its
+  fixed setup cost is repaid by then.
+
+  This also bounds what the ladder-head guards on the four-lane rungs can
+  assume: the head is `e = blocks % 4` blocks, so at most 48 bytes, and the
+  smallest dispatch threshold on either architecture is 128. That is why both
+  guards may call `absorb_one_block_chain` directly instead of going back
+  through `absorb` — a 48-byte slice can never reach another rung, so there is
+  no dispatch to skip.
 - **`ops-retired-instructions` is still `UNBLESSED` on every page.** One symbol
   in this repository carries a blessed exact count, `der_to_pem`. The removed
   operations named above are counted in the table — copies, allocations, passes,
