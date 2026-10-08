@@ -40,10 +40,11 @@ byte for byte at every length to 1032 bytes and at four start counters, head and
 headless, and gate 1 asserts the same bytes against the pinned `chacha20` crate
 before gate 3 times anything.
 
-Above 1024 bytes on `x86_64`, when the machine has both `avx512f` and `avx2`,
-one more pass takes over before that one: `chacha::wide`, the sixteen-block pass,
-instantiated over `__m512i` in `chacha::avx512`. It exists for two reasons that
-are counts and not tastes. The first is the register file.
+From 1024 bytes on `x86_64` — 960 when the buffer carries a head, since the head
+is one of the pass's own blocks — and when the machine has both `avx512f` and
+`avx2`, one more pass takes over before that one: `chacha::wide`, the
+sixteen-block pass, instantiated over `__m512i` in `chacha::avx512`. It exists
+for two reasons that are counts and not tastes. The first is the register file.
 
 ```bash
 CARGO_TARGET_DIR=/tmp/xtarget cargo rustc --release --target x86_64-apple-darwin \
@@ -267,6 +268,44 @@ own groups — 320 bytes reads 1.47x (185 ns) in the pass's run against 1.48x
 (179 ns) in the run before it, and 448 bytes 1.51x (312 ns) against 1.52x
 (304 ns).
 
+Run `37749274086` carries the sixteen-block pass — `f2c624e`, the commit this
+page ships with — against run `37740838172`, the eight-block pass at
+`d31ddae`, on the same two runner classes. Both `x86_64` reports name the pass in
+their own machine line: `ferrox core` reads `4-lane core: AVX-512, one word per
+register, 16 blocks a pass, the eight-block pass below a pass, at
+runtime-detected width`, and that line is `ferrox_core::chacha_backend()`, which
+returns it only when the runner's own `is_x86_feature_detected!("avx512f")` and
+`is_x86_feature_detected!("avx2")` both read true — the same condition that lets
+`chacha::avx512`'s differential test execute its body, so a run whose machine
+line names the pass is a run in which gate 1's 7 200 shapes went through it.
+Every length below 1024 bytes compiles to the same call in both runs, and the
+reference's own clock moved between them — 8 057 ns at 16 KiB against 9 316 ns
+on linux `x86_64`, 9 203 ns against 7 781 ns on windows `x86_64` — so each pair
+of columns is read as two runs and not one:
+
+| bytes | linux x86_64, eight-block pass | linux x86_64, sixteen-block pass | windows x86_64, eight-block pass | windows x86_64, sixteen-block pass |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 1.38x (428 ns) | 2.39x (213 ns) | 1.29x (392 ns) | 2.71x (220 ns) |
+| 4 KiB | 1.36x (1 743 ns) | 2.44x (831 ns) | 1.32x (1 483 ns) | 2.76x (841 ns) |
+| 16 KiB | 1.36x (6 846 ns) | 2.40x (3 359 ns) | 1.33x (5 863 ns) | 2.71x (3 400 ns) |
+| 64 KiB | 1.36x (27 188 ns) | 2.36x (13 688 ns) | 1.32x (23 561 ns) | 2.63x (13 977 ns) |
+
+The 16 KiB row is the record-sized one, and it halves on both runners: 6 846 ns
+to 3 359 ns on linux `x86_64` and 5 863 ns to 3 400 ns on windows `x86_64`,
+against a reference that read 13% *faster* on linux `x86_64` this time and 18%
+*slower* on windows `x86_64`, so the windows ratio is the flattered one of the
+two. That is the same shape the counts above predict from both halves of the
+trade: 0.96 round-loop instructions a byte against 2.79, and four transpose
+gathers a block against six, with the whole of the pass's extra setup inside a
+rate the eight-block pass already pays. The lengths that straddle a pass are
+where it pays for what it cannot cover — 1 023 bytes reads 1.63x (469 ns) on
+linux `x86_64` while 1 025 reads 2.00x (310 ns), the first being the eight-block
+pass plus a tail and the second a whole pass plus a one-block remainder. Gate
+3's own line for the run is 235 lengths with none below 0.95x, worst 1.00x at
+256 bytes, best 2.86x at 224 bytes; no length under 1024 bytes reaches the pass
+in either run, so those rows — the 1.15x worst the run before this one carried
+at the same 256 bytes included — are the runner and not either change.
+
 ## What we removed
 
 - **Thirteen stack moves a double round, and four operations a quarter round.**
@@ -393,14 +432,16 @@ What is **not** removed, and is named rather than claimed:
   no dispatch to skip.
 - **The sixteen-block pass is checked by the runners, not here.** Nothing this
   repository builds on can execute `avx512f` without a machine that has it, so
-  `chacha::avx512::Z16` is not run on the machine reading this — not under an
-  emulator either, since neither Rosetta nor anything else in this tree decodes
-  an `EVEX` prefix. The pass's *shape* is checked everywhere: `chacha::wide`
-  carries the same body over sixteen `u32`, and the differential test beside it
-  holds that instantiation to `portable::U4` at every length to 2072 bytes and
-  four start counters, head and headless. What is left to a machine with
-  AVX-512 is one instruction — the gather whose `idx & 0x10` bit picks the
-  source register — so the honest split is: the index table is proved a
+  `chacha::avx512::Z16` is not run on the machine reading this — and an emulator
+  does not stand in: a `x86_64` build of this crate run under Rosetta on Apple
+  silicon reports `avx512f` false, which is the very `is_x86_feature_detected!`
+  the test reads on its first line and the dispatch itself calls, so the body
+  returns before it runs a block. The pass's *shape* is checked everywhere:
+  `chacha::wide` carries the same body over sixteen `u32`, and the differential
+  test beside it holds that instantiation to `portable::U4` at every length to
+  2072 bytes and four start counters, head and headless. What is left to a
+  machine with AVX-512 is one instruction — the gather whose `idx & 0x10` bit
+  picks the source register — so the honest split is: the index table is proved a
   transpose here, the pass over it is proved the ladder here, and the one
   instruction that applies it is proved on the two `x86_64` runners of
   `bench.yml` and in the `x86_64` job of `ci.yml`. If no runner carried
