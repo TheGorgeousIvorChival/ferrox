@@ -254,6 +254,15 @@ pub(crate) fn wide_blocks<V: Wide16>(
     buf: &mut [u8],
     rest: impl FnOnce(&[u8; 32], &[u8; 12], u32, Option<&mut [u8; 32]>, &mut [u8]) -> u32,
 ) -> u32 {
+    // Below one pass the remainder handler is the whole call, so the pass state is not built.
+    let take = if head.is_some() {
+        PASS_BYTES - 64
+    } else {
+        PASS_BYTES
+    };
+    if buf.len() < take {
+        return rest(key, nonce, start, head, buf);
+    }
     let state = crate::chacha::base_state(key, nonce);
     let mut ctr = start;
     let mut left = buf;
