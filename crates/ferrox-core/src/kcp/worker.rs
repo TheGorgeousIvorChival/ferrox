@@ -264,31 +264,24 @@ impl ReceivingWorker {
         self.window.set(number, seg);
     }
 
-    pub fn read_multi_buffer(&mut self) -> Vec<Vec<u8>> {
-        if !self.left_over.is_empty() {
-            let mut out = self.left_over.drain(..).collect::<Vec<_>>();
-            if self.left_over_off > 0 {
-                let tail = out[0].split_off(self.left_over_off);
-                out[0] = tail;
-                self.left_over_off = 0;
-            }
-            return out;
-        }
-        let mut mb = Vec::new();
+    /// Drains every segment the window holds, so `next_number` reaches the end
+    /// of what has arrived before `read` is given the caller's buffer. Doing it
+    /// lazily instead lets `next_number` lag by whatever one read did not
+    /// consume, and `process_segment` refuses anything `window_size` ahead of
+    /// `next_number`, so a lazy pull drops segments an eager drain accepts.
+    fn drain_window(&mut self) {
         while let Some(mut seg) = self.window.remove(self.next_number) {
             self.next_number += 1;
-            mb.push(std::mem::take(&mut seg.payload));
+            self.left_over.push_back(std::mem::take(&mut seg.payload));
         }
-        mb
     }
 
     pub fn read(&mut self, b: &mut [u8]) -> usize {
         if self.left_over.is_empty() {
-            let mb = self.read_multi_buffer();
-            if mb.is_empty() {
+            self.drain_window();
+            if self.left_over.is_empty() {
                 return 0;
             }
-            self.left_over.extend(mb);
         }
         let mut n = 0;
         while n < b.len() && !self.left_over.is_empty() {

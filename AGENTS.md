@@ -56,6 +56,54 @@ not call the slice complete.
   place, `scripts/method-counts.txt`, and `scripts/check-method-docs.sh` fails if
   a page and that file disagree in either direction. Editing a number in the
   page alone is the failure this gate exists to catch.
+- **A copy or an allocation claim is proved by pointer identity, not by
+  reading the code.** `frames_reuse_the_callers_buffers` is the model: assert
+  that the returned slice's pointer lies inside the caller's buffer, that the
+  buffer's own pointer does not move, and that its capacity does not grow. That
+  is what makes `user-space-copies-per-byte-written 1` a claim rather than an
+  intention, and it is the gate to copy when a rewrite claims it removed a
+  copy, a `memmove` or a per-record allocation.
+- **The named checker has to observe the thing in the row.** Pointer identity
+  observes copies and reallocations. A differential sweep against a reference
+  crate observes *bytes*, not the operation count that produced them: it will
+  happily pass while the code stages keystream, calls `update` twice or recurses
+  into a dispatch with nothing to do. So a row like `staging-bytes-per-decrypt
+  0` with a differential test beside it is a row with no checker, and the honest
+  place for it is the page's prose. Nothing in this tree counts ChaCha blocks per
+  open, stack bytes staged, or `absorb` calls, and `count::measure` hooks
+  `alloc`/`alloc_zeroed`, so it would not see a stack staging buffer either.
+- **A counter beats an argument when the counter already exists.** `kcp
+  reader-wakeups-per-datagram 1` is gated because `Notifier::gen` is the very
+  counter `read` snapshots and `wait_since` compares, so its delta *is* the
+  wakeup count. Look for the quantity already lying around as state before
+  writing a test that reconstructs it.
+- **A rewrite that passes the test suite can still be a regression, so do the
+  arithmetic on the case the tests do not reach.** Two on this branch looked
+  like wins and were not, and the arithmetic found both without a benchmark.
+  Widening the websocket mask stride from 16 to 64 bytes leaves the vector op
+  count identical and pushes the *scalar remainder* from under 16 bytes to as
+  much as 63, so every length that is not a multiple of 64 got worse. Pulling
+  KCP segments out of the window one at a time instead of draining it lets
+  `next_number` lag behind what a single `read` consumed, and `process_segment`
+  refuses anything `window_size` ahead of `next_number` — at the default
+  776-segment window a sender legitimately in flight starts losing segments.
+  Neither was caught by a test, because the tests feed everything before they
+  read. Before landing a rewrite, ask what the *worst* input does, and ask
+  whether the change moves a cursor, a counter or a window that something else
+  is measured against.
+- **A rewrite that trades one pass for another says so, with both numbers.**
+  The AEAD open path went from one fused ladder pass plus a staging buffer and a
+  scalar loop to two passes and no staging, and the honest line is
+  `keystream-passes-per-decrypt 2` beside `staging-bytes-per-decrypt 0`. Naming
+  the pass that got worse is what keeps a "removal" from being a relocation.
+- **Bit-identical means the block, byte and counter counts are unchanged too,
+  not only the output.** A rewrite that generates the same bytes with a
+  different number of keystream blocks, a different panic threshold, or a
+  different number of 16-byte Poly1305 absorbs has changed the method, not
+  tuned it. The differential sweep is the gate: `every_decrypt_matches_the_crate_it_replaces`
+  and `every_payload_length_and_address_survives_the_round_trip` open against
+  the pinned crate at every length and address family, and a forged tag has to
+  leave the buffer still encrypted.
 - `UNBLESSED` is the value for a count nobody has measured. It is a claim that
   is open, not a number, and it must never be quoted as one. `ops.yml` reports
   every symbol in `scripts/method-ops.txt` on each run; read that artefact before
@@ -63,7 +111,24 @@ not call the slice complete.
 - Name what was *not* removed. A page that lists only wins is not evidence, and
   the failures are the part a reader needs: rows that parse but are not dialled,
   a carrier refused by name, a benchmark gate that is an allocation count and not
-  a clock.
+  a clock. **A change that alters the bytes on the wire is not an optimisation,
+  however many syscalls it saves** — KCP sends one datagram per segment because
+  batching would change the datagram boundaries a peer sees, so it is named and
+  left alone. Name it the same way you name a refused carrier.
+- **Two worktrees share one `target-dir` on purpose, and that makes a bisect
+  lie.** `scripts/new-worktree.sh` points every worktree at one
+  `.ferrox-target` so dependencies compile once, so a `cargo test` can pick up an
+  artefact another worktree just rebuilt, and "this change broke the test" can be
+  an artefact of the rebuild rather than of the diff. When a bisect points at
+  something absurd — a one-line capacity change failing a loopback test — rerun
+  it with `CARGO_TARGET_DIR` of its own before believing it. And re-`git
+  checkout` is how a bisect throws work away: snapshot the files to `/tmp`
+  first, or take a patch against the base you started from.
+- **Rebase onto `main` before trusting a long session.** `main` moves under a
+  worktree; a `git checkout <file>` to bisect then silently reverts commits that
+  landed in the meantime, and the result looks exactly like your own regression.
+  Re-apply work as a patch (`diff` the base against your tree, `git apply` onto
+  the new tip) so a three-way overlap is a conflict rather than a lost hunk.
 - Rewrite, do not copy. No upstream line or test enters this tree — learn how
   the pinned implementations do it and write the smaller, cheaper thing.
 - Faster, safer, leaner, or it does not land. Counts prove, durations suggest.

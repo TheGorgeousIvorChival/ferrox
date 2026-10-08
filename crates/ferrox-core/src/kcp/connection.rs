@@ -296,10 +296,14 @@ impl Connection {
         self.ctx.round_trip.lock().unwrap().timeout()
     }
 
-    pub fn input(&self, segments: Vec<Segment>) {
+    /// Takes the caller's datagram buffer by `drain`, so the socket thread
+    /// parses into one vector and hands it over with its capacity intact: a
+    /// datagram costs no allocation for its segment list.
+    pub fn input(&self, segments: &mut Vec<Segment>) {
         let current = self.elapsed();
         self.last_incoming_time.store(current, Ordering::SeqCst);
-        for seg in segments {
+        let mut woke = false;
+        for seg in segments.drain(..) {
             if seg.conversation() != self.ctx.meta.conversation {
                 break;
             }
@@ -308,14 +312,9 @@ impl Connection {
             }
             match seg {
                 Segment::Data(d) => {
-                    let available = {
-                        let mut receiving = self.receiving.lock().unwrap();
-                        receiving.process_segment(d);
-                        receiving.is_data_available()
-                    };
-                    if available {
-                        self.data_input.signal();
-                    }
+                    let mut receiving = self.receiving.lock().unwrap();
+                    receiving.process_segment(d);
+                    woke |= receiving.is_data_available();
                 }
                 Segment::Ack(a) => {
                     let rto = self.ctx.round_trip.lock().unwrap().timeout();
@@ -355,6 +354,11 @@ impl Connection {
                         .update_peer_rto(c.peer_rto, current);
                 }
             }
+        }
+        // One wake for the datagram: a reader parked on the generation counter
+        // needs to see it change, not to see it change once per segment.
+        if woke {
+            self.data_input.signal();
         }
         self.wake_update();
     }
@@ -476,26 +480,17 @@ impl Connection {
     }
 
     fn wait_for_data_input(&self, snap: u64) -> Result<(), ConnError> {
-        if self
-            .rd
-            .lock()
-            .unwrap()
-            .map(|t| t <= Instant::now())
-            .unwrap_or(false)
-        {
+        // One acquisition: the deadline is Copy, and taking it twice let a
+        // concurrent set_rd_deadline land between the two reads.
+        let deadline = *self.rd.lock().unwrap();
+        if deadline.is_some_and(|t| t <= Instant::now()) {
             return Err(ConnError::IoTimeout);
         }
-        let duration = match *self.rd.lock().unwrap() {
-            Some(t) => t.saturating_duration_since(Instant::now()),
-            None => Duration::from_secs(16),
-        };
+        let duration = deadline.map_or(Duration::from_secs(16), |t| {
+            t.saturating_duration_since(Instant::now())
+        });
         if !self.data_input.wait_since(snap, Some(duration))
-            && self
-                .rd
-                .lock()
-                .unwrap()
-                .map(|t| t <= Instant::now())
-                .unwrap_or(false)
+            && deadline.is_some_and(|t| t <= Instant::now())
         {
             return Err(ConnError::IoTimeout);
         }
@@ -503,26 +498,17 @@ impl Connection {
     }
 
     fn wait_for_data_output(&self, snap: u64) -> Result<(), ConnError> {
-        if self
-            .wd
-            .lock()
-            .unwrap()
-            .map(|t| t <= Instant::now())
-            .unwrap_or(false)
-        {
+        // One acquisition: the deadline is Copy, and taking it twice let a
+        // concurrent set_wd_deadline land between the two reads.
+        let deadline = *self.wd.lock().unwrap();
+        if deadline.is_some_and(|t| t <= Instant::now()) {
             return Err(ConnError::IoTimeout);
         }
-        let duration = match *self.wd.lock().unwrap() {
-            Some(t) => t.saturating_duration_since(Instant::now()),
-            None => Duration::from_secs(16),
-        };
+        let duration = deadline.map_or(Duration::from_secs(16), |t| {
+            t.saturating_duration_since(Instant::now())
+        });
         if !self.data_output.wait_since(snap, Some(duration))
-            && self
-                .wd
-                .lock()
-                .unwrap()
-                .map(|t| t <= Instant::now())
-                .unwrap_or(false)
+            && deadline.is_some_and(|t| t <= Instant::now())
         {
             return Err(ConnError::IoTimeout);
         }
@@ -698,7 +684,7 @@ mod tests {
     #[test]
     fn an_in_order_segment_is_delivered_once() {
         let conn = echoing_connection();
-        conn.input(vec![data(0, 0, b"first"), data(1, 0, b"second")]);
+        conn.input(&mut vec![data(0, 0, b"first"), data(1, 0, b"second")]);
         let mut buf = [0u8; 32];
         assert_eq!(read_once(&conn, &mut buf), Ok(11));
         assert_eq!(&buf[..11], b"firstsecond");
@@ -709,7 +695,7 @@ mod tests {
     fn a_segment_beyond_the_receiving_window_is_dropped() {
         let conn = echoing_connection();
         let beyond = Config::default().receiving_in_flight_size();
-        conn.input(vec![data(beyond, 0, b"too far")]);
+        conn.input(&mut vec![data(beyond, 0, b"too far")]);
         let mut buf = [0u8; 32];
         assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
     }
@@ -717,7 +703,7 @@ mod tests {
     #[test]
     fn a_retransmitted_segment_is_delivered_once() {
         let conn = echoing_connection();
-        conn.input(vec![data(0, 0, b"payload"), data(0, 0, b"payload")]);
+        conn.input(&mut vec![data(0, 0, b"payload"), data(0, 0, b"payload")]);
         let mut buf = [0u8; 32];
         assert_eq!(read_once(&conn, &mut buf), Ok(7));
         assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
@@ -726,10 +712,108 @@ mod tests {
     #[test]
     fn a_segment_arriving_out_of_order_waits_for_its_turn() {
         let conn = echoing_connection();
-        conn.input(vec![data(1, 0, b"second"), data(0, 0, b"first")]);
+        conn.input(&mut vec![data(1, 0, b"second"), data(0, 0, b"first")]);
         let mut buf = [0u8; 32];
         assert_eq!(read_once(&conn, &mut buf), Ok(11));
         assert_eq!(&buf[..11], b"firstsecond");
+    }
+
+    /// The segment list is the socket thread's, and `input` drains rather than
+    /// takes: so one capacity serves every datagram and a second allocation
+    /// would mean the buffer was dropped instead of borrowed.
+    #[test]
+    fn a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next() {
+        let conn = echoing_connection();
+        let mut segs: Vec<Segment> = Vec::new();
+        let mut room = 0usize;
+        for round in 0..8 {
+            segs.extend([data(0, 0, b"a"), data(1, 0, b"bb"), data(2, 0, b"ccc")]);
+            conn.input(&mut segs);
+            assert!(
+                segs.is_empty(),
+                "round {round}: input must drain the buffer"
+            );
+            if round == 0 {
+                room = segs.capacity();
+                assert!(room >= 3, "a three-segment datagram has to fit: {room}");
+            }
+            assert_eq!(
+                segs.capacity(),
+                room,
+                "round {round}: the capacity {room} was dropped, so a datagram reallocates"
+            );
+        }
+    }
+
+    /// `Notifier::gen` is the generation counter `read` snapshots and
+    /// `wait_since` compares, so its delta is the number of wakeups: this is
+    /// the gate for "one wakeup per datagram" rather than a reading of it.
+    #[test]
+    fn a_datagram_wakes_the_reader_once_however_many_segments_it_carries() {
+        for width in [1usize, 2, 3, 8] {
+            let conn = echoing_connection();
+            let mut segs: Vec<Segment> = Vec::new();
+            for number in 0..width {
+                segs.push(data(number as u32, 0, b"payload"));
+            }
+            let before = conn.data_input.gen();
+            conn.input(&mut segs);
+            assert_eq!(
+                conn.data_input.gen() - before,
+                1,
+                "width {width}: a {width}-segment datagram woke the reader more than once"
+            );
+        }
+        let conn = echoing_connection();
+        let before = conn.data_input.gen();
+        conn.input(&mut vec![data(9, 0, b"far away")]);
+        assert_eq!(
+            conn.data_input.gen(),
+            before,
+            "a segment outside the receiving window is not a wakeup"
+        );
+    }
+
+    #[test]
+    fn every_read_size_delivers_the_same_stream() {
+        let stream: Vec<u8> = (0..776).map(|i| (i as u8).wrapping_mul(29)).collect();
+        let segments: Vec<Vec<u8>> = (0..8)
+            .map(|k| stream[k * 97..(k + 1) * 97].to_vec())
+            .collect();
+        let mut want = Vec::new();
+        for window in [1usize, 2, 3, 7, 31, 64, 96, 97, 128, 389, 776, 1024, 4096] {
+            let conn = echoing_connection();
+            let mut segs: Vec<Segment> = Vec::new();
+            let mut number = 0u32;
+            for chunk in &segments {
+                let mut at = 0;
+                while at < chunk.len() {
+                    let take = window.min(chunk.len() - at);
+                    segs.push(data(number, 0, &chunk[at..at + take]));
+                    number += 1;
+                    at += take;
+                }
+            }
+            conn.input(&mut segs);
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; window];
+            loop {
+                conn.set_read_deadline(std::time::Instant::now() + Duration::from_millis(20));
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            if want.is_empty() {
+                want = got.clone();
+            }
+            assert_eq!(got, want, "window {window}");
+            assert_eq!(got.len(), stream.len(), "window {window}");
+        }
+        assert_eq!(
+            want, stream,
+            "the reassembled stream is the one that went in"
+        );
     }
 
     #[test]

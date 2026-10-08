@@ -68,7 +68,7 @@ impl<S: Read + Write> Link<S> {
             hat: 0,
             out: Vec::new(),
             oat: 0,
-            staging: Vec::new(),
+            staging: Vec::with_capacity(BUFFER + SHORTEST_FRAME),
             staged: 0,
             read: Reading {
                 padding: true,

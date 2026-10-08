@@ -98,6 +98,51 @@ rather than a gap in the table:
   produced. The gates that *are* deterministic — allocation counts, copy counts,
   syscall counts — are gated, and those are the numbers the pages lead with.
 
+### What the last branch removed, in counts
+
+Two of these are gated by a counter; the rest are argued from the source at the
+line named, and the page says which is which. A number nobody can produce is not
+a number, so only the first table below appears in `scripts/method-counts.txt`.
+
+| rung | removed | gate |
+| --- | --- | --- |
+| [shadowsocks](docs/function/shadowsocks.md) | two of the three passes over every UDP payload, and the per-datagram allocation | `udp-payload-buffers-per-datagram 1` and `udp-datagram-reallocations-after-the-first 0`, both by pointer identity over eight datagrams |
+| [kcp](docs/function/kcp.md) | a `Vec<Segment>` allocated and freed per received datagram | `segment-list-vectors-per-datagram 1`, by capacity identity over eight datagrams |
+| [kcp](docs/function/kcp.md) | `n - 1` of every `n` reader wakeups on a multi-segment datagram | `reader-wakeups-per-datagram 1`, by the `Notifier` generation-counter delta |
+| [record layer](docs/function/record-layer.md) | the 64-byte staging buffer every ChaCha open carried, its zero-fill, the scalar XOR loop, and the split that fed a third pass | argued; proved bit-identical by a 6 000-case differential against the pinned crate |
+| [record layer](docs/function/record-layer.md) | the second `update` (and its dynamically sized `memcpy`) that pads an AEAD section, and the empty `absorb` at both ends of a record | argued, same differential |
+| [mux-cool](docs/function/mux-cool.md) | a full `memcpy` of every inbound byte, on all three read loops | argued; `mux::decode` was already handing out a borrowed subslice |
+| [shadowsocks](docs/function/shadowsocks.md) | a 16-byte tag copy per chunk, and a second 16 KiB buffer alive for the connection's whole life | argued |
+| [kcp](docs/function/kcp.md) | a `Vec<Vec<u8>>` per `read`, and a second deadline lock per wait | argued |
+| [carrier-websocket](docs/function/carrier-websocket.md) | an unbounded `realloc` chain in the read-ahead buffer | argued |
+
+Three of those need their limits stated, because a page that lists only wins is
+not evidence:
+
+- **The open path is now two keystream passes, not one.** MAC-before-decrypt is
+  not free: Poly1305 needs no keystream, so the tag is checked first and block
+  one onward is xored in afterwards. The old shape fused the one-time key and
+  the first body block into one ladder pass but needed a staging buffer and a
+  third pass over the tail. The block count is `1 + ceil(len/64)` before and
+  after and so is the panic threshold; what changed is the staging, the scalar
+  loop and the passes over the buffer. This is the order `aesgcm::open_impl` in
+  this tree has always used, so the AEADs no longer disagree about when plaintext
+  exists.
+- **Two optimisations were measured as regressions and reverted, and the
+  arithmetic is on the page.** Widening the websocket mask stride to 64 bytes
+  makes the *scalar remainder* up to 63 bytes instead of under 16, so every
+  length that is not a multiple of 64 gets worse. Pulling KCP segments out of
+  the window one at a time instead of draining it lets `next_number` lag behind
+  what one `read` consumed, and `process_segment` refuses anything
+  `window_size` ahead of `next_number` — at the default 776-segment window a
+  sender legitimately in flight starts having segments dropped. Both passed the
+  test suite. Neither is here.
+- **NOT removed:** KCP still sends one datagram per 1 332-byte segment, because
+  batching would change the bytes on the wire. The mux uplink still copies every
+  payload byte once, because removing that copy means splitting
+  `mux::Outgoing::encode_into` in two. Both are named on their pages as open, not
+  claimed as wins.
+
 ## Connection methods
 
 The goal is a drop-in replacement for xray-core — the same JSON, the same share links, every protocol, transport and security it dials or serves — and then a superset of it: everything sing-box, ZeroNet and LxBox carry that Xray does not. Tables A–I are the verdict so far; tables J–L are the rest of that superset, read off the four pinned trees, each row naming the paths that prove the reference has it.

@@ -32,6 +32,10 @@ graph TD
     I --> J["read the payload chunk into<br/>the connection's own buffer"]
     J --> K["open in place, zero copies"]
     K --> L["write_all to the target"]
+    M["wire datagram"] --> N["salt to the subkey, one copy in"]
+    N --> O["open in place in the socket thread's<br/>own buffer, no allocation"]
+    O --> P["payload is a subslice of that buffer:<br/>memmove 0, no third copy"]
+    P --> Q(("target"))
 ```
 
 ## Measured
@@ -52,6 +56,13 @@ that file disagree.
 | user-space-copies-per-byte-read | 0 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | zero-filled-bytes-per-chunk | 0 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
+| udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
+| udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
+
+| udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
+
+
+
 <!-- counts:end -->
 
 ## Ops
@@ -120,6 +131,34 @@ Read against the three pinned implementations, all of which are in
   no second transpose and no second store exist. The subkey and the inner nonce
   live on the stack, and the method dispatch is one `match` on `Aead`, hoisted
   out of the per-byte loop rather than a string compare per chunk.
+- **Two of the three copies every UDP payload made.** `open_udp_datagram` took
+  the datagram's sealed tail with `to_vec` (a `malloc` plus a full `memcpy`),
+  opened the AEAD in place, then `copy_within(used..len, 0)` moved the whole
+  payload down to offset zero so the caller could hand it on — and the caller
+  copied it a third time into its reply buffer. The salt and the address header
+  both precede the payload, so one copy in is unavoidable; the `memmove` and the
+  allocation were not. `Datagrams` now holds one `opened` and one `sealed`
+  buffer per socket thread and returns `&opened[used..len]`, so the payload is
+  a subslice of the buffer the datagram was opened in. The same holds for
+  sealing: `seal_udp_datagram` allocated a fresh `Vec` per datagram, and the
+  buffer is now the thread's own.
+  `an_opened_payload_is_the_datagrams_own_bytes` is the gate: it asserts the
+  returned pointer lies inside `opened` — which is `udp-payload-buffers-per-datagram 1`
+  — and that `opened` neither moves nor grows over eight rounds, which is
+  `udp-datagram-reallocations-after-the-first 0`. Same pointer-identity idiom as
+  `frames_reuse_the_callers_buffers`. The 16-byte tag copy and the `memmove` are
+  named rather than counted: no test observes a copy that does not happen, so
+  they are not in the table.
+- **A 16-byte tag copy per chunk.** `Cipher::open_in_place` split the tag off
+  with `split_at_mut` and then built a `[u8; TAG_LEN]` on the stack to pass by
+  reference. It now borrows the sixteen bytes that are already there, which is
+  the shape `vmess.rs` already used. Small next to the AEAD, but it is one
+  `memcpy` per chunk and it is gone.
+- **A second 16 KiB buffer alive for the whole connection.** The server's first
+  chunk buffer was shadowed by the slice borrowed out of it, so it stayed live
+  until the function returned while `pump_relay_carried` allocated its own;
+  every Shadowsocks connection held 32 KiB where it needed 16. Both handoff
+  paths now drop the head buffer once the address has been forwarded.
 
 What is **not** removed, and is named rather than claimed: `2022-blake3-aes-128-gcm`,
 `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-poly1305` and `rc4-md5` still

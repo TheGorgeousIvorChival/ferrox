@@ -43,6 +43,12 @@ graph TD
 | oracle-runs-against-the-pinned-go | 1 | ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go |
 | rto-cap-seconds | 10 | ferrox-core-kcp::tests::rto_is_capped_at_ten_seconds_and_widened |
 | app-rows-serving-over-kcp | 4 | ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback |
+
+| segment-list-vectors-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
+
+
+
+| reader-wakeups-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries |
 <!-- counts:end -->
 
 ## Ops
@@ -66,6 +72,60 @@ figure is quoted. A KCP number measured over a VPN is a measurement of the VPN.
 
 Read against the pinned Go implementation, which is the reference here because
 it is the one this rung replaces:
+
+- **A `Vec<Segment>` allocated and freed per received datagram.** `Connection::input`
+  took `Vec<Segment>` by value, so the socket thread's `parse_segments` had to
+  build a fresh one — `Vec::new()` then a `push` per segment — and it was
+  dropped the moment the datagram was consumed. At the default MTU that is one
+  `malloc`/`free` pair per 1 332 received bytes. `input` now takes `&mut
+  Vec<Segment>` and `drain`s it, which hands every `Segment` over by value while
+  leaving the caller's capacity intact: the same vector serves every datagram
+  the socket ever receives. `a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next`
+  is the gate, and it is the same capacity-identity idiom as
+  `frames_reuse_the_callers_buffers`. Go's `kcp-go` has no equivalent object to
+  drop here — it decodes into a slice header and a fixed `seg` array — so this
+  is a place where the Go reference is structurally cheaper and this tree now
+  matches it.
+- **A `Vec<Vec<u8>>` allocated and freed per `read`.** `read_multi_buffer`
+  drained the receiving window into a fresh outer `Vec` only for `read` to move
+  it straight into a `VecDeque`, one entry per segment, and then walk two layers
+  of indirection to reach the payload. The outer `Vec` is gone: `drain_window`
+  pushes straight into `left_over`, which keeps its capacity, so a read that
+  finds the window non-empty allocates nothing.
+
+  **The lazy version of this was measured as a regression and is not here.**
+  Pulling one segment at a time out of the window instead of draining it is
+  cheaper still and passes every test in this file — but it lets `next_number`
+  lag by whatever one `read` did not consume, and `process_segment` refuses
+  anything `window_size` ahead of `next_number`. At the default
+  `receiving_in_flight_size()` of 776 segments, a sender legitimately in flight
+  would start having segments dropped that the eager drain accepts. That is a
+  flow-control change wearing a performance costume, and `drain_window` carries
+  a comment saying so.
+- **Two mutex acquisitions where one decides the same thing.**
+  `wait_for_data_input` took the read deadline, tested it, then took it again to
+  compute the wait. `Option<Instant>` is `Copy` and nothing else changes it
+  between the two acquisitions under the same lock, so the two reads agreed by
+  accident; the rewrite reads it once, and it also closes a window in which a
+  concurrent `set_read_deadline` could land between the two. Same for
+  `wait_for_data_output`.
+- **`n - 1` wakeups per multi-segment datagram.** `Connection::input` signalled
+  the reader inside the loop, once per data segment that made data available, so
+  a datagram carrying *n* segments paid *n* lock-and-broadcast pairs to wake the
+  same reader for the same reason. The loop now records whether any segment did
+  and signals once, after it, which is `reader-wakeups-per-datagram 1`.
+
+  That row is gated by a real counter rather than by reading the code:
+  `a_datagram_wakes_the_reader_once_however_many_segments_it_carries` snapshots
+  `Notifier::gen` — the generation counter `read` takes and `wait_since`
+  compares, so its delta *is* the number of wakeups — and requires the delta to
+  be exactly 1 for datagrams of 1, 2, 3 and 8 segments, and 0 for a segment
+  outside the receiving window. Safe because the counter is a change-detection
+  token compared only against its own past value: a reader parked on it needs to
+  see it change, not to see it change once per segment. It is *not* relaxed to an
+  atomic — `signal` bumps it under the mutex and `wait_since` compares it under
+  the same mutex, which is what closes the lost-wakeup window between `gen()` in
+  `read` and the `wait`.
 
 - **A fresh 8 KiB buffer per outbound segment.** Xray's
   `transport/internet/kcp/connection.go:406` does
@@ -108,6 +168,27 @@ one test on that runner only.
 `ferrox-core/examples/kcp_bench.rs` is not wired to a workflow that runs it on a
 named runner, so no throughput figure is quoted. The oracle proves the wire
 format; nothing in CI yet proves the loss behaviour under a real packet layer.
+
+
+What is **not** removed, and is named rather than claimed:
+
+- **One `sendto` per 1 332-byte segment.** `Ctx::emit` is called once per
+  segment from `SendingWindow::flush`, so KCP sends as many datagrams as it has
+  segments, and that is by far the largest syscall count on this rung.
+  Batching segments into one datagram would cut it substantially — and it would
+  change the bytes on the wire, because a peer sees fewer, larger datagrams.
+  That is a wire change, not an optimisation, so it is named here rather than
+  done.
+- **A `Vec<u32>` per received ACK.** `AckSegment::parse` collects the ACK numbers
+  into a fresh `Vec<u32>` — one `malloc` per ACK segment, up to 255 numbers. The
+  fix is the same scratch-vector mechanism as the receive side, but it means
+  threading a second buffer through `read_segment` for a gain of roughly one
+  allocation per round trip. Open.
+- **A `Vec` per 1 332-byte send chunk.** `SendingWindow` has to own each
+  outbound payload for retransmission, so the payload cannot be a borrow of the
+  caller's read buffer. An arena with front-trimming would remove the
+  allocation, and it is a real refactor of `window.rs` with real aliasing
+  hazards. Open.
 
 ## Pins
 

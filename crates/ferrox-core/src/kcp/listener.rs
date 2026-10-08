@@ -21,21 +21,24 @@ fn next_conversation() -> u16 {
     NEXT_CONVERSATION.fetch_add(1, Ordering::Relaxed).max(1)
 }
 
-fn parse_segments(buf: &[u8]) -> Vec<Segment> {
-    let mut out = Vec::new();
+fn parse_segments(buf: &[u8], out: &mut Vec<Segment>) {
+    out.clear();
     let mut rest = buf;
     while let Some((seg, tail)) = read_segment(rest) {
         out.push(seg);
         rest = tail;
     }
-    out
 }
 
 fn feed(sock: &UdpSocket, conn: &Connection) {
     let mut buf = vec![0u8; 65536];
+    let mut segs: Vec<Segment> = Vec::new();
     loop {
         match sock.recv_from(&mut buf) {
-            Ok((n, _)) => conn.input(parse_segments(&buf[..n])),
+            Ok((n, _)) => {
+                parse_segments(&buf[..n], &mut segs);
+                conn.input(&mut segs);
+            }
             Err(ref e)
                 if matches!(
                     e.kind(),
@@ -118,6 +121,7 @@ impl Listener {
         let weak = Arc::downgrade(&inner);
         thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
+            let mut segs: Vec<Segment> = Vec::new();
             loop {
                 {
                     let Some(inner) = weak.upgrade() else { break };
@@ -128,7 +132,7 @@ impl Listener {
                 match sock_r.recv_from(&mut buf) {
                     Ok((n, src)) => {
                         let Some(inner) = weak.upgrade() else { break };
-                        let segs = parse_segments(&buf[..n]);
+                        parse_segments(&buf[..n], &mut segs);
                         if segs.is_empty() {
                             continue;
                         }
@@ -136,7 +140,7 @@ impl Listener {
                         let key = (src, conv);
                         let existing = inner.sessions.lock().unwrap().get(&key).cloned();
                         if let Some(session) = existing {
-                            session.input(segs);
+                            session.input(&mut segs);
                             continue;
                         }
                         if segs[0].command() == Some(Command::Terminate) {
@@ -169,7 +173,7 @@ impl Listener {
                             .lock()
                             .unwrap()
                             .insert(key, Arc::clone(&session));
-                        session.input(segs);
+                        session.input(&mut segs);
                         inner.ready.lock().unwrap().push_back(session);
                         inner.ready_cv.notify_all();
                     }

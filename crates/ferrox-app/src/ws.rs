@@ -156,7 +156,7 @@ impl<R: Read> WsReader<R> {
         }
         let room = READ_AHEAD.max(len);
         if self.have.capacity() - self.have.len() < room {
-            self.have.reserve_exact(room);
+            self.have.reserve(room);
         }
         let base = self.have.len();
         unsafe {

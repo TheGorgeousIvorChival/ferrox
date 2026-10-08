@@ -756,9 +756,8 @@ fn serve_vless_mux(stream: TcpStream) {
     let mut udp: UdpTable = HashMap::new();
     let mut global: UdpGlobal = HashMap::new();
     let mut handles: Vec<std::sync::mpsc::Receiver<()>> = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
     let mut at = 0;
-    let mut probe = [0u8; 8192];
     let mut staging = Vec::with_capacity(8192);
     loop {
         if at >= buf.len() {
@@ -792,9 +791,9 @@ fn serve_vless_mux(stream: TcpStream) {
             }
         }
         if !progressed {
-            match read.read(&mut probe) {
+            match read_into_tail(&mut read, &mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&probe[..n]),
+                Ok(_) => {}
             }
         }
     }
@@ -1547,6 +1546,33 @@ pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
         buf.reserve(len);
     }
     unsafe { buf.set_len(len) }
+}
+
+/// One relay read's worth of stream bytes: the framing buffer's read room.
+pub(crate) const READ_SLICE: usize = 8 * 1024;
+
+/// Reads straight into the vector's spare capacity, so a relay read is not
+/// copied through a second buffer on its way to the framing loop.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the tail is handed straight to `read`, and every path that does not fill it truncates"
+)]
+pub(crate) fn read_into_tail(read: &mut impl Read, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    let base = buf.len();
+    buf.reserve(READ_SLICE);
+    // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled
+    // back on every path that does not, so no uninitialised byte is readable.
+    unsafe { buf.set_len(base + READ_SLICE) };
+    match read.read(&mut buf[base..]) {
+        Ok(n) => {
+            buf.truncate(base + n);
+            Ok(n)
+        }
+        Err(error) => {
+            buf.truncate(base);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn refresh_read_timeout(
@@ -2461,9 +2487,8 @@ fn spawn_trojan_uplink_reader(
 }
 
 fn mux_dial_downlink(mut down: TcpStream, mut up: TcpStream, id: u16) {
-    let mut buf: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
     let mut at = 0;
-    let mut probe = [0u8; 8192];
     loop {
         if at >= buf.len() {
             buf.clear();
@@ -2501,9 +2526,9 @@ fn mux_dial_downlink(mut down: TcpStream, mut up: TcpStream, id: u16) {
             }
         }
         if !progressed {
-            match down.read(&mut probe) {
+            match read_into_tail(&mut down, &mut buf) {
                 Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&probe[..n]),
+                Ok(_) => {}
             }
         }
     }
@@ -3936,6 +3961,7 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         return;
     };
     let mut buf = vec![0u8; UDP_BUF];
+    let mut datagrams = crate::shadowsocks::Datagrams::new();
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
@@ -3946,9 +3972,8 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
-        if let Some(packet) = crate::shadowsocks::seal_udp_datagram(&master, method, &dest, payload)
-        {
-            let _ = uplink.send(&packet);
+        if let Some(packet) = datagrams.seal(&master, method, &dest, payload) {
+            let _ = uplink.send(packet);
         }
     }
     done.store(true, Ordering::Relaxed);
@@ -3970,12 +3995,11 @@ fn spawn_ss_udp_reader(
     Some(RelayPool::global().run(move || {
         let mut buf = vec![0u8; UDP_BUF];
         let mut reply = Vec::with_capacity(UDP_BUF);
+        let mut datagrams = crate::shadowsocks::Datagrams::new();
         loop {
             match read.recv(&mut buf) {
                 Ok(n) => {
-                    let Some((target, payload)) =
-                        crate::shadowsocks::open_udp_datagram(&master, method, &buf[..n])
-                    else {
+                    let Some((target, payload)) = datagrams.open(&master, method, &buf[..n]) else {
                         continue;
                     };
                     let dest = match source.lock() {
@@ -3988,7 +4012,7 @@ fn spawn_ss_udp_reader(
                     reply.clear();
                     reply.extend_from_slice(&[0, 0, 0]);
                     push_socks_addr(&mut reply, &target);
-                    reply.extend_from_slice(&payload);
+                    reply.extend_from_slice(payload);
                     let _ = send.send_to(&reply, dest);
                 }
                 Err(error) if is_timeout(&error) => {
@@ -4112,9 +4136,8 @@ fn spawn_xudp_reader(
     let reply = relay.try_clone().ok()?;
     Some(RelayPool::global().run(move || {
         let mut read = read;
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
         let mut at = 0;
-        let mut probe = [0u8; 8192];
         let mut packet = Vec::with_capacity(UDP_BUF);
         loop {
             if at >= buf.len() {
@@ -4148,9 +4171,9 @@ fn spawn_xudp_reader(
                 }
             }
             if !progressed {
-                match read.read(&mut probe) {
+                match read_into_tail(&mut read, &mut buf) {
                     Ok(0) | Err(_) => return,
-                    Ok(n) => buf.extend_from_slice(&probe[..n]),
+                    Ok(_) => {}
                 }
             }
         }
@@ -6369,6 +6392,72 @@ mod tests {
         }
     }
 
+    struct Broken;
+
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no bytes today"))
+        }
+    }
+
+    struct Dribble {
+        inner: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let take = buf.len().min(5);
+            self.inner.read(&mut buf[..take])
+        }
+    }
+
+    #[test]
+    fn a_read_into_the_tail_appends_exactly_what_the_stream_held() {
+        let stream: Vec<u8> = (0..(READ_SLICE * 2 + 137))
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
+        let mut source = Dribble {
+            inner: std::io::Cursor::new(stream.clone()),
+        };
+        let mut buf = Vec::with_capacity(READ_SLICE);
+        let mut reads = 0usize;
+        loop {
+            match read_into_tail(&mut source, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    assert!(n <= READ_SLICE, "read {n} exceeds the slice");
+                    reads += 1;
+                }
+            }
+            assert_eq!(buf, stream[..buf.len()], "read {reads}");
+            assert!(
+                buf.capacity() >= READ_SLICE,
+                "read {reads}: the framing buffer grew past the read slice"
+            );
+        }
+        assert_eq!(buf, stream, "every byte arrived, in order");
+        assert!(
+            reads > 3_000,
+            "a five-byte reader needs many reads: {reads}"
+        );
+    }
+
+    #[test]
+    fn a_read_into_the_tail_never_leaves_a_short_buffer() {
+        let mut buf = Vec::from(&b"keep"[..]);
+        assert!(read_into_tail(&mut Broken, &mut buf).is_err());
+        assert_eq!(buf, b"keep", "a failed read leaves the bytes already there");
+        let mut buf = Vec::from(&b"keep"[..]);
+        assert_eq!(
+            read_into_tail(&mut std::io::empty(), &mut buf).expect("eof"),
+            0
+        );
+        assert_eq!(
+            buf, b"keep",
+            "an empty stream leaves the bytes already there"
+        );
+    }
+
     #[test]
     fn b64url_matches_the_shared_encoder() {
         for (bytes, want) in [
@@ -8486,8 +8575,11 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let master = ferrox_core::shadowsocks::MasterKey::new(password, 32);
         let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
-        let packet = crate::shadowsocks::seal_udp_datagram(&master, method, &target, b"ping")
-            .expect("seals");
+        let mut datagrams = crate::shadowsocks::Datagrams::new();
+        let packet = datagrams
+            .seal(&master, method, &target, b"ping")
+            .expect("seals")
+            .to_vec();
         let mut attempts = 0usize;
         loop {
             attempts += 1;
@@ -8512,8 +8604,7 @@ mod tests {
             let Some(n) = echoed else {
                 continue;
             };
-            let (source, payload) =
-                crate::shadowsocks::open_udp_datagram(&master, method, &back[..n]).expect("opens");
+            let (source, payload) = datagrams.open(&master, method, &back[..n]).expect("opens");
             assert_eq!(source.port(), target.port());
             assert_eq!(payload, b"ping");
             return;
