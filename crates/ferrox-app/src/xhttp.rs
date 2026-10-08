@@ -36,7 +36,7 @@ fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
     width + 2
 }
 
-fn read_line_into(reader: &mut XhttpReader, out: &mut [u8; 130]) -> Option<usize> {
+fn read_line_into<R: Read>(reader: &mut XhttpReader<R>, out: &mut [u8; 130]) -> Option<usize> {
     loop {
         if let Some(end) = reader.prefix[reader.at..]
             .windows(2)
@@ -77,15 +77,15 @@ fn chunk_size(line: &[u8]) -> Option<usize> {
 }
 
 #[derive(Debug)]
-pub(crate) struct XhttpReader {
-    read: TcpStream,
+pub(crate) struct XhttpReader<R: Read = TcpStream> {
+    read: R,
     prefix: Vec<u8>,
     at: usize,
     left: usize,
     ended: bool,
 }
 
-impl XhttpReader {
+impl<R: Read> XhttpReader<R> {
     fn body(&mut self, buf: &mut [u8]) -> Option<usize> {
         if self.at < self.prefix.len() {
             let n = (self.prefix.len() - self.at).min(buf.len());
@@ -105,13 +105,20 @@ pub(crate) struct XhttpWriter {
     shared: Arc<Shared>,
 }
 
-#[derive(Debug)]
 struct Shared {
-    stream: Mutex<TcpStream>,
+    stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     finished: AtomicBool,
 }
 
-impl Read for XhttpReader {
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Read> Read for XhttpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -180,7 +187,7 @@ impl XhttpWriter {
             }
             let mut line = [0u8; 6];
             let len = size_line(piece.len(), &mut line);
-            if !crate::proxy::write_all_three(&mut stream, &line[..len], piece, b"\r\n") {
+            if !stream.write_slices(&[&line[..len], piece, b"\r\n"]) {
                 return false;
             }
         }
@@ -215,6 +222,15 @@ fn split(read: TcpStream, prefix: Vec<u8>) -> Option<(XhttpReader, XhttpWriter)>
     let Ok(write) = read.try_clone() else {
         return None;
     };
+    Some(split_halves(read, write, prefix))
+}
+
+// The same split over halves that cannot clone: the handshake leaves pipelined bytes as the prefix.
+fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    read: R,
+    write: W,
+    prefix: Vec<u8>,
+) -> (XhttpReader<R>, XhttpWriter) {
     let reader = XhttpReader {
         read,
         prefix,
@@ -224,11 +240,11 @@ fn split(read: TcpStream, prefix: Vec<u8>) -> Option<(XhttpReader, XhttpWriter)>
     };
     let writer = XhttpWriter {
         shared: Arc::new(Shared {
-            stream: Mutex::new(write),
+            stream: Mutex::new(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>),
             finished: AtomicBool::new(false),
         }),
     };
-    Some((reader, writer))
+    (reader, writer)
 }
 
 fn has_chunked(value: &str) -> bool {
@@ -241,7 +257,13 @@ fn has_chunked(value: &str) -> bool {
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
     let (head, prefix) = read_head(&mut read)?;
-    let text = std::str::from_utf8(&head).ok()?;
+    check_request(&head, path)?;
+    read.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n").ok()?;
+    split(read, prefix)
+}
+
+fn check_request(head: &[u8], path: &str) -> Option<()> {
+    let text = std::str::from_utf8(head).ok()?;
     let mut parts = text.split("\r\n").next()?.split_ascii_whitespace();
     if parts.next()? != "POST" {
         return None;
@@ -250,12 +272,23 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, Xhtt
     if !path_covers(path, bare_path(target)) {
         return None;
     }
-    let chunked = crate::proxy::header_value(&head, "transfer-encoding").is_some_and(has_chunked);
-    if !chunked {
+    if !crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked) {
         return None;
     }
-    read.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n").ok()?;
-    split(read, prefix)
+    Some(())
+}
+
+// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix.
+#[cfg(test)]
+pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    mut read: R,
+    mut write: W,
+    path: &str,
+) -> Option<(XhttpReader<R>, XhttpWriter)> {
+    let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    check_request(&head, path)?;
+    write.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n").ok()?;
+    Some(split_halves(read, write, prefix))
 }
 
 pub(crate) fn connect(
@@ -269,14 +302,35 @@ pub(crate) fn connect(
     );
     read.write_all(request.as_bytes()).ok()?;
     let (head, prefix) = read_head(&mut read)?;
-    let text = std::str::from_utf8(&head).ok()?;
+    check_response(&head)?;
+    split(read, prefix)
+}
+
+fn check_response(head: &[u8]) -> Option<()> {
+    let text = std::str::from_utf8(head).ok()?;
     if text.split("\r\n").next()? != "HTTP/1.1 200 OK" {
         return None;
     }
-    if !crate::proxy::header_value(&head, "transfer-encoding").is_some_and(has_chunked) {
+    if !crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked) {
         return None;
     }
-    split(read, prefix)
+    Some(())
+}
+
+// The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    mut read: R,
+    mut write: W,
+    host: &str,
+    path: &str,
+) -> Option<(XhttpReader<R>, XhttpWriter)> {
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n"
+    );
+    write.write_all(request.as_bytes()).ok()?;
+    let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    check_response(&head)?;
+    Some(split_halves(read, write, prefix))
 }
 
 impl crate::proxy::CarrierSink for XhttpWriter {

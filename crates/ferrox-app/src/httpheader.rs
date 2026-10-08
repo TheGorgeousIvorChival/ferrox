@@ -4,13 +4,13 @@ use std::net::TcpStream;
 const HEAD_LIMIT: usize = 8192;
 
 #[derive(Debug)]
-pub(crate) struct HeadReader {
-    read: TcpStream,
+pub(crate) struct HeadReader<R: Read = TcpStream> {
+    read: R,
     prefix: Vec<u8>,
     at: usize,
 }
 
-impl Read for HeadReader {
+impl<R: Read> Read for HeadReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -36,13 +36,40 @@ fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(HeadReader, TcpStream)> {
     let mut read = stream;
     let (head, prefix) = read_head(&mut read)?;
-    if crate::proxy::request_path(&head)? != path {
-        return None;
-    }
+    check_request(&head, path)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
     let mut write = write;
+    write
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+        .ok()?;
+    Some((
+        HeadReader {
+            read,
+            prefix,
+            at: 0,
+        },
+        write,
+    ))
+}
+
+fn check_request(head: &[u8], path: &str) -> Option<()> {
+    if crate::proxy::request_path(head)? != path {
+        return None;
+    }
+    Some(())
+}
+
+// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix.
+#[cfg(test)]
+pub(crate) fn accept_split<R: Read, W: Write>(
+    mut read: R,
+    mut write: W,
+    path: &str,
+) -> Option<(HeadReader<R>, W)> {
+    let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    check_request(&head, path)?;
     write
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
         .ok()?;
@@ -65,14 +92,40 @@ pub(crate) fn connect(
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
     read.write_all(request.as_bytes()).ok()?;
     let (head, prefix) = read_head(&mut read)?;
-    let text = std::str::from_utf8(&head).ok()?;
+    check_response(&head)?;
+    let Ok(write) = read.try_clone() else {
+        return None;
+    };
+    Some((
+        HeadReader {
+            read,
+            prefix,
+            at: 0,
+        },
+        write,
+    ))
+}
+
+fn check_response(head: &[u8]) -> Option<()> {
+    let text = std::str::from_utf8(head).ok()?;
     let mut parts = text.split("\r\n").next()?.split_ascii_whitespace();
     if parts.next()? != "HTTP/1.1" || parts.next()? != "200" {
         return None;
     }
-    let Ok(write) = read.try_clone() else {
-        return None;
-    };
+    Some(())
+}
+
+// The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+pub(crate) fn connect_split<R: Read, W: Write>(
+    mut read: R,
+    mut write: W,
+    host: &str,
+    path: &str,
+) -> Option<(HeadReader<R>, W)> {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
+    write.write_all(request.as_bytes()).ok()?;
+    let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    check_response(&head)?;
     Some((
         HeadReader {
             read,

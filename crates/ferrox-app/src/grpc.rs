@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -240,7 +240,7 @@ impl Decoder {
     }
 }
 
-fn read_head(stream: &mut TcpStream) -> Option<(usize, u8, u8, u32)> {
+fn read_head(stream: &mut dyn Read) -> Option<(usize, u8, u8, u32)> {
     let mut head = [0u8; 9];
     crate::proxy::read_exact(stream, &mut head).ok()?;
     let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
@@ -252,7 +252,7 @@ fn read_head(stream: &mut TcpStream) -> Option<(usize, u8, u8, u32)> {
 }
 
 fn write_frame_parts(
-    stream: &mut TcpStream,
+    stream: &mut dyn crate::proxy::FrameWrite,
     kind: u8,
     flags: u8,
     id: u32,
@@ -265,16 +265,22 @@ fn write_frame_parts(
     head[3] = kind;
     head[4] = flags;
     head[5..9].copy_from_slice(&id.to_be_bytes());
-    crate::proxy::write_all_three(stream, &head, first, second)
+    stream.write_slices(&[&head, first, second])
 }
 
-fn write_frame(stream: &mut TcpStream, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
+fn write_frame(
+    stream: &mut dyn crate::proxy::FrameWrite,
+    kind: u8,
+    flags: u8,
+    id: u32,
+    body: &[u8],
+) -> bool {
     let mut head = [0u8; 9];
     head[0..3].copy_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
     head[3] = kind;
     head[4] = flags;
     head[5..9].copy_from_slice(&id.to_be_bytes());
-    crate::proxy::write_all_two(stream, &head, body)
+    stream.write_slices(&[&head, body])
 }
 
 #[derive(Debug, Default)]
@@ -283,15 +289,26 @@ struct SendWindow {
     stream: u64,
 }
 
-#[derive(Debug)]
 struct Shared {
-    stream: Mutex<TcpStream>,
+    stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     send: Mutex<SendWindow>,
     wake: Condvar,
     max_frame: Mutex<usize>,
     init: Mutex<u64>,
     ended: AtomicBool,
     dead: AtomicBool,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("send", &self.send)
+            .field("max_frame", &self.max_frame)
+            .field("init", &self.init)
+            .field("ended", &self.ended)
+            .field("dead", &self.dead)
+            .finish_non_exhaustive()
+    }
 }
 
 fn take_window(shared: &Shared, need: u64) -> bool {
@@ -311,8 +328,8 @@ fn take_window(shared: &Shared, need: u64) -> bool {
 }
 
 #[derive(Debug)]
-pub(crate) struct GrpcReader {
-    read: TcpStream,
+pub(crate) struct GrpcReader<R: Read = TcpStream> {
+    read: R,
     shared: Arc<Shared>,
     decoder: Decoder,
     stream: u32,
@@ -336,12 +353,12 @@ pub(crate) struct GrpcWriter {
     stream: u32,
 }
 
-impl GrpcReader {
+impl<R: Read> GrpcReader<R> {
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
         };
-        write_frame(&mut stream, kind, flags, id, body)
+        write_frame(&mut **stream, kind, flags, id, body)
     }
 
     fn settings(&self, flags: u8, body: &[u8]) {
@@ -630,7 +647,7 @@ impl GrpcReader {
     }
 }
 
-impl Read for GrpcReader {
+impl<R: Read> Read for GrpcReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -697,11 +714,17 @@ impl GrpcWriter {
                 return false;
             };
             let wrote = if at + n <= plen {
-                write_frame(&mut stream, T_DATA, flags, self.stream, &prefix[at..at + n])
+                write_frame(
+                    &mut **stream,
+                    T_DATA,
+                    flags,
+                    self.stream,
+                    &prefix[at..at + n],
+                )
             } else if at >= plen {
                 let from = at - plen;
                 write_frame(
-                    &mut stream,
+                    &mut **stream,
                     T_DATA,
                     flags,
                     self.stream,
@@ -709,7 +732,7 @@ impl GrpcWriter {
                 )
             } else {
                 write_frame_parts(
-                    &mut stream,
+                    &mut **stream,
                     T_DATA,
                     flags,
                     self.stream,
@@ -831,16 +854,15 @@ fn skip_field(msg: &[u8], at: &mut usize, wire: u8) -> Option<()> {
 }
 
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcWriter)> {
-    let mut read = stream;
-    let mut magic = [0u8; 24];
-    crate::proxy::read_exact(&mut read, &mut magic).ok()?;
-    if magic != *MAGIC {
-        return None;
-    }
+    let read = stream;
     let Ok(write) = read.try_clone() else {
         return None;
     };
-    let shared = Arc::new(Shared {
+    accept_split(read, write, path)
+}
+
+fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
+    Arc::new(Shared {
         stream: Mutex::new(write),
         send: Mutex::new(SendWindow {
             conn: 65_535,
@@ -851,24 +873,22 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcW
         init: Mutex::new(65_535),
         ended: AtomicBool::new(false),
         dead: AtomicBool::new(false),
-    });
-    {
-        let mut initial = Vec::with_capacity(12);
-        initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-        initial.extend_from_slice(&WINDOW.to_be_bytes());
-        let Ok(mut socket) = shared.stream.lock() else {
-            return None;
-        };
-        if !write_frame(&mut socket, T_SETTINGS, 0, 0, &initial) {
-            return None;
-        }
-    }
-    let mut reader = GrpcReader {
+    })
+}
+
+fn new_reader<R: Read>(
+    read: R,
+    shared: Arc<Shared>,
+    server: bool,
+    path: &str,
+    stream: u32,
+) -> GrpcReader<R> {
+    GrpcReader {
         read,
-        shared: Arc::clone(&shared),
+        shared,
         decoder: Decoder::default(),
-        stream: 0,
-        server: true,
+        stream,
+        server,
         path: path.to_owned(),
         answered: false,
         head: Vec::new(),
@@ -880,7 +900,33 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcW
         backlog_at: 0,
         frame: Vec::new(),
         eof: false,
-    };
+    }
+}
+
+// The same accept over halves that cannot clone: the preface is read, not peeked.
+pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    mut read: R,
+    write: W,
+    path: &str,
+) -> Option<(GrpcReader<R>, GrpcWriter)> {
+    let mut magic = [0u8; 24];
+    crate::proxy::read_exact(&mut read, &mut magic).ok()?;
+    if magic != *MAGIC {
+        return None;
+    }
+    let shared = new_shared(Box::new(write));
+    {
+        let mut initial = Vec::with_capacity(12);
+        initial.extend_from_slice(&S_WINDOW.to_be_bytes());
+        initial.extend_from_slice(&WINDOW.to_be_bytes());
+        let Ok(mut socket) = shared.stream.lock() else {
+            return None;
+        };
+        if !write_frame(&mut **socket, T_SETTINGS, 0, 0, &initial) {
+            return None;
+        }
+    }
+    let mut reader = new_reader(read, Arc::clone(&shared), true, path, 0);
     while !reader.answered && !reader.eof {
         if reader.pump().is_none() {
             reader.eof = true;
@@ -901,12 +947,25 @@ pub(crate) fn connect(
     host: &str,
     path: &str,
 ) -> Option<(GrpcReader, GrpcWriter)> {
-    let mut read = stream;
-    read.write_all(MAGIC).ok()?;
+    let read = stream;
+    let Ok(write) = read.try_clone() else {
+        return None;
+    };
+    connect_split(read, write, host, path)
+}
+
+// The same connect over halves that cannot clone: the preface is written, not peeked.
+pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    read: R,
+    mut write: W,
+    host: &str,
+    path: &str,
+) -> Option<(GrpcReader<R>, GrpcWriter)> {
+    write.write_all(MAGIC).ok()?;
     let mut initial = Vec::with_capacity(12);
     initial.extend_from_slice(&S_WINDOW.to_be_bytes());
     initial.extend_from_slice(&WINDOW.to_be_bytes());
-    if !write_frame(&mut read, T_SETTINGS, 0, 0, &initial) {
+    if !write_frame(&mut write, T_SETTINGS, 0, 0, &initial) {
         return None;
     }
     let block = block_encode(&[
@@ -919,39 +978,11 @@ pub(crate) fn connect(
         ("grpc-encoding", "identity"),
         ("grpc-accept-encoding", "gzip,identity"),
     ]);
-    if !write_frame(&mut read, T_HEADERS, F_END_HEADERS, 1, &block) {
+    if !write_frame(&mut write, T_HEADERS, F_END_HEADERS, 1, &block) {
         return None;
     }
-    let shared = Arc::new(Shared {
-        stream: Mutex::new(read.try_clone().ok()?),
-        send: Mutex::new(SendWindow {
-            conn: 65_535,
-            stream: 65_535,
-        }),
-        wake: Condvar::new(),
-        max_frame: Mutex::new(16_384),
-        init: Mutex::new(65_535),
-        ended: AtomicBool::new(false),
-        dead: AtomicBool::new(false),
-    });
-    let reader = GrpcReader {
-        read,
-        shared: Arc::clone(&shared),
-        decoder: Decoder::default(),
-        stream: 1,
-        server: false,
-        path: path.to_owned(),
-        answered: false,
-        head: Vec::new(),
-        head_id: 0,
-        msg: Vec::new(),
-        msg_at: 0,
-        need: 0,
-        backlog: Vec::new(),
-        backlog_at: 0,
-        frame: Vec::new(),
-        eof: false,
-    };
+    let shared = new_shared(Box::new(write));
+    let reader = new_reader(read, Arc::clone(&shared), false, path, 1);
     Some((reader, GrpcWriter { shared, stream: 1 }))
 }
 
@@ -966,7 +997,7 @@ impl crate::proxy::CarrierSink for GrpcWriter {
     }
 }
 
-pub(crate) fn mark_reader_dead(reader: &mut GrpcReader) {
+pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
     reader.shared.dead.store(true, Ordering::SeqCst);
     reader.shared.wake.notify_all();
 }
@@ -1051,7 +1082,9 @@ mod tests {
                 let handle = thread::spawn(move || {
                     let (stream, _) = listener.accept().expect("accepts");
                     let shared = Arc::new(Shared {
-                        stream: Mutex::new(stream),
+                        stream: Mutex::new(
+                            Box::new(stream) as Box<dyn crate::proxy::FrameWrite + Send>
+                        ),
                         send: Mutex::new(SendWindow {
                             conn: u64::MAX,
                             stream: u64::MAX,

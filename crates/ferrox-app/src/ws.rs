@@ -98,10 +98,17 @@ fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
     crate::proxy::read_http_head(stream, HEAD_LIMIT)
 }
 
-#[derive(Debug)]
 struct Shared {
-    stream: Mutex<TcpStream>,
+    stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     closed: AtomicBool,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Bytes one socket read asks for. A frame header and its payload come out of
@@ -267,7 +274,7 @@ impl<R: Read> WsReader<R> {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
-        let _ = write_frame(&mut stream, false, opcode, payload);
+        let _ = write_frame(&mut **stream, false, opcode, payload);
     }
 
     /// Read syscalls this reader has spent: the header is parsed out of the
@@ -315,7 +322,7 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
         };
-        write_frame(&mut stream, self.masked, OP_DATA, data)
+        write_frame(&mut **stream, self.masked, OP_DATA, data)
     }
 
     pub(crate) fn close(&self) {
@@ -325,7 +332,7 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
-        let _ = write_frame(&mut stream, self.masked, OP_CLOSE, &CLOSE_BODY);
+        let _ = write_frame(&mut **stream, self.masked, OP_CLOSE, &CLOSE_BODY);
     }
 }
 
@@ -347,7 +354,12 @@ thread_local! {
     static MASKED_FRAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-fn write_frame(stream: &mut TcpStream, masked: bool, opcode: u8, data: &[u8]) -> bool {
+fn write_frame(
+    stream: &mut dyn crate::proxy::FrameWrite,
+    masked: bool,
+    opcode: u8,
+    data: &[u8],
+) -> bool {
     let flag: u8 = if masked { 0x80 } else { 0 };
     let mut head = [0u8; 10];
     head[0] = 0x80 | (opcode & 0x0F);
@@ -364,7 +376,7 @@ fn write_frame(stream: &mut TcpStream, masked: bool, opcode: u8, data: &[u8]) ->
         10
     };
     if !masked {
-        return crate::proxy::write_all_two(stream, &head[..hlen], data);
+        return stream.write_slices(&[&head[..hlen], data]);
     }
     let Some(mask) = fresh_mask() else {
         return false;
@@ -386,27 +398,59 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(WsReader, WsWrite
     use std::fmt::Write as _;
     let mut read = stream;
     let head = read_head(&mut read)?;
-    if crate::proxy::request_path(&head)? != path {
-        return None;
-    }
-    let key = crate::proxy::header_value(&head, "sec-websocket-key")?;
-    if key.is_empty() {
-        return None;
-    }
-    let offered = crate::proxy::header_value(&head, "sec-websocket-protocol").unwrap_or_default();
-    let early = early_decode(offered)
-        .filter(|bytes| !bytes.is_empty())
-        .unwrap_or_default();
+    let (key, early) = check_request(&head, path)?;
     let mut response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
         accept_key(key)
     );
     if !early.is_empty() {
+        let offered =
+            crate::proxy::header_value(&head, "sec-websocket-protocol").unwrap_or_default();
         let _ = write!(response, "Sec-WebSocket-Protocol: {offered}\r\n");
     }
     response.push_str("\r\n");
     read.write_all(response.as_bytes()).ok()?;
     split(read, early, false)
+}
+
+fn check_request<'a>(head: &'a [u8], path: &str) -> Option<(&'a str, Vec<u8>)> {
+    if crate::proxy::request_path(head)? != path {
+        return None;
+    }
+    let key = crate::proxy::header_value(head, "sec-websocket-key")?;
+    if key.is_empty() {
+        return None;
+    }
+    let offered = crate::proxy::header_value(head, "sec-websocket-protocol").unwrap_or_default();
+    let early = early_decode(offered)
+        .filter(|bytes| !bytes.is_empty())
+        .unwrap_or_default();
+    Some((key, early))
+}
+
+// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix, after the early data.
+#[cfg(test)]
+pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    mut read: R,
+    mut write: W,
+    path: &str,
+) -> Option<(WsReader<R>, WsWriter)> {
+    use std::fmt::Write as _;
+    let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    let (key, mut early) = check_request(&head, path)?;
+    let mut response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
+        accept_key(key)
+    );
+    if !early.is_empty() {
+        let offered =
+            crate::proxy::header_value(&head, "sec-websocket-protocol").unwrap_or_default();
+        let _ = write!(response, "Sec-WebSocket-Protocol: {offered}\r\n");
+    }
+    response.push_str("\r\n");
+    write.write_all(response.as_bytes()).ok()?;
+    early.extend_from_slice(&prefix);
+    Some(split_halves(read, write, early, false))
 }
 
 pub(crate) fn connect(
@@ -421,17 +465,43 @@ pub(crate) fn connect(
     let (handshake, early) = request(host, path, &key, budget, first);
     read.write_all(handshake.as_bytes()).ok()?;
     let head = read_head(&mut read)?;
-    let text = std::str::from_utf8(&head).ok()?;
-    if text.split("\r\n").next()?.split(' ').nth(1)? != "101" {
-        return None;
-    }
-    if crate::proxy::header_value(&head, "sec-websocket-accept")? != accept_key(&key) {
-        return None;
-    }
+    check_response(&head, &key)?;
     let at = head.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     let mut behind = Vec::new();
     behind.extend_from_slice(&head[at..]);
     let (reader, writer) = split(read, behind, true)?;
+    if !early && !first.is_empty() && !writer.send(first) {
+        return None;
+    }
+    Some((reader, writer))
+}
+
+fn check_response(head: &[u8], key: &str) -> Option<()> {
+    let text = std::str::from_utf8(head).ok()?;
+    if text.split("\r\n").next()?.split(' ').nth(1)? != "101" {
+        return None;
+    }
+    if crate::proxy::header_value(head, "sec-websocket-accept")? != accept_key(key) {
+        return None;
+    }
+    Some(())
+}
+
+// The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    mut read: R,
+    mut write: W,
+    host: &str,
+    path: &str,
+    budget: u32,
+    first: &[u8],
+) -> Option<(WsReader<R>, WsWriter)> {
+    let key = fresh_key()?;
+    let (handshake, early) = request(host, path, &key, budget, first);
+    write.write_all(handshake.as_bytes()).ok()?;
+    let (head, behind) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    check_response(&head, &key)?;
+    let (reader, writer) = split_halves(read, write, behind, true);
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
@@ -456,8 +526,18 @@ fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsW
     let Ok(write) = read.try_clone() else {
         return None;
     };
+    Some(split_halves(read, write, early, masked))
+}
+
+// The same split over halves that cannot clone: the handshake leaves pipelined bytes as the prefix.
+fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    read: R,
+    write: W,
+    early: Vec<u8>,
+    masked: bool,
+) -> (WsReader<R>, WsWriter) {
     let shared = Arc::new(Shared {
-        stream: Mutex::new(write),
+        stream: Mutex::new(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>),
         closed: AtomicBool::new(false),
     });
     let reader = WsReader {
@@ -471,7 +551,7 @@ fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsW
         eof: false,
         reads: 0,
     };
-    Some((reader, WsWriter { shared, masked }))
+    (reader, WsWriter { shared, masked })
 }
 
 impl crate::proxy::CarrierSink for WsWriter {
@@ -534,7 +614,8 @@ mod tests {
                 });
                 let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
                 let shared = Arc::new(Shared {
-                    stream: Mutex::new(stream.try_clone().expect("clones")),
+                    stream: Mutex::new(Box::new(stream.try_clone().expect("clones"))
+                        as Box<dyn crate::proxy::FrameWrite + Send>),
                     closed: AtomicBool::new(false),
                 });
                 let mut reader = WsReader {
@@ -572,7 +653,9 @@ mod tests {
         let server = thread::spawn(move || listener.accept().expect("accepts").0);
         let _spare = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let shared = Arc::new(Shared {
-            stream: Mutex::new(server.join().expect("joins")),
+            stream: Mutex::new(
+                Box::new(server.join().expect("joins")) as Box<dyn crate::proxy::FrameWrite + Send>
+            ),
             closed: AtomicBool::new(false),
         });
         let frames = 64usize;
