@@ -81,6 +81,12 @@ jobs:
       - name: Download a real file through the tunnel
         if: steps.secrets.outputs.present == 'true'
         run: |
+          # Plain HTTP first: it discriminates a tunnel that moves bytes from
+          # one that only opens. TLS through the same tunnel comes next.
+          curl -sS --max-time 60 --socks5-hostname 127.0.0.1:10808 \
+            http://www.cloudflare.com/cdn-cgi/trace -o trace-http.txt || true
+          echo "== plain-http trace =="
+          cat trace-http.txt 2>/dev/null || echo "(no answer)"
           # The first flow pays for sign-in, catalogue and edge dial, so the
           # trace is retried; a lane that never answers fails here, loudly.
           for i in $(seq 1 24); do

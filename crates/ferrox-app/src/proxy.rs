@@ -4150,6 +4150,18 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
     });
 }
 
+/// Temporary first-bytes dump behind `FOXY_DEBUG`: the opening bytes of each
+/// direction, so a tunnel that answers TLS with plaintext names itself.
+fn debug_bytes(direction: &str, buf: &[u8]) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        let end = buf.len().min(32);
+        eprintln!(
+            "foxy-debug: {direction} first {end} B: {:02x?}",
+            &buf[..end]
+        );
+    }
+}
+
 /// Temporary live-lane tracing behind `FOXY_DEBUG`: edge, carrier and outcome
 /// per dial, so a stall names where it stopped instead of timing out silently.
 fn debug_lane(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier, what: &str) {
@@ -4223,7 +4235,7 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
             let stream = quic.as_ref().map(|(_, _, _, id)| *id);
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
                 Ok(mut tunnel) => {
-                    debug_lane(&edge, carrier, "opened");
+                    debug_lane(&edge, carrier, &format!("opened for {target}"));
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     if client.write_all(&foxy_socks_reply(0)).is_err() {
@@ -4744,7 +4756,12 @@ fn copy_locked(
                 // A short write is credit, not completion: the window reopens
                 // as the other direction drains, so the rest is retried rather
                 // than dropped.
-                Ok(read) => write_full(tunnel, &buf[..read]),
+                Ok(read) => {
+                    if total == 0 {
+                        debug_bytes(direction, &buf[..read]);
+                    }
+                    write_full(tunnel, &buf[..read])
+                }
             }
         } else {
             let Ok(mut lane) = tunnel.lock() else { break };
@@ -4753,13 +4770,18 @@ fn copy_locked(
                     debug_relay(direction, total, None);
                     break;
                 }
-                Ok(read) => match socket.write_all(&buf[..read]) {
-                    Ok(()) => read,
-                    Err(error) => {
-                        debug_relay(direction, total, Some(error.kind()));
-                        break;
+                Ok(read) => {
+                    if total == 0 {
+                        debug_bytes(direction, &buf[..read]);
                     }
-                },
+                    match socket.write_all(&buf[..read]) {
+                        Ok(()) => read,
+                        Err(error) => {
+                            debug_relay(direction, total, Some(error.kind()));
+                            break;
+                        }
+                    }
+                }
                 // The quantum elapsed with no payload: release the lock so the
                 // forward write gets its turn, then poll again.
                 Err(error)

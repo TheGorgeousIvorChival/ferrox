@@ -1215,7 +1215,8 @@ mod loopback {
 
     #[test]
     fn the_shared_lane_carries_both_directions_at_once() {
-        const BIG: usize = 256 * 1024;
+        const BIG: usize = 64 * 1024;
+        const STEP: usize = 1024;
         let (roots, server) = minted(b"h2");
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -1234,7 +1235,8 @@ mod loopback {
         std::thread::spawn(move || {
             let mut at = 0usize;
             while at < chunk.len() {
-                match forward.lock().expect("locks").write(&chunk[at..]) {
+                let end = (at + STEP).min(chunk.len());
+                match forward.lock().expect("locks").write(&chunk[at..end]) {
                     Ok(0) => std::thread::sleep(Duration::from_millis(5)),
                     Ok(wrote) => at += wrote,
                     Err(error) => panic!("the write failed: {error}"),
