@@ -189,7 +189,7 @@ The goal is a drop-in replacement for xray-core — the same JSON, the same shar
 
 They are not the same, and where they differ the table says so. `Support::Planned` exists because a cell that says why is evidence and a blank cell is not, so nothing here is silently dropped: a refusal always carries its reason string, which is the whole reason the refusal is worth reading.
 
-`ferrox-app run <vless://…>` is deliberately *not* a dialler: it refuses unless the link is `Implemented`, then opens one TCP connection, reports the time and sends nothing. Real traffic goes through `run -c config.json`, which binds inbounds (`vless`, `trojan`, `vmess`, `shadowsocks`, `socks`) and needs a `freedom` outbound. `check <vless://…>` is fully offline.
+`ferrox-app run <vless://…>` is deliberately *not* a dialler: it refuses unless the link is `Implemented`, then opens one TCP connection, reports the time and sends nothing. Real traffic goes through `run -c config.json`, which binds inbounds (`vless`, `trojan`, `vmess`, `shadowsocks`, `socks`, `http`, `mixed`) and needs a `freedom` outbound. `check <vless://…>` is fully offline.
 
 ### A — proxy protocols (the share-link world)
 
@@ -346,7 +346,7 @@ What Xray has no equivalent of. Row H already covers Tor as a lane; the Hysteria
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 85 | mixed (HTTP + SOCKS) inbound | planned | sing-box `protocol/mixed/`. |
+| 85 | mixed (HTTP + SOCKS) inbound | implemented | sing-box `protocol/mixed/`. `http` serves CONNECT to every outbound and origin-form to raw uplinks (`serve_http`, `proxy.rs`); `mixed` sniffs one byte (`serve_mixed`). Plain HTTP through a protocol outbound is 405 until P28's shared buffer carries prefixes. Proven by loopback (`http_connect_*`, `http_get_*`, `mixed_serves_*`) and by the `foxy-relay.yml` http-front legs downloading 1 MB live. |
 | 86 | redirect + tproxy inbounds | planned | sing-box `protocol/redirect/`. Zero `tproxy`/`redirect` in `crates/`. |
 | 87 | NaïveProxy | planned | sing-box `protocol/naive/`; LxBox imports `naive+https://` (task 037F). Zero `naive` in `crates/`. |
 | 88 | AnyTLS | planned | sing-box `protocol/anytls/`; ZeroNet `anytls.rs`; LxBox imports `anytls://` (task 269). Row 21 is the link-type parse; this row is the auth + handshake. |

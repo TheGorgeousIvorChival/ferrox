@@ -1,15 +1,24 @@
 name: Foxy relay (live download check)
 
-# Proves the `foxy` lane carries bytes, not just handshakes: it starts
-# `ferrox-app` with a socks->foxy config on a clean runner, pins the exit
-# country, downloads a real 1 MB file through the tunnel and asserts the exact
-# byte count, plus the exit country off the Cloudflare trace. The loopback
-# tests prove framing against a local edge; only this job proves the relay
-# moves bytes against the real one.
+# Proves the `foxy` lane carries bytes, not just handshakes: on every OS it
+# starts `ferrox-app` with a socks->foxy config on a clean runner, walks every
+# carrier the lane speaks (h1, h2, h3, auto) in the pinned country, downloads a
+# real 1 MB file through each tunnel and asserts the exact byte count, plus
+# the exit country off the Cloudflare trace. The loopback tests prove framing
+# against a local edge; only this job proves the relay moves bytes against the
+# real one, on every platform, through every method.
+#
+# The ubuntu job additionally proves a second exit country (a different
+# server), the `http` front (CONNECT and plain GET through the same lane), and
+# the UDP datagram path — each a separate lane start, so one leg's failure
+# names its own method, front, or server.
 #
 # Needs repository secrets like foxy-live.yml does: FOXY_EMAIL and FOXY_PASS
 # (or USERNAME and PASSWORD). Without them the job skips cleanly. Quota cost
-# is ~1 MB per run, so this fires on lane changes and on demand, not per push.
+# is ~1 MB per download leg, so this fires on lane changes and on demand, not
+# per push. Every shell here is `bash` with portable helpers only: no
+# `timeout(1)`, no `/dev/tcp`, no `sha256sum`, no `xxd` — none of those exist
+# on all three runners.
 on:
   pull_request:
     paths:
@@ -31,20 +40,18 @@ env:
 
 jobs:
   foxy-relay:
-    name: Foxy relay live (${{ matrix.carrier }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    name: Foxy relay live (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - carrier: h2
-            port: 10808
-          - carrier: h3
-            port: 10809
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     env:
-      SOCKS_PORT: ${{ matrix.port }}
-      FOXY_CARRIER: ${{ matrix.carrier }}
+      SOCKS_PORT: 10808
     steps:
       - uses: actions/checkout@v7
       - name: Check secrets present
@@ -62,11 +69,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: foxy-relay
+          key: foxy-relay-${{ matrix.os }}
       - name: Build ferrox-app
         if: steps.secrets.outputs.present == 'true'
         run: cargo build --locked -p ferrox-app
-      - name: Start socks->foxy
+      - name: Download 1 MB through every carrier
         if: steps.secrets.outputs.present == 'true'
         env:
           FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
@@ -74,64 +81,177 @@ jobs:
           FOXY_COUNTRY: ${{ inputs.country || 'US' }}
           FOXY_DEBUG: 1
         run: |
-          python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["SOCKS_PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["FOXY_CARRIER"]}}]}, open("foxy-relay.json","w"))'
-          chmod 600 foxy-relay.json
-          echo "country=$FOXY_COUNTRY" >> "$GITHUB_ENV"
-          ./target/debug/ferrox-app run -c foxy-relay.json > ferrox-relay.log 2>&1 &
-          echo "$!" > ferrox-relay.pid
-      - name: Wait for the SOCKS port
-        if: steps.secrets.outputs.present == 'true'
-        run: |
-          for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/$SOCKS_PORT) 2>/dev/null; then exit 0; fi
-            sleep 2
+          BIN=target/debug/ferrox-app
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          PORT="$SOCKS_PORT"
+          wait_port() {
+            PORT="$1" python3 - <<'PY'
+          import os, socket, time
+          port = int(os.environ["PORT"])
+          for _ in range(90):
+              try:
+                  socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                  raise SystemExit(0)
+              except OSError:
+                  time.sleep(2)
+          raise SystemExit("the lane never listened")
+          PY
+          }
+          stop_lane() {
+            python3 - <<'PY' || true
+          import os, signal, time
+          try:
+              pid = int(open("ferrox-relay.pid").read().strip())
+          except OSError:
+              raise SystemExit(0)
+          try:
+              os.kill(pid, signal.SIGTERM)
+          except OSError:
+              pass
+          PY
+            sleep 3
+            rm -f ferrox-relay.pid
+          }
+          sha_of() {
+            python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
+          }
+          : > ferrox-relay.log
+          for carrier in h1 h2 h3 auto; do
+            echo "== carrier $carrier =="
+            CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
+            chmod 600 foxy-relay.json
+            "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
+            echo "$!" > ferrox-relay.pid
+            if ! wait_port "$PORT"; then
+              echo "carrier $carrier never listened" >&2
+              tail -n 30 ferrox-relay.log
+              exit 1
+            fi
+            # Diagnosis first, one shot each: full SOCKS+TLS transcript and the
+            # raw bytes a plain-HTTP GET brings back through the same tunnel.
+            curl -v --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>&1 | tail -n 30 || true
+            curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
+              http://www.cloudflare.com/cdn-cgi/trace -o body.bin || true
+            echo "== plain-http body =="
+            wc -c body.bin 2>/dev/null || echo "(no answer)"
+            python3 -c 'print(open("body.bin","rb").read(128).hex())' 2>/dev/null || true
+            # The first flow pays for sign-in, catalogue and edge dial, so the
+            # trace is retried; a lane that never answers fails here, loudly.
+            for i in $(seq 1 24); do
+              if curl -sS --max-time 30 --socks5-hostname "127.0.0.1:$PORT" \
+                https://www.cloudflare.com/cdn-cgi/trace -o trace.txt; then
+                break
+              fi
+              sleep 20
+            done
+            grep -E '^(loc|ip)=' trace.txt
+            grep -qx "loc=$FOXY_COUNTRY" trace.txt
+            curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin"
+            test "$(wc -c < "file-$carrier.bin")" = 1000000
+            sha_of "file-$carrier.bin"
+            echo "carrier $carrier: 1000000 B, exit $FOXY_COUNTRY"
+            stop_lane
           done
-          echo "the lane never listened" >&2
-          tail -n 30 ferrox-relay.log
-          exit 1
-      - name: Download a real file through the tunnel
-        if: steps.secrets.outputs.present == 'true'
+      - name: Second country, http front, UDP path
+        # One runner proves the legs that are about the lane rather than the
+        # platform: a different exit server, the http front the app now serves
+        # itself, and the datagram path. Each restarts the lane, so a failure
+        # names its leg.
+        if: steps.secrets.outputs.present == 'true' && matrix.os == 'ubuntu-latest'
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+          FOXY_DEBUG: 1
         run: |
-          # Diagnosis first, one shot each: full SOCKS+TLS transcript and the
-          # raw bytes a plain-HTTP GET brings back through the same tunnel.
-          curl -v --max-time 25 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
-            https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>&1 | tail -n 30 || true
-          curl -sS --max-time 25 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
-            http://www.cloudflare.com/cdn-cgi/trace -o body.bin || true
-          echo "== plain-http body =="
-          wc -c body.bin 2>/dev/null || echo "(no answer)"
-          xxd body.bin 2>/dev/null | head -n 8 || true
-          # Plain HTTP first: it discriminates a tunnel that moves bytes from
-          # one that only opens. TLS through the same tunnel comes next.
-          curl -sS --max-time 60 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
-            http://www.cloudflare.com/cdn-cgi/trace -o trace-http.txt || true
-          echo "== plain-http trace =="
-          cat trace-http.txt 2>/dev/null || echo "(no answer)"
-          # The first flow pays for sign-in, catalogue and edge dial, so the
-          # trace is retried; a lane that never answers fails here, loudly.
+          BIN=target/debug/ferrox-app
+          PORT="$SOCKS_PORT"
+          wait_port() {
+            PORT="$1" python3 - <<'PY'
+          import os, socket, time
+          port = int(os.environ["PORT"])
+          for _ in range(90):
+              try:
+                  socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                  raise SystemExit(0)
+              except OSError:
+                  time.sleep(2)
+          raise SystemExit("the lane never listened")
+          PY
+          }
+          stop_lane() {
+            python3 - <<'PY' || true
+          import os, signal
+          try:
+              pid = int(open("ferrox-relay.pid").read().strip())
+          except OSError:
+              raise SystemExit(0)
+          try:
+              os.kill(pid, signal.SIGTERM)
+          except OSError:
+              pass
+          PY
+            sleep 3
+            rm -f ferrox-relay.pid
+          }
+          start_lane() {
+            FRONT="$1" COUNTRY="$2" CARRIER="$3" PORT="$PORT" python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
+            chmod 600 foxy-relay.json
+            "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
+            echo "$!" > ferrox-relay.pid
+            wait_port "$PORT"
+          }
+          # A different exit server: the trace must pin DE, and 1 MB must
+          # arrive through it with its exact byte count.
+          echo "== second country DE over h2 =="
+          start_lane socks DE h2
           for i in $(seq 1 24); do
-            if curl -sS --max-time 30 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
-              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt; then
+            if curl -sS --max-time 30 --socks5-hostname "127.0.0.1:$PORT" \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace-de.txt; then
               break
             fi
             sleep 20
           done
-          grep -E '^(loc|ip)=' trace.txt
-          grep -qx "loc=${country:?}" trace.txt
-          curl -sS --max-time 300 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
-            'https://speed.cloudflare.com/__down?bytes=1000000' -o file.bin
-          test "$(wc -c < file.bin)" = 1000000
-          sha256sum file.bin
-      - name: DNS through the tunnel over UDP
-        # UDP rides H2 CONNECT-UDP whatever the TCP carrier is, so one leg
-        # proves it; the h3 leg proves H3 tunnels instead.
-        if: steps.secrets.outputs.present == 'true' && matrix.carrier == 'h2'
-        run: |
+          grep -E '^(loc|ip)=' trace-de.txt
+          grep -qx "loc=DE" trace-de.txt
+          curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin
+          test "$(wc -c < file-de.bin)" = 1000000
+          echo "second country DE: 1000000 B"
+          stop_lane
+          # The http front the app serves itself: CONNECT carries TLS and
+          # plain GET carries the trace, then 1 MB arrives through it.
+          echo "== http front over h2 =="
+          start_lane http "$FOXY_COUNTRY" h2
+          for i in $(seq 1 24); do
+            if curl -sS --max-time 30 -x "http://127.0.0.1:$PORT" \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace-http-front.txt; then
+              break
+            fi
+            sleep 20
+          done
+          grep -E '^(loc|ip)=' trace-http-front.txt
+          grep -qx "loc=$FOXY_COUNTRY" trace-http-front.txt
+          curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
+            http://www.cloudflare.com/cdn-cgi/trace -o trace-http-plain.txt
+          grep -qx "loc=$FOXY_COUNTRY" trace-http-plain.txt
+          curl -sS --max-time 300 -x "http://127.0.0.1:$PORT" \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o file-http.bin
+          test "$(wc -c < file-http.bin)" = 1000000
+          echo "http front: 1000000 B"
+          stop_lane
+          # DNS through the tunnel over UDP. UDP rides H2 CONNECT-UDP whatever
+          # the TCP carrier is, so one leg proves it — through a fresh socks
+          # lane, because the UDP associate below speaks SOCKS5.
+          echo "== udp path over h2 =="
+          start_lane socks "$FOXY_COUNTRY" h2
           # Control first: plain TCP to the DNS port through the same tunnel.
           # A fast connect proves egress; a refusal proves the target, and any
           # UDP verdict below must be read against this line. Names only, no
           # literals: the fixture gate forbids routable addresses in the tree.
-          timeout 15 curl -v --max-time 12 --socks5-hostname 127.0.0.1:$SOCKS_PORT telnet://one.one.one.one:53 || true
+          curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
           python3 - <<'PY'
           import random, socket, struct, sys, time
           def udp_addr(packet):
@@ -240,10 +360,22 @@ jobs:
           assert answers, 'no udp answer through the tunnel'
           print('udp through the tunnel:', answers)
           PY
+          stop_lane
       - name: Stop the lane and show its log
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
-          kill "$(cat ferrox-relay.pid)" 2>/dev/null || true
+          python3 - <<'PY' || true
+          import os, signal
+          try:
+              pid = int(open("ferrox-relay.pid").read().strip())
+          except OSError:
+              raise SystemExit(0)
+          try:
+              os.kill(pid, signal.SIGTERM)
+          except OSError:
+              pass
+          PY
+          rm -f ferrox-relay.pid
           echo "== udp lines =="
           grep -iE "udp|masque|datagram" ferrox-relay.log | tail -n 100 || true
           echo "== lane log tail (edges, carriers, relay totals; no secrets) =="
@@ -252,17 +384,19 @@ jobs:
         if: always() && steps.secrets.outputs.present == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ferrox-relay-log
+          name: ferrox-relay-log-${{ matrix.os }}
           path: ferrox-relay.log
           retention-days: 3
       - name: Summarise
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
           {
-            echo "### Foxy relay, live"
+            echo "### Foxy relay, live (${{ matrix.os }})"
             echo
             echo "Exit country off the tunnel's Cloudflare trace, plus a real"
-            echo "1 MB download through the tunnel with its exact byte count"
-            echo "and SHA-256 above. The log names the edge, the carrier that"
-            echo "answered, and per-flow relay totals."
+            echo "1 MB download through the tunnel per carrier (h1, h2, h3,"
+            echo "auto) with its exact byte count and SHA-256 above. Ubuntu"
+            echo "additionally proves a second exit country, the http front,"
+            echo "and the UDP datagram path. The log names the edge, the"
+            echo "carrier that answered, and per-flow relay totals."
           } >> "$GITHUB_STEP_SUMMARY"

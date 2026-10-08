@@ -75,6 +75,22 @@ pub(crate) fn serve_file(path: &str) -> ! {
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
                 }
+                "http" => {
+                    let Some(out) = outbound.clone() else {
+                        continue;
+                    };
+                    let role = Role::Http { out };
+                    thread::spawn(move || accept_loop(&address, &role));
+                    inbounds += 1;
+                }
+                "mixed" => {
+                    let Some(out) = outbound.clone() else {
+                        continue;
+                    };
+                    let role = Role::Mixed { out };
+                    thread::spawn(move || accept_loop(&address, &role));
+                    inbounds += 1;
+                }
                 _ => eprintln!("unsupported inbound protocol `{protocol}` in {path}"),
             }
         }
@@ -304,6 +320,12 @@ enum Role {
     Socks {
         out: Outbound,
     },
+    Http {
+        out: Outbound,
+    },
+    Mixed {
+        out: Outbound,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +518,8 @@ fn accept_loop(address: &str, role: &Role) {
                 freedom,
             } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
             Role::Socks { out } => serve_socks(stream, &out),
+            Role::Http { out } => serve_http(stream, &out),
+            Role::Mixed { out } => serve_mixed(stream, &out),
         });
     }
 }
@@ -4009,8 +4033,22 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
     if cmd == 3 {
         return serve_socks_udp(client, out);
     }
+    serve_connect(client, out, &asked, Front::Socks, &[]);
+}
+
+/// One tunnel request from either byte front: SOCKS CONNECT or HTTP
+/// CONNECT/forward. The grant is already written, except on the Foxy lane,
+/// which grants after its tunnel opens. A non-empty prefix is a plain-HTTP
+/// head the front already consumed, and only a raw uplink can take it.
+fn serve_connect(
+    mut client: TcpStream,
+    out: &Outbound,
+    asked: &SocksTarget,
+    front: Front,
+    prefix: &[u8],
+) {
     if let Outbound::Foxy(foxy) = out {
-        return serve_foxy(client, foxy, &asked);
+        return serve_foxy_front(client, foxy, asked, front, prefix);
     }
     let Some(target) = asked.socket() else {
         return;
@@ -4020,14 +4058,25 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
         Outbound::Vmess(vmess) => (vmess.address.clone(), vmess.port),
         Outbound::Trojan(trojan) => (trojan.address.clone(), trojan.port),
         Outbound::Shadowsocks(shadowsocks) => (shadowsocks.address.clone(), shadowsocks.port),
-        Outbound::Foxy(_) | Outbound::Freedom => {
-            let Some(upstream) = dial_or_report(&target) else {
+        Outbound::Foxy(_) => return,
+        Outbound::Freedom => {
+            let Some(mut upstream) = dial_or_report(&target) else {
                 return;
             };
+            if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+                return;
+            }
             relay(&client, &upstream);
             return;
         }
     };
+    if !prefix.is_empty() {
+        // A protocol outbound handshakes over the client's bytes itself, so a
+        // consumed head has nowhere to go until one buffer carries prefixes;
+        // that buffer is P28's, and until then this is refused by name.
+        let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
+        return;
+    }
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
             if !vless.mux {
@@ -4181,20 +4230,61 @@ fn debug_relay(direction: &str, moved: u64, error: Option<std::io::ErrorKind>) {
     }
 }
 
-fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
+/// Which byte front a tunnel answers: the grant and the refusal render per
+/// front, while the edge and carrier loop is the same tunnel either way.
+#[derive(Debug, Clone, Copy)]
+enum Front {
+    Socks,
+    Http,
+}
+
+impl Front {
+    fn grant_line(self) -> Vec<u8> {
+        match self {
+            Self::Socks => foxy_socks_reply(0).to_vec(),
+            Self::Http => b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+        }
+    }
+    fn direct_grant(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Socks => None,
+            Self::Http => Some(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+        }
+    }
+    fn refusal(self, code: u8) -> Vec<u8> {
+        match self {
+            Self::Socks => foxy_socks_reply(code).to_vec(),
+            Self::Http => b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".to_vec(),
+        }
+    }
+}
+
+/// An opened Foxy route: the tunnel with its H3 stream to release, a direct
+/// dial for split-tunnel targets, a rendered refusal code, or nothing to say.
+enum FoxyOpen {
+    Tunnel(
+        Box<crate::foxy::Tunnel>,
+        Option<(crate::quic::QuicDial, u64)>,
+    ),
+    Direct(SocketAddr),
+    Refused(u8),
+    Silent,
+}
+
+/// The edge and carrier loop both fronts share: first answer wins, a refused
+/// pass stops every carrier and every edge, and the grant stays with the front.
+fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
     if foxy
         .unauthenticated
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        let _ = client.write_all(&foxy_socks_reply(0x01));
-        return;
+        return FoxyOpen::Refused(0x01);
     }
     if foxy_splits(foxy, asked) {
-        let Some(target) = asked.socket() else { return };
-        let Some(upstream) = dial_or_report(&target) else {
-            return;
+        let Some(target) = asked.socket() else {
+            return FoxyOpen::Silent;
         };
-        return relay(&client, &upstream);
+        return FoxyOpen::Direct(target);
     }
     let target = asked.authority();
     let order = ferrox_core::foxy::catalog::tier(
@@ -4206,7 +4296,7 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
     let mut refusals = ferrox_core::foxy::Refusals::new(256);
     let key = target.clone();
     if refusals.blocked(&key, 0) {
-        return;
+        return FoxyOpen::Silent;
     }
     let mut last = None;
     for edge in ferrox_core::foxy::dial_order(
@@ -4235,28 +4325,14 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
                 }
                 _ => None,
             };
-            let stream = quic.as_ref().map(|(_, _, _, id)| *id);
+            let h3 = quic.as_ref().map(|(_, _, _, id)| *id);
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
-                Ok(mut tunnel) => {
+                Ok(tunnel) => {
                     debug_lane(&edge, carrier, &format!("opened for {target}"));
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    if client.write_all(&foxy_socks_reply(0)).is_err() {
-                        return;
-                    }
-                    if !foxy_exit_agrees(&mut tunnel, foxy) {
-                        return;
-                    }
-                    // One lock serves both relay directions, so a blocking
-                    // backward read would hold it while the forward write
-                    // waits: the quantum bounds one read instead.
-                    let _ = tunnel.set_read_quantum(RELAY_QUANTUM);
-                    let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
-                    relay_tunnel(&client, &tunnel);
-                    if let (Some(id), crate::foxy::Carrier::H3) = (stream, carrier) {
-                        crate::quic::release_stream(&foxy_quic_dial(foxy, &edge), id);
-                    }
-                    return;
+                    let h3 = h3.map(|id| (foxy_quic_dial(foxy, &edge), id));
+                    return FoxyOpen::Tunnel(Box::new(tunnel), h3);
                 }
                 Err(failure) => {
                     debug_lane(&edge, carrier, &failure.to_string());
@@ -4277,8 +4353,187 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
             }
         }
     }
-    let reply = last.map_or(0x01, crate::foxy::refusal_reply);
-    let _ = client.write_all(&foxy_socks_reply(reply));
+    FoxyOpen::Refused(last.map_or(0x01, crate::foxy::refusal_reply))
+}
+
+/// The Foxy half of either front: CONNECT grants the tunnel, plain HTTP
+/// forwards its head through it, and a split target leaves by direct dial.
+fn serve_foxy_front(
+    mut client: TcpStream,
+    foxy: &FoxyOut,
+    asked: &SocksTarget,
+    front: Front,
+    prefix: &[u8],
+) {
+    match foxy_open(foxy, asked) {
+        FoxyOpen::Tunnel(tunnel, h3) => {
+            let mut tunnel = *tunnel;
+            if prefix.is_empty() && client.write_all(&front.grant_line()).is_err() {
+                return;
+            }
+            if !foxy_exit_agrees(&mut tunnel, foxy) {
+                return;
+            }
+            if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
+                return;
+            }
+            // One lock serves both relay directions, so a blocking
+            // backward read would hold it while the forward write
+            // waits: the quantum bounds one read instead.
+            let _ = tunnel.set_read_quantum(RELAY_QUANTUM);
+            let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+            relay_tunnel(&client, &tunnel);
+            if let Some((dial, id)) = h3 {
+                crate::quic::release_stream(&dial, id);
+            }
+        }
+        FoxyOpen::Direct(target) => {
+            let Some(mut upstream) = dial_or_report(&target) else {
+                return;
+            };
+            if prefix.is_empty() {
+                if let Some(grant) = front.direct_grant() {
+                    if client.write_all(grant).is_err() {
+                        return;
+                    }
+                }
+            }
+            if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+                return;
+            }
+            relay(&client, &upstream);
+        }
+        FoxyOpen::Refused(code) => {
+            let _ = client.write_all(&front.refusal(code));
+        }
+        FoxyOpen::Silent => {}
+    }
+}
+
+const HTTP_HEAD_LIMIT: usize = 8192;
+
+/// An HTTP proxy request: a tunnel to open, or a head to forward to a raw uplink.
+enum ProxyRequest {
+    Connect(SocksTarget),
+    Forward(SocksTarget, Vec<u8>),
+}
+
+/// CONNECT opens a tunnel; absolute- and origin-form forward the head with the
+/// request line rewritten to origin-form, which is what an origin parses.
+fn http_proxy_request(head: &[u8]) -> Option<ProxyRequest> {
+    let line = head.split(|byte| *byte == b'\n').next()?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next().unwrap_or(b"HTTP/1.1");
+    if method.eq_ignore_ascii_case(b"CONNECT") {
+        return authority_target(target).map(ProxyRequest::Connect);
+    }
+    if method.eq_ignore_ascii_case(b"OPTIONS")
+        || method.eq_ignore_ascii_case(b"TRACE")
+        || target.is_empty()
+    {
+        return None;
+    }
+    if let Some(rest) = target.strip_prefix(b"http://") {
+        let (authority, path) = match rest.iter().position(|byte| *byte == b'/') {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, b"/".as_slice()),
+        };
+        let asked = authority_target(authority)?;
+        return Some(ProxyRequest::Forward(
+            asked,
+            origin_head(method, path, version, head),
+        ));
+    }
+    if target.starts_with(b"/") {
+        let host = header_value(head, "host")?;
+        let asked = authority_target(host.as_bytes())?;
+        return Some(ProxyRequest::Forward(
+            asked,
+            origin_head(method, target, version, head),
+        ));
+    }
+    None
+}
+
+/// Rewrites the request line to origin-form, keeping every header byte as sent.
+fn origin_head(method: &[u8], path: &[u8], version: &[u8], head: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len());
+    out.extend_from_slice(method);
+    out.push(b' ');
+    out.extend_from_slice(path);
+    out.push(b' ');
+    out.extend_from_slice(version);
+    out.extend_from_slice(b"\r\n");
+    let rest = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    out.extend_from_slice(&head[rest..]);
+    out
+}
+
+/// An authority as a target: a literal address stays one, a name rides the
+/// tunnel untouched, and a missing port is plain HTTP's 80.
+fn authority_target(authority: &[u8]) -> Option<SocksTarget> {
+    let authority = std::str::from_utf8(authority).ok()?;
+    if let Ok(address) = authority.parse::<SocketAddr>() {
+        return Some(SocksTarget::Address(address));
+    }
+    if let Ok(ip) = authority.parse::<std::net::IpAddr>() {
+        return Some(SocksTarget::Address(SocketAddr::new(ip, 80)));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (authority, 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(SocksTarget::Name(host.to_owned(), port))
+}
+
+/// The `http` front: CONNECT tunnels like SOCKS does, plain HTTP forwards its
+/// head through a raw uplink, and anything unparsable closes quietly.
+fn serve_http(mut client: TcpStream, out: &Outbound) {
+    let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT) else {
+        return;
+    };
+    let Some(request) = http_proxy_request(&head) else {
+        return;
+    };
+    match request {
+        ProxyRequest::Connect(asked) => {
+            if !matches!(out, Outbound::Foxy(_))
+                && client.write_all(&Front::Http.grant_line()).is_err()
+            {
+                return;
+            }
+            serve_connect(client, out, &asked, Front::Http, &[]);
+        }
+        ProxyRequest::Forward(asked, origin) => {
+            serve_connect(client, out, &asked, Front::Http, &origin);
+        }
+    }
+}
+
+/// The `mixed` front sniffs one byte: SOCKS5 greets with 0x05, HTTP with a
+/// method token, and a peek consumes nothing either way.
+fn serve_mixed(client: TcpStream, out: &Outbound) {
+    let mut first = [0u8; 1];
+    let Ok(n) = client.peek(&mut first) else {
+        return;
+    };
+    if n == 0 {
+        return;
+    }
+    if first[0] == 5 {
+        serve_socks(client, out);
+    } else {
+        serve_http(client, out);
+    }
 }
 
 fn now_secs() -> u64 {
@@ -12981,6 +13236,186 @@ mod tests {
             serve_socks(stream, &out);
         });
         port
+    }
+
+    fn http_front_with(out: Outbound) -> u16 {
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_http(stream, &out);
+        });
+        port
+    }
+
+    fn http_connect(port: u16, authority: &str) -> TcpStream {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .expect("connects");
+        client
+    }
+
+    fn http_status(client: &mut TcpStream) -> String {
+        let head = read_http_head(client, HEAD_LIMIT_TEST).expect("reads a head");
+        let line = head.split(|byte| *byte == b'\n').next().expect("a line");
+        String::from_utf8(line.to_vec()).expect("text")
+    }
+
+    #[test]
+    fn http_connect_reaches_echo_direct() {
+        let echo = echo_once();
+        let front = http_front_with(Outbound::Freedom);
+        let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
+        assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn http_get_forwards_origin_form_to_direct() {
+        let echo = echo_once();
+        let front = http_front_with(Outbound::Freedom);
+        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{echo}/path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST).expect("echoes the head");
+        assert_eq!(
+            head,
+            format!("GET /path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes()
+        );
+    }
+
+    #[test]
+    fn http_get_to_a_protocol_outbound_is_405() {
+        let front = http_front_with(Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: 1,
+            id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
+            carrier: Carrier::Raw,
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: None,
+        }));
+        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(b"GET http://127.0.0.1:1/ HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+            .expect("gets");
+        assert!(http_status(&mut client).starts_with("HTTP/1.1 405"));
+    }
+
+    #[test]
+    fn http_connect_tunnels_vless_raw_to_echo() {
+        let echo = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_port = server.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accepts");
+            serve_vless_raw(stream, &id, true);
+        });
+        let front = http_front_with(Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_port,
+            id,
+            carrier: Carrier::Raw,
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: None,
+        }));
+        let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
+        assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn mixed_serves_socks_and_http_on_one_port() {
+        let echo_socks = echo_once();
+        let echo_http = echo_once();
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in front.incoming().take(2) {
+                let Ok(stream) = stream else { continue };
+                thread::spawn(|| serve_mixed(stream, &Outbound::Freedom));
+            }
+        });
+        let mut socks = socks_tcp_client(port, echo_socks);
+        socks.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        socks.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let mut http = http_connect(port, &format!("127.0.0.1:{echo_http}"));
+        assert!(http_status(&mut http).starts_with("HTTP/1.1 200"));
+        http.write_all(b"ping").expect("writes");
+        http.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn garbage_closes_the_http_front() {
+        let front = http_front_with(Outbound::Freedom);
+        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(b"GARBAGE\r\n\r\n").expect("writes");
+        let mut probe = [0u8; 1];
+        match client.read(&mut probe) {
+            Ok(0) | Err(_) => {}
+            Ok(_) => panic!("garbage was answered"),
+        }
+    }
+
+    #[test]
+    fn http_request_parses_connect_and_both_get_forms() {
+        let connect = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let Some(ProxyRequest::Connect(asked)) = http_proxy_request(connect) else {
+            panic!("connect parses");
+        };
+        assert_eq!(asked.authority(), "example.com:443");
+        let absolute =
+            b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(absolute) else {
+            panic!("absolute-form parses");
+        };
+        assert_eq!(asked.authority(), "example.com:8080");
+        assert_eq!(
+            origin,
+            b"GET /p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+        );
+        let origin_form = b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(origin_form) else {
+            panic!("origin-form parses");
+        };
+        assert_eq!(asked.authority(), "example.com:80");
+        assert_eq!(origin, origin_form);
+        assert!(http_proxy_request(b"GET /p HTTP/1.1\r\n\r\n").is_none());
+        assert!(http_proxy_request(b"GARBAGE\r\n\r\n").is_none());
     }
 
     #[test]

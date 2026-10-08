@@ -949,3 +949,19 @@ Each of those is its own proof: a loopback pair in each direction per row, the w
 
 Decide which rung the window between 1 KiB and 4 KiB wants, and if it is the four-block one, delete `absorb_two_lane`, its threshold, its dispatch arm and the test that calls it by name. The alternative is to move the four-block rung back above 4 096 and re-measure the window, which needs a `bench.yml` comparison to be worth its cost. Either way each architecture is left with the rungs it can enter, and no reader has to decide whether a threshold that cannot fire is a design or a leftover.
 ```
+
+## P46 · Serve the TUN device and the system VPN modes
+
+**When to use:** When every proxy front is served and the ask is whole-device capture: `http`, `mixed` and `socks` are served inbounds with loopback proofs and live relay legs, while README rows 29 (native TUN inbound) and 58 (tun2socks engine) are still planned and no system-VPN surface exists anywhere in the tree.
+**Status:** todo
+**Leverage:** 4
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `foxy-relay.yml` green with a TUN leg that captures device traffic and downloads 1 MB through it on each runner that can create a device
+**Touches:** crates/ferrox-app/src/proxy.rs, README.md
+**Random weight:** 1
+
+```text
+A TUN device is not another front: it needs a platform device (`utun` on macOS, `tun` on Linux, Wintun on Windows), a userspace IP stack to turn packets into flows, and root or an entitlement to create it — none of which this tree has. The `foxy-macos.sh` helper calls its `--vpn` flag system-proxy mode for exactly this reason: it points `networksetup` at the local fronts, which covers TCP apps that honour the proxy and captures nothing else, and UDP over SOCKS to a foxy outbound rides the MASQUE datagrams, not the device.
+
+Decide the shape before writing the stack: a native TUN inbound (row 29) that terminates IP itself, or the zeptun-style translator (row 58) that turns TUN into TCP/UDP/ICMP through the SOCKS front that already exists. Either way the proof is a CI leg that captures device traffic and downloads 1 MB through it, because a TUN path proven only by framing is the loopback mistake P39 already paid for once. Until then rows 29 and 58 stay planned and say so, and no config key names a device this binary cannot open.
+```
