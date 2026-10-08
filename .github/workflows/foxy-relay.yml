@@ -184,30 +184,42 @@ jobs:
           relay = ('127.0.0.1', port)
           udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
           udp.settimeout(10)
-          # One query per target shape: two IP literals and one DNS name, so
-          # the lane log shows one CONNECT-UDP verdict per shape.
+          # UDP shapes: NTP to Cloudflare (name and literal) plus the DNS
+          # control that the edge refuses at TCP level too. One CONNECT-UDP
+          # verdict per shape lands in the lane log; a 200 with answer bytes
+          # is the datagram path proven.
           targets = [
-              (b'\x00\x00\x00\x01\x01\x01\x01\x01', 53, '1.1.1.1'),
-              (b'\x00\x00\x00\x01\x08\x08\x08\x08', 53, '8.8.8.8'),
-              (b'\x00\x00\x00\x03\x0eone.one.one.one', 53, 'one.one.one.one'),
+              (b'\x00\x00\x00\x03\x13time.cloudflare.com', 123, 'ntp-name', b'\x1b' + b'\x00' * 47, 48),
+              (b'\x00\x00\x00\x01\xa2\x9f\xc8\x01', 123, 'ntp-literal', b'\x1b' + b'\x00' * 47, 48),
+              (b'\x00\x00\x00\x01\x08\x08\x08\x08', 53, 'dns', None, 0),
           ]
           answers = []
-          for hdr, port, name in targets:
+          for hdr, port, name, probe, want in targets:
               for _ in range(3):
-                  qid, query = dns_query('one.one.one.one')
-                  udp.sendto(hdr + struct.pack('>H', port) + query, relay)
+                  if probe is None:
+                      qid, query = dns_query('one.one.one.one')
+                      out = query
+                  else:
+                      out = probe
+                  udp.sendto(hdr + struct.pack('>H', port) + out, relay)
                   try:
                       packet, _ = udp.recvfrom(65535)
                   except socket.timeout:
                       continue
                   assert packet[:3] == b'\x00\x00\x00', 'bad socks udp header'
                   hlen, _ = udp_addr(packet[3:])
-                  got = dns_answers(packet[3 + hlen:], qid)
-                  if got:
-                      answers.append((name, got))
+                  body = packet[3 + hlen:]
+                  print(name, 'answered', len(body), 'B', flush=True)
+                  if probe is not None and len(body) == want:
+                      answers.append((name, len(body)))
                       break
-          assert answers, 'no dns answer through the tunnel'
-          print('dns through the tunnel:', answers)
+                  if probe is None:
+                      got = dns_answers(body, qid)
+                      if got:
+                          answers.append((name, got))
+                          break
+          assert answers, 'no udp answer through the tunnel'
+          print('udp through the tunnel:', answers)
           PY
       - name: Stop the lane and show its log
         if: always() && steps.secrets.outputs.present == 'true'
