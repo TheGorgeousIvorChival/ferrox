@@ -5,13 +5,37 @@ never touch a cipher primitive of their own; they call
 `record::fill_exact` and `record::fill_exact_with_head`, and the only thing
 above this rung that knows a block is 64 bytes long is `ferrox-bench`.
 
-The shape that makes it cheap is that there is exactly one round function,
-written once, generic over a `Lanes` trait. `portable::U4` (four `u32`), `sse2::S4`,
-`neon::N4` and `avx2::A8` implement it, so a backend cannot disagree with
-another about the algorithm — it can only be slower. The portable backend is
-safe Rust, which is what lets Miri interpret the ladder at all; the SIMD
-backends are five instructions each whose only failure mode is a wrong answer,
-and a wrong answer is caught by a differential test before any timing runs.
+The shape that makes it cheap is that there is exactly one ladder round
+function, written once, generic over a `Lanes` trait. `portable::U4` (four
+`u32`), `sse2::S4`, `neon::N4` and `avx2::A8` implement it, so a ladder backend
+cannot disagree with another about the algorithm — it can only be slower. The
+portable backend is safe Rust, which is what lets Miri interpret the ladder at
+all; the SIMD backends are five instructions each whose only failure mode is a
+wrong answer, and a wrong answer is caught by a differential test before any
+timing runs.
+
+Above 512 bytes on aarch64 a fifth implementation takes over, `chacha::soa`: it
+gives a register one *word* of eight blocks instead of one row of one block, so
+a diagonal round is a rename of the row registers where `neon::N4` needs six
+`vext` per double round per block — and the permute pipe is the floor this core
+has. The four registers of a row transpose once at the store instead, which is
+the layout `x/crypto`'s arm64 assembly keeps. Two sets of four blocks, not one:
+a half round ends in a barrier, because all four diagonal quarter rounds read
+what all four column quarter rounds wrote, so a four-block pass has four chains
+across that barrier and nothing to issue while they are in flight. The
+four-block form measured exactly that — in gate 3 of `bench.yml` runs
+`37720316104` and `37723102887` its ratio against the pinned `chacha20` crate
+went 1.50x to 1.98x on the linux aarch64 runner and 2.96x to 2.08x on the macos
+aarch64 one, a kernel bound by its own dependency chains rather than by its op
+count. Sharing the sixteen broadcasts and the base between two sets puts
+sixteen quarter rounds and eight chains in a double round, which is the ladder's
+shape, at the register cost the ladder already pays for its eight blocks. Its
+only *checked* claim is equality: `chacha::soa` is timed nowhere until it has
+produced the same keystream as the ladder, which
+`chacha::soa::tests::the_eight_block_pass_is_the_ladder_at_every_length` asserts
+byte for byte at every length to 1032 bytes and at four start counters, head and
+headless, and gate 1 asserts the same bytes against the pinned `chacha20` crate
+before gate 3 times anything.
 
 `fill_exact_with_head` is the interesting entry point. ChaCha20-Poly1305 needs
 block 0 as the Poly1305 one-time key and blocks 1.. as the payload keystream,
@@ -26,12 +50,19 @@ discards nothing.
 ```mermaid
 graph TD
     A["fill_exact_with_head, len bytes"] --> B["base_state: constants,<br/>key, nonce, counter 0"]
-    B --> C["counters: NST states, each holding<br/>CHUNKS consecutive block counters"]
-    C --> D["10 double rounds,<br/>quarter round then diagonalise"]
-    D --> E["state + base, 16 bytes per chunk"]
-    E --> F["xor into the caller's buffer"]
+    B --> C{"aarch64, and 512 bytes or more?"}
+    C -- yes --> S["16 broadcasts, two sets of four:<br/>one word per register, eight blocks in the lanes"]
+    S --> T["10 double rounds over both sets,<br/>the diagonal is a register rename"]
+    T --> U["add the base back,<br/>transpose one row of eight blocks"]
+    U --> V["xor into the caller's buffer,<br/>eight blocks a pass"]
+    V --> W{"a whole pass left?"}
+    W -- yes --> S
+    C -- no --> D["counters: NST states, each holding<br/>CHUNKS consecutive block counters"]
+    D --> E["10 double rounds,<br/>quarter round then diagonalise"]
+    E --> F["state + base, 16 bytes per chunk"]
     F --> G{"more than a group left?"}
-    G -- yes --> C
+    G -- yes --> D
+    W -- no --> H
     G -- no --> H["8→4→2→1 tail ladder,<br/>then a scalar last block"]
     H --> I(("buffer, in place, nothing discarded"))
     J["decrypt_in_place, len bytes"] --> K["poly_key: block 0 only,<br/>32 bytes, no body"]
@@ -54,12 +85,7 @@ graph TD
 | blocks-per-byte | 1/64 | ferrox-bench-gate-2 |
 | blocks-per-iteration | 8 | ferrox-core-chacha::backend |
 | fused-head-blocks | 1 | ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted |
-| backends-a-differential-test-cannot-lie-to | 4 | ferrox-bench-gate-1 |
-
-
-
-
-
+| backends-a-differential-test-cannot-lie-to | 5 | ferrox-bench-gate-1 |
 <!-- counts:end -->
 
 ## Ops
@@ -104,6 +130,23 @@ branch has been read.
 
 ## What we removed
 
+- **Six lane permutations a double round a block on aarch64.** The row layout
+  diagonalises by rotating the lane order of three of the four row registers,
+  one `vext` each, so a block's twenty rounds spend sixty permutations on
+  rotations alone; the pass spends none, and pays one four-register transpose
+  per row of four blocks instead, which is eight permutations a block against
+  those sixty. Nothing else moves: the quarter round, the ten double rounds and the
+  keystream bytes are the same, and the pass's equality with the ladder is
+  asserted at every length before gate 3 times either side.
+- **What the pass did not remove, on purpose.** Below 512 bytes aarch64 is
+  still `neon::N4` through the same ladder: a pass pays its setup for eight
+  blocks whether eight are wanted or one, and the `8 → 4 → 2 → 1` rungs ask for
+  exactly the blocks the caller asked for. The MAC beside the keystream is untouched by
+  this slice, and the limb extraction it got in the slice before is not a clean
+  win: five `TBL4` lookups a group read 4152 ns against the scalar windows' 4421
+  ns at 16 KiB on macos aarch64, and 6436 ns against 6222 ns on linux aarch64.
+  It is faster on one runner, slower on the other, and named here rather than
+  left as a win.
 - **Keystream that was generated and thrown away.** Gate 2 compares the block
   count the ladder reports against `ceil(len / 64)` at every length in a
   0..=65 537 sweep and at six start counters, and fails on any excess. The

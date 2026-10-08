@@ -10,6 +10,8 @@ mod calibrate;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 mod portable;
+#[cfg(target_arch = "aarch64")]
+mod soa;
 #[cfg(target_arch = "x86_64")]
 mod sse2;
 
@@ -341,7 +343,18 @@ pub(crate) fn xor_blocks(
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn xor_blocks(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    buf: &mut [u8],
+) -> u32 {
+    soa::xor_blocks(key, nonce, start, head, buf)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn xor_blocks(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -394,7 +407,9 @@ pub const fn backend() -> &'static str {
     #[cfg(target_arch = "aarch64")]
     {
         match (GROUP_STATES, GROUP_STATES * <Wide as Lanes>::CHUNKS) {
-            (8, 8) => "4-lane core: NEON, 8 states in flight, 8 blocks per iteration",
+            (8, 8) => {
+                "4-lane core: NEON, one word per register, 8 blocks per pass, the ladder below 512 bytes"
+            }
             _ => "aarch64: a width this build does not have",
         }
     }
