@@ -80,7 +80,7 @@ fn from_26(h: [u32; 5]) -> [u64; 3] {
 }
 
 #[cfg(target_arch = "x86_64")]
-const AVX2_THRESHOLD_BYTES: usize = 4096;
+const AVX2_THRESHOLD_BYTES: usize = 1024;
 
 /// A four-byte window at `offset` of each block in the low dword of each 64-bit lane, zeroed above.
 #[cfg(target_arch = "x86_64")]
