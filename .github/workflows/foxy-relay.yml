@@ -31,9 +31,20 @@ env:
 
 jobs:
   foxy-relay:
-    name: Foxy relay live (tcp download + udp dns)
+    name: Foxy relay live (${{ matrix.carrier }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - carrier: h2
+            port: 10808
+          - carrier: h3
+            port: 10809
+    env:
+      SOCKS_PORT: ${{ matrix.port }}
+      FOXY_CARRIER: ${{ matrix.carrier }}
     steps:
       - uses: actions/checkout@v7
       - name: Check secrets present
@@ -55,7 +66,7 @@ jobs:
       - name: Build ferrox-app
         if: steps.secrets.outputs.present == 'true'
         run: cargo build --locked -p ferrox-app
-      - name: Start socks->foxy on 127.0.0.1:10808
+      - name: Start socks->foxy
         if: steps.secrets.outputs.present == 'true'
         env:
           FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
@@ -63,7 +74,7 @@ jobs:
           FOXY_COUNTRY: ${{ inputs.country || 'US' }}
           FOXY_DEBUG: 1
         run: |
-          python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":10808}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["FOXY_COUNTRY"],"carrier":"auto"}}]}, open("foxy-relay.json","w"))'
+          python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["SOCKS_PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["FOXY_CARRIER"]}}]}, open("foxy-relay.json","w"))'
           chmod 600 foxy-relay.json
           echo "country=$FOXY_COUNTRY" >> "$GITHUB_ENV"
           ./target/debug/ferrox-app run -c foxy-relay.json > ferrox-relay.log 2>&1 &
@@ -72,7 +83,7 @@ jobs:
         if: steps.secrets.outputs.present == 'true'
         run: |
           for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/10808) 2>/dev/null; then exit 0; fi
+            if (echo > /dev/tcp/127.0.0.1/$SOCKS_PORT) 2>/dev/null; then exit 0; fi
             sleep 2
           done
           echo "the lane never listened" >&2
@@ -83,23 +94,23 @@ jobs:
         run: |
           # Diagnosis first, one shot each: full SOCKS+TLS transcript and the
           # raw bytes a plain-HTTP GET brings back through the same tunnel.
-          curl -v --max-time 25 --socks5-hostname 127.0.0.1:10808 \
+          curl -v --max-time 25 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
             https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>&1 | tail -n 30 || true
-          curl -sS --max-time 25 --socks5-hostname 127.0.0.1:10808 \
+          curl -sS --max-time 25 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
             http://www.cloudflare.com/cdn-cgi/trace -o body.bin || true
           echo "== plain-http body =="
           wc -c body.bin 2>/dev/null || echo "(no answer)"
           xxd body.bin 2>/dev/null | head -n 8 || true
           # Plain HTTP first: it discriminates a tunnel that moves bytes from
           # one that only opens. TLS through the same tunnel comes next.
-          curl -sS --max-time 60 --socks5-hostname 127.0.0.1:10808 \
+          curl -sS --max-time 60 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
             http://www.cloudflare.com/cdn-cgi/trace -o trace-http.txt || true
           echo "== plain-http trace =="
           cat trace-http.txt 2>/dev/null || echo "(no answer)"
           # The first flow pays for sign-in, catalogue and edge dial, so the
           # trace is retried; a lane that never answers fails here, loudly.
           for i in $(seq 1 24); do
-            if curl -sS --max-time 30 --socks5-hostname 127.0.0.1:10808 \
+            if curl -sS --max-time 30 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
               https://www.cloudflare.com/cdn-cgi/trace -o trace.txt; then
               break
             fi
@@ -107,17 +118,19 @@ jobs:
           done
           grep -E '^(loc|ip)=' trace.txt
           grep -qx "loc=${country:?}" trace.txt
-          curl -sS --max-time 300 --socks5-hostname 127.0.0.1:10808 \
+          curl -sS --max-time 300 --socks5-hostname 127.0.0.1:$SOCKS_PORT \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o file.bin
           test "$(wc -c < file.bin)" = 1000000
           sha256sum file.bin
       - name: DNS through the tunnel over UDP
-        if: steps.secrets.outputs.present == 'true'
+        # UDP rides H2 CONNECT-UDP whatever the TCP carrier is, so one leg
+        # proves it; the h3 leg proves H3 tunnels instead.
+        if: steps.secrets.outputs.present == 'true' && matrix.carrier == 'h2'
         run: |
           # Control first: plain TCP to the DNS port through the same tunnel.
           # A fast connect proves egress; a refusal proves the target, and any
           # UDP verdict below must be read against this line.
-          timeout 15 curl -v --max-time 12 --socks5-hostname 127.0.0.1:10808 telnet://1.1.1.1:53 || true
+          timeout 15 curl -v --max-time 12 --socks5-hostname 127.0.0.1:$SOCKS_PORT telnet://1.1.1.1:53 || true
           python3 - <<'PY'
           import random, socket, struct, sys, time
           def udp_addr(packet):
@@ -157,7 +170,7 @@ jobs:
                       out.append(socket.inet_ntoa(reply[at:at + 4]))
                   at += rdlen
               return out
-          tcp = socket.create_connection(('127.0.0.1', 10808), timeout=30)
+          tcp = socket.create_connection(('127.0.0.1', int(__import__('os').environ['SOCKS_PORT'])), timeout=30)
           tcp.settimeout(30)
           def recv_exact(sock, n):
               out = b''

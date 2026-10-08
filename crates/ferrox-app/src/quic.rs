@@ -949,32 +949,52 @@ pub(crate) fn release_stream(dial: &QuicDial, id: u64) {
 
 fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
-    let (sock, peer, local) = udp_to_server(&dial.address, dial.port)?;
-    let mut conn = handshake(&sock, peer, local, &dial.host, roots)?;
-    flush_egress(&mut conn, &sock);
-    let shared = Arc::new(Mutex::new(conn));
-    let table = Arc::new(Mutex::new(PooledState {
-        sessions: HashMap::new(),
-        opening: HashSet::new(),
-        next_id: 0,
-    }));
-    let task_shared = Arc::clone(&shared);
-    let task_table = Arc::clone(&table);
-    let Ok(pump_sock) = sock.try_clone() else {
-        return None;
-    };
-    std::thread::spawn(move || pump(&task_shared, &task_table, &pump_sock, local));
-    Some(PooledConn {
-        conn: shared,
-        table,
-        sock: Arc::new(sock),
-        key: Arc::new(QuicServer {
-            address: dial.address.clone(),
-            port: dial.port,
-            host: dial.host.clone(),
-            roots: dial.roots.clone(),
-        }),
-    })
+    // One attempt per resolved address, like the reference: the first answer
+    // is not always the reachable one.
+    let peers: Vec<SocketAddr> = format!("{}:{}", dial.address, dial.port)
+        .to_socket_addrs()
+        .ok()?
+        .collect();
+    for peer in peers {
+        let Ok(sock) = (if peer.is_ipv6() {
+            bind_datagram("[::]:0")
+        } else {
+            bind_datagram("0.0.0.0:0")
+        }) else {
+            continue;
+        };
+        let Ok(local) = sock.local_addr() else {
+            continue;
+        };
+        let Some(mut conn) = handshake(&sock, peer, local, &dial.host, roots) else {
+            continue;
+        };
+        flush_egress(&mut conn, &sock);
+        let shared = Arc::new(Mutex::new(conn));
+        let table = Arc::new(Mutex::new(PooledState {
+            sessions: HashMap::new(),
+            opening: HashSet::new(),
+            next_id: 0,
+        }));
+        let task_shared = Arc::clone(&shared);
+        let task_table = Arc::clone(&table);
+        let Ok(pump_sock) = sock.try_clone() else {
+            continue;
+        };
+        std::thread::spawn(move || pump(&task_shared, &task_table, &pump_sock, local));
+        return Some(PooledConn {
+            conn: shared,
+            table,
+            sock: Arc::new(sock),
+            key: Arc::new(QuicServer {
+                address: dial.address.clone(),
+                port: dial.port,
+                host: dial.host.clone(),
+                roots: dial.roots.clone(),
+            }),
+        });
+    }
+    None
 }
 
 /// One connection and one stream on it, with nothing else reading the socket.

@@ -692,24 +692,30 @@ impl H3 {
         Some(out)
     }
 
-    /// The control stream is the client's first unidirectional stream, id 2, and
-    /// its SETTINGS are what the peer waits for before it answers anything.
-    ///
-    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL` is sent as zero on purpose: it says
-    /// this lane sends a classic CONNECT with no `:protocol`, which is the shape
-    /// the edge answers over HTTP/2, and a peer that believes otherwise reads
-    /// the request as one it may refuse.
+    /// The client's QPACK streams, opened alongside control: a strict peer
+    /// waits for the encoder and the decoder before it answers anything.
+    /// All three streams stay open: closing a critical stream kills the
+    /// connection.
+    const QPACK_ENCODER: u64 = 6;
+    const QPACK_DECODER: u64 = 10;
+
+    /// The control stream carries the stream type plus one complete SETTINGS
+    /// frame: no dynamic table (the QPACK below is literal-only), no blocked
+    /// streams, classic CONNECT. A truncated SETTINGS is a peer that waits
+    /// forever, which is what the previous shape was.
     fn control(&mut self) -> Result<(), Failure> {
-        self.out.clear();
-        frames::quic_varint(&mut self.out, frames::H3_DATA);
-        frames::quic_varint(&mut self.out, 4);
-        frames::quic_varint(&mut self.out, 0x04);
-        frames::quic_varint(&mut self.out, 0);
-        let settings = std::mem::take(&mut self.out);
-        let sent = self.send(CONTROL_STREAM, &settings, false);
-        self.out = settings;
-        sent?;
-        self.fin(CONTROL_STREAM)?;
+        let mut opening = Vec::with_capacity(16);
+        frames::quic_varint(&mut opening, 0x00);
+        let settings = [0x01u8, 0x00, 0x07, 0x00, 0x08, 0x00];
+        frames::quic_varint(&mut opening, 0x04);
+        frames::quic_varint(&mut opening, settings.len() as u64);
+        opening.extend_from_slice(&settings);
+        self.send(CONTROL_STREAM, &opening, false)?;
+        for (stream, kind) in [(Self::QPACK_ENCODER, 0x02u64), (Self::QPACK_DECODER, 0x03)] {
+            let mut hello = Vec::with_capacity(2);
+            frames::quic_varint(&mut hello, kind);
+            self.send(stream, &hello, false)?;
+        }
         Ok(())
     }
 
@@ -1607,6 +1613,7 @@ mod loopback {
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         seen: std::sync::mpsc::Sender<Vec<u8>>,
+        uni: std::sync::mpsc::Sender<Vec<(u64, Vec<u8>, bool)>>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let stamp = std::time::SystemTime::now()
@@ -1639,7 +1646,17 @@ mod loopback {
             conn.stream_send(3, &control, true).expect("opens control");
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             let mut request = None;
-            while request.is_none() {
+            // The client's unidirectional streams, id plus bytes plus whether
+            // the lane closed one: control must arrive whole and stay open.
+            let mut uni_streams: Vec<(u64, Vec<u8>, bool)> = Vec::new();
+            let uni_ready = |streams: &[(u64, Vec<u8>, bool)]| {
+                [2u64, 6, 10].iter().all(|want| {
+                    streams
+                        .iter()
+                        .any(|(id, bytes, _)| id == want && !bytes.is_empty())
+                })
+            };
+            while request.is_none() || !uni_ready(&uni_streams) {
                 assert!(std::time::Instant::now() < deadline, "the request arrives");
                 let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) else {
                     crate::quic::server_idle(&mut conn, &sock, &mut out);
@@ -1649,6 +1666,10 @@ mod loopback {
                 let ids: Vec<u64> = conn.readable().collect();
                 conn.recv(&mut buf[..n], info).expect("drives");
                 for id in ids {
+                    if id % 4 == 2 {
+                        drain_uni(&mut conn, id, &mut uni_streams);
+                        continue;
+                    }
                     // The control stream is unidirectional and the request is
                     // not, so the stream id itself tells them apart.
                     if id % 4 != 0 {
@@ -1657,13 +1678,13 @@ mod loopback {
                     let piece = drain(&mut conn, id);
                     if !piece.is_empty() {
                         request = Some((id, piece));
-                        break;
                     }
                 }
                 while let Ok((written, info)) = conn.send(&mut out) {
                     let _ = sock.send_to(&out[..written], info.to);
                 }
             }
+            let _ = uni.send(uni_streams);
             let (stream, raw) = request.expect("read");
             let mut at = 0usize;
             let frame = frames::h3_frame(&raw, &mut at).expect("a frame");
@@ -1681,41 +1702,71 @@ mod loopback {
             while let Ok((written, info)) = conn.send(&mut out) {
                 let _ = sock.send_to(&out[..written], info.to);
             }
+            echo_stream(&sock, local, &mut conn, &mut buf, &mut out, stream);
+        })
+    }
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
-            let mut received: Vec<u8> = Vec::new();
-            let mut sent = 0usize;
-            while sent < PAYLOAD.len() {
-                assert!(std::time::Instant::now() < deadline, "the tunnel echoes");
-                if let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) {
-                    let info = quiche::RecvInfo { from, to: local };
-                    conn.recv(&mut buf[..n], info).expect("drives");
-                    let piece = drain(&mut conn, stream);
-                    let mut at = 0usize;
-                    while let Some(frame) = frames::h3_frame(&piece, &mut at) {
-                        let end = (at + frame.length as usize).min(piece.len());
-                        if let frames::H3Event::Data { payload, .. } =
-                            frames::h3_event(frame, &piece[at..end])
-                        {
-                            received.extend_from_slice(payload);
-                        }
-                        at = end;
+    /// Echoes one request stream's DATA payloads until the lane's whole
+    /// payload has come back: the tunnel half of the loopback proof.
+    fn echo_stream(
+        sock: &UdpSocket,
+        local: SocketAddr,
+        conn: &mut quiche::Connection,
+        buf: &mut [u8; 1350],
+        out: &mut [u8; 1350],
+        stream: u64,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut received: Vec<u8> = Vec::new();
+        let mut sent = 0usize;
+        while sent < PAYLOAD.len() {
+            assert!(std::time::Instant::now() < deadline, "the tunnel echoes");
+            if let Some((n, from)) = crate::quic::server_poll(sock, &mut buf[..]) {
+                let info = quiche::RecvInfo { from, to: local };
+                conn.recv(&mut buf[..n], info).expect("drives");
+                let piece = drain(&mut *conn, stream);
+                let mut at = 0usize;
+                while let Some(frame) = frames::h3_frame(&piece, &mut at) {
+                    let end = (at + frame.length as usize).min(piece.len());
+                    if let frames::H3Event::Data { payload, .. } =
+                        frames::h3_event(frame, &piece[at..end])
+                    {
+                        received.extend_from_slice(payload);
                     }
-                }
-                if received.len() > sent {
-                    let n = (received.len() - sent).min(16_384);
-                    let mut frame = Vec::new();
-                    frames::quic_varint(&mut frame, frames::H3_DATA);
-                    frames::quic_varint(&mut frame, n as u64);
-                    frame.extend_from_slice(&received[sent..sent + n]);
-                    conn.stream_send(stream, &frame, false).expect("echoes");
-                    sent += n;
-                }
-                while let Ok((written, info)) = conn.send(&mut out) {
-                    let _ = sock.send_to(&out[..written], info.to);
+                    at = end;
                 }
             }
-        })
+            if received.len() > sent {
+                let n = (received.len() - sent).min(16_384);
+                let mut frame = Vec::new();
+                frames::quic_varint(&mut frame, frames::H3_DATA);
+                frames::quic_varint(&mut frame, n as u64);
+                frame.extend_from_slice(&received[sent..sent + n]);
+                conn.stream_send(stream, &frame, false).expect("echoes");
+                sent += n;
+            }
+            while let Ok((written, info)) = conn.send(&mut out[..]) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+        }
+    }
+
+    /// One unidirectional stream's bytes plus whether it has closed, merged
+    /// into the snapshot the test asserts the lane's opening against.
+    fn drain_uni(conn: &mut quiche::Connection, id: u64, streams: &mut Vec<(u64, Vec<u8>, bool)>) {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match conn.stream_recv(id, &mut chunk) {
+                Ok((0, _)) | Err(_) => break,
+                Ok((n, fin)) => match streams.iter_mut().find(|(known, _, _)| *known == id) {
+                    Some((_, bytes, closed)) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        *closed = *closed || fin;
+                    }
+                    None => streams.push((id, chunk[..n].to_vec(), fin)),
+                },
+            }
+        }
     }
 
     /// Every byte a stream holds, read into a buffer that exists: a `Vec` handed
@@ -1739,11 +1790,13 @@ mod loopback {
         let port = sock.local_addr().expect("addr").port();
         let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (uni_tx, uni_rx) = std::sync::mpsc::channel();
         let edge = h3_edge(
             sock,
             crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
             key_pem,
             seen_tx,
+            uni_tx,
         );
 
         let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
@@ -1756,6 +1809,32 @@ mod loopback {
         let mut want = Vec::new();
         hpack::qpack_connect("example.com:443", "the-pass", &mut want);
         assert_eq!(block, want, "the edge reads the same block the lane wrote");
+        let uni = uni_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("uni streams");
+        let stream = |id| {
+            uni.iter()
+                .find(|(known, _, _)| *known == id)
+                .unwrap_or_else(|| panic!("stream {id} opened"))
+        };
+        let (_, control, control_fin) = stream(2);
+        let mut at = 0usize;
+        assert_eq!(control.first(), Some(&0x00), "a control stream type");
+        at += 1;
+        assert_eq!(control.get(at), Some(&0x04), "one SETTINGS frame");
+        at += 1;
+        let len = frames::quic_read(control, &mut at).expect("a length") as usize;
+        assert_eq!(
+            control.len(),
+            at + len,
+            "a complete SETTINGS, no truncation"
+        );
+        assert!(!control_fin, "control stays open");
+        for (id, first) in [(6u64, 0x02u8), (10, 0x03)] {
+            let (_, bytes, fin) = stream(id);
+            assert_eq!(bytes.as_slice(), &[first], "qpack stream {id}");
+            assert!(!fin, "qpack stream {id} stays open");
+        }
         round_trip(&mut tunnel);
         edge.join().expect("joins");
     }
