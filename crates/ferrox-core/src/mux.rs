@@ -185,7 +185,10 @@ impl Outgoing<'_> {
     }
 
     #[inline]
-    pub fn encode_into(&self, data: Option<&[u8]>, out: &mut [u8]) -> usize {
+    /// The three invariants every encoding of this frame has to satisfy, and the
+    /// metadata length they agree on. Split out of `encode_into` so the
+    /// header-only path below cannot drift from the full one.
+    fn check_meta(&self) -> usize {
         assert!(
             self.carries_target() == self.target.is_some(),
             "the status decides whether a target follows, and this frame disagrees with itself"
@@ -200,28 +203,17 @@ impl Outgoing<'_> {
                     && self.target.is_some_and(|t| t.network == Network::Udp)),
             "the NAT identity rides a new UDP frame and nowhere else"
         );
-        assert_eq!(
-            self.has_data(),
-            data.is_some(),
-            "the data option and the payload have to agree"
-        );
-        let payload = data.unwrap_or(&[]);
-        assert!(
-            payload.len() <= CHUNK_MAX,
-            "mux chunk longer than a length field"
-        );
         let meta = self.meta_len();
         assert!(
             meta <= META_MAX,
             "mux metadata longer than the format allows"
         );
-        let chunk = if self.has_data() {
-            2 + payload.len()
-        } else {
-            0
-        };
-        assert!(out.len() >= 2 + meta + chunk, "mux frame buffer too short");
+        meta
+    }
 
+    /// Writes `[meta length][metadata]` and returns the offset the payload
+    /// length goes at. `out` must already be at least `2 + meta` long.
+    fn write_meta(&self, out: &mut [u8], meta: usize) -> usize {
         let mut o = 2;
         out[o..o + 2].copy_from_slice(&self.id.to_be_bytes());
         o += 2;
@@ -242,6 +234,54 @@ impl Outgoing<'_> {
             "the length came from one function and the writes agree"
         );
         out[..2].copy_from_slice(&(meta as u16).to_be_bytes());
+        o
+    }
+
+    /// Everything a frame puts on the wire except its payload: the metadata
+    /// length, the metadata, and a **zeroed** payload length for the caller to
+    /// patch once it knows how many bytes it has.
+    ///
+    /// This is for a relay that can hand the payload to the socket without
+    /// moving it — the payload is not sealed, it is framed — so a `writev` of
+    /// header and read buffer is the whole frame and no relay read is copied.
+    /// `encode_into` is this plus the copy; the two must not drift, which
+    /// `a_header_plus_a_patched_length_is_the_whole_frame` holds.
+    #[must_use]
+    pub fn encode_header_into(&self, out: &mut Vec<u8>) -> usize {
+        let meta = self.check_meta();
+        out.clear();
+        out.resize(2 + meta + usize::from(self.has_data()) * 2, 0);
+        let at = self.write_meta(out, meta);
+        debug_assert_eq!(at, 2 + meta, "the payload length follows the metadata");
+        at
+    }
+
+    /// Rewrites the payload length `encode_header_into` left at zero.
+    pub fn patch_payload_len(&self, out: &mut [u8], at: usize, len: usize) {
+        debug_assert!(self.has_data(), "only a frame with a payload has a length");
+        out[at..at + 2].copy_from_slice(&(len as u16).to_be_bytes());
+    }
+
+    pub fn encode_into(&self, data: Option<&[u8]>, out: &mut [u8]) -> usize {
+        assert_eq!(
+            self.has_data(),
+            data.is_some(),
+            "the data option and the payload have to agree"
+        );
+        let payload = data.unwrap_or(&[]);
+        assert!(
+            payload.len() <= CHUNK_MAX,
+            "mux chunk longer than a length field"
+        );
+        let meta = self.check_meta();
+        let chunk = if self.has_data() {
+            2 + payload.len()
+        } else {
+            0
+        };
+        assert!(out.len() >= 2 + meta + chunk, "mux frame buffer too short");
+
+        let mut o = self.write_meta(out, meta);
 
         if self.has_data() {
             out[o..o + 2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -617,6 +657,92 @@ mod tests {
 
     const NEW_DOMAIN: [u8; 28] =
         *b"\x00\x14\x00\x01\x01\x01\x01\x00\x50\x02\x0bexample.com\x00\x04abcd";
+
+    /// The relay writes a header it built once and a payload it never copied.
+    /// Those two have to be the same bytes as the single-buffer encoder at
+    /// every status, option and length — the header-only path is the one on the
+    /// wire for every relayed byte, and it shares `write_meta` with the other
+    /// so the only thing left to pin is the length field.
+    #[test]
+    fn a_header_plus_a_patched_length_is_the_whole_frame() {
+        let addrs = [
+            Target::of(Network::Tcp, "192.0.2.1", 443),
+            Target::of(Network::Udp, "example.com", 53),
+        ];
+        let mut frames: Vec<Outgoing> = Vec::new();
+        for status in [Status::New, Status::Keep, Status::End, Status::KeepAlive] {
+            for options in [0u8, DATA, DATA | ERROR, ERROR] {
+                for target in [None, Some(addrs[0]), Some(addrs[1])] {
+                    for global_id in [None, Some([7u8; GLOBAL_ID])] {
+                        let f = Outgoing {
+                            id: 513,
+                            status,
+                            options,
+                            target,
+                            global_id,
+                        };
+                        // skip the shapes this type already refuses to encode
+                        if f.carries_target() != target.is_some()
+                            || (status == Status::Keep
+                                && target.is_some_and(|t| t.network != Network::Udp))
+                            || (global_id.is_some()
+                                && !(status == Status::New
+                                    && target.is_some_and(|t| t.network == Network::Udp)))
+                            || f.has_data() != (options & DATA != 0)
+                        {
+                            continue;
+                        }
+                        frames.push(f);
+                    }
+                }
+            }
+        }
+        assert!(frames.len() > 20, "the sweep should cover many shapes");
+
+        let mut checked = 0usize;
+        for f in &frames {
+            for len in [0usize, 1, 2, 15, 16, 17, 255, 256, 1400, 8192] {
+                if !f.has_data() && len != 0 {
+                    continue;
+                }
+                if len > CHUNK_MAX {
+                    continue;
+                }
+                let payload: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x3C).collect();
+                let data = f.has_data().then_some(payload.as_slice());
+
+                let mut whole = vec![0u8; f.frame_len(len)];
+                let n = f.encode_into(data, &mut whole);
+                assert_eq!(n, whole.len(), "frame_len and the encoder disagree");
+
+                let mut header = Vec::new();
+                let at = f.encode_header_into(&mut header);
+                if f.has_data() {
+                    f.patch_payload_len(&mut header, at, len);
+                }
+                let mut split = header.clone();
+                split.extend_from_slice(data.unwrap_or(&[]));
+
+                assert_eq!(
+                    split,
+                    whole,
+                    "{:?} len {len}: header plus payload is not the frame",
+                    (f.status, f.options)
+                );
+                assert_eq!(
+                    header.len(),
+                    2 + f.meta_len() + usize::from(f.has_data()) * 2,
+                    "{:?}: the header length must not carry the payload",
+                    (f.status, f.options)
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 100,
+            "the sweep should be dense, not a sample: {checked}"
+        );
+    }
 
     #[test]
     fn a_new_frame_is_the_bytes_the_fields_add_up_to() {

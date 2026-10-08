@@ -39,8 +39,8 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | maximum-frame-payload-bytes | 8192 | ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame |
-| user-space-copies-per-byte-written | 0 | ferrox-bench-gate-6 |
-| user-space-copies-per-byte-read | 1 | ferrox-bench-gate-6 |
+| relay-copies-per-byte-written | 0 | ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer |
+| codec-copies-per-byte-written | 1 | ferrox-core-mux::tests::a_header_plus_a_patched_length_is_the_whole_frame |
 | mux-frame-allocations | 0 | ferrox-bench-gate-6 |
 | live-session-cap | 8 | ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used |
 | xudp-frame-layout-matches-upstream | 1 | ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout |
@@ -93,15 +93,48 @@ No artefact from this branch has been read.
   geometrically — better, but not zero, and no row claims otherwise. Sizing the
   buffer to `2 + META_MAX + 2 + 8192 + READ_SLICE` up front would make it zero,
   and is not worth an over-sized first allocation on the evidence available.
-- **NOT removed: the uplink's one payload copy per byte.** `mux_dial_uplink`
-  reads into a stack `chunk` and then `encode_into` copies that payload into the
-  framing buffer, so the write side still makes one user-space pass. Removing it
-  means reading *into* the frame's own payload region, which means splitting
-  `mux::Outgoing::encode_into` into a header write and a chunk write — a second
-  way of doing something the gate already pins, for one copy on one direction.
-  That is a `prompts.md` slice, not a patch. `mux::decode` is also still
-  stateless and re-derives the 2-byte length on every call; making it a session
-  would save two loads per frame and cost an API with a lifetime.
+- **The uplink's one payload copy per byte, and its per-frame header rebuild.**
+  A mux payload is *framed*, not sealed: it goes on the wire behind a two-byte
+  length with nothing else done to it. So the payload does not have to be moved
+  into the frame buffer at all. `mux_dial_uplink` used to read into a stack
+  buffer and then `encode_into` the whole frame — a full `memcpy` of every
+  relayed byte — and it rebuilt the entire header per read even though the
+  metadata is the same for every frame on that uplink. It now builds the header
+  **once** and rewrites only its two-byte payload length, then hands the kernel
+  the header and the read buffer as two `writev` parts, so the payload reaches
+  the socket from where it was read. One syscall, unchanged; one `memcpy` of every
+  relayed byte, gone.
+
+  Three things had to hold, and each has its own gate rather than one test:
+
+  - **The two encoders cannot drift.** `encode_into` is now
+    `check_meta` + `write_meta` + the payload, and `encode_header_into` is
+    `check_meta` + `write_meta` + a zeroed length — one implementation of the
+    metadata, not two. `a_header_plus_a_patched_length_is_the_whole_frame` then
+    requires header-plus-payload to equal the single-buffer encoder across every
+    status, option, target and identity combination that type will encode, at
+    ten payload lengths.
+  - **The wiring delivers what the codec describes.**
+    `the_mux_uplink_frames_every_relay_read_the_same_way` drives the relay over a
+    real socket pair at seven total lengths, decodes every frame off the wire and
+    requires the reassembled bytes to equal what was written to the client.
+  - **The payload is handed over by pointer, not copied.**
+    `a_two_part_write_hands_the_payload_over_by_pointer` asserts the second
+    `writev` part's base address *is* the payload slice's. This is the only kind
+    of test that can see the copy: a byte-level test cannot, because the bytes
+    are identical either way — reverting to the copying form still passes the
+    framing test, and that is the honest shape of this claim.
+
+  **Two rows on this page were wrong and are corrected rather than kept.** Both
+  `user-space-copies-per-byte-written 0` and `-read 1` named `ferrox-bench-gate-6`,
+  which counts *allocations, bytes allocated and zero-fills* — not copies
+  (`check_encode_allocs`, `muxframe.rs:234`). So the checker did not observe what
+  the row claimed, and the written value was also wrong for the codec:
+  `encode_into` copies the payload into the output buffer, so the codec's write
+  side is **1** copy per byte, not 0. They are now `relay-copies-per-byte-written 0`
+  — gated by the pointer identity above — and `codec-copies-per-byte-written 1`,
+  which is the floor for an in-place-serialised codec and what the decode side's
+  borrowed subslice already achieves.
 - **The write-side payload copy.** Xray's `common/mux/writer.go:83` allocates a
   `MultiBuffer` per frame — `mb2 := make(buf.MultiBuffer, 0, len(data)+1)` — and
   appends the header buffer and the caller's payload buffers to it, so the
