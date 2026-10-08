@@ -528,29 +528,36 @@ pub fn qpack_fields(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
 }
 
 /// One CONNECT request, three fields, literal names and literal values: the
-/// smallest header block a CONNECT can be written in.
+/// smallest header block a CONNECT can be written in. The authorization carries
+/// the `Bearer` scheme, which is the shape the edge answers: a bare token is
+/// a 400.
 pub fn hpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
-    for (name, value) in [
-        (":method", "CONNECT"),
-        (":authority", target),
-        ("proxy-authorization", bearer),
-    ] {
+    for (name, value) in [(":method", "CONNECT"), (":authority", target)] {
         out.push(0x00);
         integer(out, 7, 0x00, name.len());
         out.extend_from_slice(name.as_bytes());
         integer(out, 7, 0x00, value.len());
         out.extend_from_slice(value.as_bytes());
     }
+    let name = "proxy-authorization";
+    out.push(0x00);
+    integer(out, 7, 0x00, name.len());
+    out.extend_from_slice(name.as_bytes());
+    integer(out, 7, 0x00, "Bearer ".len() + bearer.len());
+    out.extend_from_slice(b"Bearer ");
+    out.extend_from_slice(bearer.as_bytes());
 }
 
 /// The same three fields under QPACK, whose block starts with a required insert
-/// count of zero and names its fields with the `001` literal pattern.
+/// count of zero and names its fields with the `001` literal pattern. The one
+/// allocation joins the scheme the edge answers with; a bare token is a 400.
 pub fn qpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
+    let bearer = format!("Bearer {bearer}");
     qpack_literal_many(
         &[
             (":method", "CONNECT"),
             (":authority", target),
-            ("proxy-authorization", bearer),
+            ("proxy-authorization", bearer.as_str()),
         ],
         out,
     );
@@ -964,7 +971,7 @@ mod tests {
             &[
                 (":method", "CONNECT"),
                 (":authority", "example.com:443"),
-                ("proxy-authorization", "p"),
+                ("proxy-authorization", "Bearer p"),
             ],
             &mut many,
         );
@@ -983,9 +990,9 @@ mod tests {
         hpack_connect("example.com:443", "p", &mut h2);
         let mut q3 = Vec::new();
         qpack_connect("example.com:443", "p", &mut q3);
-        assert_eq!(h2, hex("00073a6d 6574686f 6407434f 4e4e4543 54000a3a 61757468 6f726974 790f6578 616d706c 652e636f 6d3a3434 33001370 726f7879 2d617574 686f7269 7a617469 6f6e0170"));
-        assert_eq!(q3, hex("00002700 3a6d6574 686f6407 434f4e4e 45435427 033a6175 74686f72 6974790f 6578616d 706c652e 636f6d3a 34343327 0c70726f 78792d61 7574686f 72697a61 74696f6e 0170"));
-        assert_eq!((h2.len(), q3.len()), (68, 70));
+        assert_eq!(h2, hex("00073a6d 6574686f 6407434f 4e4e4543 54000a3a 61757468 6f726974 790f6578 616d706c 652e636f 6d3a3434 33001370 726f7879 2d617574 686f7269 7a617469 6f6e0842 65617265 722070"));
+        assert_eq!(q3, hex("00002700 3a6d6574 686f6407 434f4e4e 45435427 033a6175 74686f72 6974790f 6578616d 706c652e 636f6d3a 34343327 0c70726f 78792d61 7574686f 72697a61 74696f6e 08426561 72657220 70"));
+        assert_eq!((h2.len(), q3.len()), (75, 77));
     }
 
     #[test]
