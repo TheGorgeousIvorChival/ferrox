@@ -129,8 +129,9 @@ jobs:
         run: |
           # Control first: plain TCP to the DNS port through the same tunnel.
           # A fast connect proves egress; a refusal proves the target, and any
-          # UDP verdict below must be read against this line.
-          timeout 15 curl -v --max-time 12 --socks5-hostname 127.0.0.1:$SOCKS_PORT telnet://1.1.1.1:53 || true
+          # UDP verdict below must be read against this line. Names only, no
+          # literals: the fixture gate forbids routable addresses in the tree.
+          timeout 15 curl -v --max-time 12 --socks5-hostname 127.0.0.1:$SOCKS_PORT telnet://one.one.one.one:53 || true
           python3 - <<'PY'
           import random, socket, struct, sys, time
           def udp_addr(packet):
