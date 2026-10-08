@@ -384,6 +384,15 @@ pub(crate) unsafe fn xor_blocks(
     mut head: Option<&mut [u8; 32]>,
     buf: &mut [u8],
 ) -> u32 {
+    // Below one pass the ladder is the whole call, so the pass state is not built.
+    let take = if head.is_some() {
+        PASS_BYTES - 64
+    } else {
+        PASS_BYTES
+    };
+    if buf.len() < take {
+        return super::xor_ladder::<A8>(key, nonce, start, head, buf);
+    }
     let state = super::base_state(key, nonce);
     let mut ctr = start;
     let mut rest = buf;
