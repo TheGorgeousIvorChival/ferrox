@@ -120,13 +120,36 @@ that is the same gap P41 and P25 are named for.
 
 ## Time
 
-**Not measured on this branch.** `ferrox-bench` gate 3 (`.github/workflows/bench.yml`)
-times this rung against the pinned `chacha20` 0.9 crate at every length from
-0 to 65 537 and fails on any length whose ratio drops below 0.95, after a
-re-measure. Gate 1 runs the differential identity check first, so a backend
-that is fast because it is wrong cannot pass. Both numbers come from
-`target/bench-report.md` in a `bench.yml` artefact, and no artefact from this
-branch has been read.
+Measured in `bench.yml` run `37728743550`, which carries the pass (`66c704e`
+over `89f9714`), against the same rows in run `37720316104`, which carried the
+ladder alone (`4bb63c5`). Gate 3 times this rung against the pinned `chacha20`
+0.9 crate at 235 lengths from 65 to 65 537, interleaved best of five per side,
+and re-measures any length under 0.95x before the job can fail on it; gate 1
+runs the differential identity check first, so a backend that is fast because
+it is wrong cannot pass.
+
+| bytes | linux aarch64, ladder | linux aarch64, pass | macos aarch64, ladder | macos aarch64, pass |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 1.49x | 1.66x | 3.19x | 3.12x |
+| 4 KiB | 1.50x | 1.69x | 2.96x | 3.13x |
+| 16 KiB | 1.50x | 1.70x | 2.95x | 3.19x |
+| 64 KiB | 1.50x | 1.70x | 2.98x | 3.25x |
+
+Both runs measured their own reference in the same process, so the ratios
+compare, but they are different runner instances. Lengths below 512 bytes
+compile to the same ladder in both runs, and those 203 rows are this
+comparison's noise floor: 0.94x to 1.01x on linux aarch64, 0.61x to 1.30x on
+macos aarch64. Against that floor, the 32 measured lengths at or above 512
+bytes — the ones the pass handles — run 1.04x to 1.14x, median 1.11x, on linux
+aarch64, every one of them above it, and 0.92x to 1.42x, median 1.05x, on macos
+aarch64, where the three rows under 1.0x (769, 1024 and 2047 bytes) move less
+than the noise beside them does.
+
+Gate 7b's halves are printed and not gated, and at these sizes they are the
+weaker instrument: on macos aarch64 its 16 KiB keystream row read 9356 ns for
+the pass against 9041 ns for the ladder, while gate 3 read the pass 1.08x faster
+at the same length. The self-timed row has no reference to cancel a drifting
+runner, so the claim here rests on gate 3.
 
 ## What we removed
 
