@@ -1,6 +1,5 @@
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -205,7 +204,7 @@ impl SendingWorker {
 
 pub struct ReceivingWorker {
     ctx: Arc<Ctx>,
-    left_over: VecDeque<Vec<u8>>,
+    left_over: Vec<u8>,
     left_over_off: usize,
     window: ReceivingWindow,
     acklist: AckList,
@@ -225,7 +224,7 @@ impl ReceivingWorker {
         let window_size = config.receiving_in_flight_size();
         Self {
             ctx,
-            left_over: VecDeque::new(),
+            left_over: Vec::new(),
             left_over_off: 0,
             window: ReceivingWindow::new(),
             acklist: AckList::new(),
@@ -264,42 +263,26 @@ impl ReceivingWorker {
         self.window.set(number, seg);
     }
 
-    pub fn read_multi_buffer(&mut self) -> Vec<Vec<u8>> {
-        if !self.left_over.is_empty() {
-            let mut out = self.left_over.drain(..).collect::<Vec<_>>();
-            if self.left_over_off > 0 {
-                let tail = out[0].split_off(self.left_over_off);
-                out[0] = tail;
-                self.left_over_off = 0;
-            }
-            return out;
-        }
-        let mut mb = Vec::new();
-        while let Some(mut seg) = self.window.remove(self.next_number) {
-            self.next_number += 1;
-            mb.push(std::mem::take(&mut seg.payload));
-        }
-        mb
-    }
-
+    /// One segment at a time, taken straight out of the window: only the
+    /// partially-drained one has to outlive this call, so a read costs no
+    /// container of segments and no batch drained before it is needed.
     pub fn read(&mut self, b: &mut [u8]) -> usize {
-        if self.left_over.is_empty() {
-            let mb = self.read_multi_buffer();
-            if mb.is_empty() {
-                return 0;
-            }
-            self.left_over.extend(mb);
-        }
         let mut n = 0;
-        while n < b.len() && !self.left_over.is_empty() {
+        while n < b.len() {
+            if self.left_over.is_empty() {
+                let Some(mut seg) = self.window.remove(self.next_number) else {
+                    break;
+                };
+                self.next_number += 1;
+                self.left_over = std::mem::take(&mut seg.payload);
+            }
             let start = self.left_over_off;
-            let head = &self.left_over[0];
-            let take = (b.len() - n).min(head.len() - start);
-            b[n..n + take].copy_from_slice(&head[start..start + take]);
+            let take = (b.len() - n).min(self.left_over.len() - start);
+            b[n..n + take].copy_from_slice(&self.left_over[start..start + take]);
             n += take;
             self.left_over_off += take;
-            if self.left_over_off == self.left_over[0].len() {
-                self.left_over.pop_front();
+            if self.left_over_off == self.left_over.len() {
+                self.left_over.clear();
                 self.left_over_off = 0;
             }
         }

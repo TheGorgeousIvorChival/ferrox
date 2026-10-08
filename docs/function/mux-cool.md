@@ -44,6 +44,9 @@ graph TD
 | mux-frame-allocations | 0 | ferrox-bench-gate-6 |
 | live-session-cap | 8 | ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used |
 | xudp-frame-layout-matches-upstream | 1 | ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout |
+| relay-read-copies-through-a-second-buffer | 0 | ferrox-app-proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held |
+
+| relay-read-reallocations | 0 | ferrox-app-proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held |
 <!-- counts:end -->
 
 ## Ops
@@ -64,6 +67,34 @@ No artefact from this branch has been read.
 
 ## What we removed
 
+- **A full `memcpy` of every inbound byte, on all three read loops.** The
+  accept loop, `mux_dial_downlink` and the XUDP reader each read into an 8 KiB
+  stack array and then did `buf.extend_from_slice(&probe[..n])`, so every byte
+  off the socket was copied once before the framing loop could see it — while
+  `mux::decode` was already handing out a *borrowed* subslice of `buf`, which
+  the consumer then writes straight to its socket. The framing buffer's own
+  spare capacity is the read destination now, via `proxy::read_into_tail`, the
+  same idiom `ws.rs::pull` and `vision.rs::fill` already used and for the same
+  reason. The buffer is sized once with `with_capacity(READ_SLICE)` and `clear`ed
+  between reads, so the relay loop never reallocates either. The user-space copy
+  count on the read side goes from one to zero; the syscall count is unchanged,
+  because a TCP read is a read either way.
+  `a_read_into_the_tail_appends_exactly_what_the_stream_held` is the gate: it
+  drains a stream through a five-bytes-at-a-time reader — 3 300-odd short reads
+  over 16.5 KiB — and checks after *every* read that the buffer holds exactly the
+  prefix the source held, and that it never grew past the read slice. A second
+  test covers the two ways the `set_len` can be rolled back, the failing reader
+  and the empty one, because a buffer left longer than the bytes read is how
+  this idiom reads uninitialised memory.
+- **NOT removed: the uplink's one payload copy per byte.** `mux_dial_uplink`
+  reads into a stack `chunk` and then `encode_into` copies that payload into the
+  framing buffer, so the write side still makes one user-space pass. Removing it
+  means reading *into* the frame's own payload region, which means splitting
+  `mux::Outgoing::encode_into` into a header write and a chunk write — a second
+  way of doing something the gate already pins, for one copy on one direction.
+  That is a `prompts.md` slice, not a patch. `mux::decode` is also still
+  stateless and re-derives the 2-byte length on every call; making it a session
+  would save two loads per frame and cost an API with a lifetime.
 - **The write-side payload copy.** Xray's `common/mux/writer.go:83` allocates a
   `MultiBuffer` per frame — `mb2 := make(buf.MultiBuffer, 0, len(data)+1)` — and
   appends the header buffer and the caller's payload buffers to it, so the

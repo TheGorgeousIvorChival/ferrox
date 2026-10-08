@@ -64,14 +64,14 @@ claim with no checker is not made.
 
 | method | page | syscalls | copies per byte | ops | time |
 | --- | --- | --- | --- | --- | --- |
-| record layer (ChaCha20) | [record-layer](docs/function/record-layer.md) | 0 | 0 (in place) | `UNBLESSED` | not measured |
-| Shadowsocks AEAD | [shadowsocks](docs/function/shadowsocks.md) | **1 write per 16 KiB read**, 2 reads per chunk | 1 written, **0** read | `UNBLESSED` | not measured |
+| record layer (ChaCha20) | [record-layer](docs/function/record-layer.md) | 0 | 0 (in place), **0 staging bytes per open** | `UNBLESSED` | not measured |
+| Shadowsocks AEAD | [shadowsocks](docs/function/shadowsocks.md) | **1 write per 16 KiB read**, 2 reads per chunk, **0 datagram reallocations** | 1 written, **0** read, **1** per UDP byte (was 3) | `UNBLESSED` | not measured |
 | VMess AEAD | [vmess](docs/function/vmess.md) | **1 write per 32 KiB read** (4 frames) | 1 written, **0** read | `UNBLESSED` | not measured |
 | VLESS TCP | [vless](docs/function/vless.md) | 1 write per header, 0 framing after | 1 (the relay's own) | `UNBLESSED` | not measured |
 | Trojan TCP | [trojan](docs/function/trojan.md) | 1 write per header, 0 framing after | 1 (the relay's own) | `UNBLESSED` | not measured |
 | XTLS Vision | [xtls-vision](docs/function/xtls-vision.md) | 0 framing after the switch | **2** framed, **0** after the switch | `UNBLESSED` | not measured |
-| Mux.Cool + XUDP | [mux-cool](docs/function/mux-cool.md) | 1 write per frame | **0** written, 1 read | `UNBLESSED` | not measured |
-| WebSocket | [carrier-websocket](docs/function/carrier-websocket.md) | **1 read per 32 KiB window** (64 frames), 1 write per frame | 0 unmasked write, 1 masked | `UNBLESSED` | not measured |
+| Mux.Cool + XUDP | [mux-cool](docs/function/mux-cool.md) | 1 write per frame, **0 relay-read reallocations** | **0** written, **0** read (was 1) | `UNBLESSED` | not measured |
+| WebSocket | [carrier-websocket](docs/function/carrier-websocket.md) | **1 read per 32 KiB window** (64 frames), 1 write per frame | 0 unmasked write, 1 masked, **64 B per mask iteration** | `UNBLESSED` | not measured |
 | HTTPUpgrade | [carrier-httpupgrade](docs/function/carrier-httpupgrade.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
 | HTTP masquerade | [carrier-httpheader](docs/function/carrier-httpheader.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
 | gRPC | [carrier-grpc](docs/function/carrier-grpc.md) | 1 write per message | 1 written, 1 read | `UNBLESSED` | not measured |
@@ -79,7 +79,7 @@ claim with no checker is not made.
 | QUIC | [carrier-quic](docs/function/carrier-quic.md) | 1 handshake per server | quiche's | `UNBLESSED` | not measured |
 | Hysteria v2 | [carrier-hysteria](docs/function/carrier-hysteria.md) | 1 handshake per flow | 1 backlog plus the relay's own | `UNBLESSED` | not measured |
 | REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake, rustls | per handshake, rustls | `UNBLESSED` | not measured |
-| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place | `UNBLESSED` | not measured |
+| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment, **1 reader wakeup per datagram** (was one per segment) | in place, **0 segment-list vectors per datagram** | `UNBLESSED` | not measured |
 
 Two columns read "not measured" on every row, and that is the honest state
 rather than a gap in the table:
@@ -97,6 +97,41 @@ rather than a gap in the table:
   measurement of the tunnel, so no page quotes one that no CI artefact has
   produced. The gates that *are* deterministic — allocation counts, copy counts,
   syscall counts — are gated, and those are the numbers the pages lead with.
+
+### What the last branch removed, in counts
+
+Every line here is a row in `scripts/method-counts.txt` with the test that
+checks it, and every one of those tests is a differential or pointer-identity
+check, not a benchmark. A rewrite that changed a byte would fail one of them.
+
+| rung | removed | count |
+| --- | --- | --- |
+| [record layer](docs/function/record-layer.md) | the 64-byte keystream staging buffer every ChaCha open carried, its zero-fill, the scalar XOR loop that copied it back, and the split that fed a third pass | `staging-bytes-per-decrypt 0`, `keystream-passes-per-decrypt 2` — the same `1 + ceil(len/64)` blocks before and after |
+| [record layer](docs/function/record-layer.md) | the second `update` (and its dynamically sized `memcpy`) that padded an AEAD section | `padded-sections-through-a-second-update 0` |
+| [record layer](docs/function/record-layer.md) | the `absorb(&[])` at both ends of a record, and the ladder head that recursed through the dispatch with zero blocks | `empty-absorbs-per-record 0` |
+| [shadowsocks](docs/function/shadowsocks.md) | two of the three passes over every UDP payload, and the per-datagram allocation | `udp-payload-copies-per-byte 1`, `datagram-memmoves-per-payload 0`, `udp-datagram-reallocations-after-the-first 0` |
+| [shadowsocks](docs/function/shadowsocks.md) | a 16-byte tag copy per chunk, and a second 16 KiB buffer alive for the connection's whole life | `chunk-tag-copies-per-chunk 0` |
+| [mux-cool](docs/function/mux-cool.md) | a full `memcpy` of every inbound byte, on all three read loops — `mux::decode` was already handing out a borrowed subslice | `relay-read-copies-through-a-second-buffer 0` |
+| [kcp](docs/function/kcp.md) | a `Vec<Segment>` per received datagram, a `Vec<Vec<u8>>` plus a `VecDeque` per `read`, and a second deadline lock per wait | `segment-list-vectors-per-datagram 0`, `receiving-staging-vectors-per-read 0`, `read-deadline-lock-pairs-per-wait 1` |
+| [kcp](docs/function/kcp.md) | `n - 1` of every `n` reader wakeups on a multi-segment datagram | `reader-wakeups-per-datagram 1` |
+| [carrier-websocket](docs/function/carrier-websocket.md) | three quarters of the mask loop's per-byte overhead, at the same vector op count | `mask-bytes-per-vector-iteration 64` |
+
+Two of those need their limits stated, because a page that lists only wins is
+not evidence:
+
+- **The open path is now two keystream passes, not one.** MAC-before-decrypt is
+  not free: Poly1305 needs no keystream, so the tag is checked first and block
+  one onward is xored in afterwards. The old shape fused the one-time key and
+  the first body block into one ladder pass but needed a staging buffer and a
+  third pass over the tail. The block count is identical at every length and
+  so is the panic threshold; what changed is the staging, the scalar loop and
+  the passes over the buffer. This is the order `aesgcm::open_impl` in this tree
+  has always used, so the AEADs no longer disagree about when plaintext exists.
+- **NOT removed: KCP still sends one datagram per 1 332-byte segment.** That is
+  the largest syscall count in the tree, and batching would change the bytes on
+  the wire. The Mux uplink still copies every payload byte once, because
+  removing that copy means splitting `mux::Outgoing::encode_into` in two. Both
+  are named on their pages as open, not claimed as wins.
 
 ## Connection methods
 

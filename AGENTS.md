@@ -56,6 +56,28 @@ not call the slice complete.
   place, `scripts/method-counts.txt`, and `scripts/check-method-docs.sh` fails if
   a page and that file disagree in either direction. Editing a number in the
   page alone is the failure this gate exists to catch.
+- **A copy or an allocation claim is proved by pointer identity, not by
+  reading the code.** `frames_reuse_the_callers_buffers` is the model: assert
+  that the returned slice's pointer lies inside the caller's buffer, that the
+  buffer's own pointer does not move, and that its capacity does not grow. That
+  is what makes `user-space-copies-per-byte-written 1` a claim rather than an
+  intention, and it is the gate to copy when a rewrite claims it removed a
+  copy, a `memmove` or a per-record allocation. Two existing rows had the
+  weaker checker — an `Aes256Gcm` round trip that measures nothing about copies
+  — so the row is only as good as the test named beside it.
+- **A rewrite that trades one pass for another says so, with both numbers.**
+  The AEAD open path went from one fused ladder pass plus a staging buffer and a
+  scalar loop to two passes and no staging, and the honest line is
+  `keystream-passes-per-decrypt 2` beside `staging-bytes-per-decrypt 0`. Naming
+  the pass that got worse is what keeps a "removal" from being a relocation.
+- **Bit-identical means the block, byte and counter counts are unchanged too,
+  not only the output.** A rewrite that generates the same bytes with a
+  different number of keystream blocks, a different panic threshold, or a
+  different number of 16-byte Poly1305 absorbs has changed the method, not
+  tuned it. The differential sweep is the gate: `every_decrypt_matches_the_crate_it_replaces`
+  and `every_payload_length_and_address_survives_the_round_trip` open against
+  the pinned crate at every length and address family, and a forged tag has to
+  leave the buffer still encrypted.
 - `UNBLESSED` is the value for a count nobody has measured. It is a claim that
   is open, not a number, and it must never be quoted as one. `ops.yml` reports
   every symbol in `scripts/method-ops.txt` on each run; read that artefact before
@@ -63,7 +85,24 @@ not call the slice complete.
 - Name what was *not* removed. A page that lists only wins is not evidence, and
   the failures are the part a reader needs: rows that parse but are not dialled,
   a carrier refused by name, a benchmark gate that is an allocation count and not
-  a clock.
+  a clock. **A change that alters the bytes on the wire is not an optimisation,
+  however many syscalls it saves** — KCP sends one datagram per segment because
+  batching would change the datagram boundaries a peer sees, so it is named and
+  left alone. Name it the same way you name a refused carrier.
+- **Two worktrees share one `target-dir` on purpose, and that makes a bisect
+  lie.** `scripts/new-worktree.sh` points every worktree at one
+  `.ferrox-target` so dependencies compile once, so a `cargo test` can pick up an
+  artefact another worktree just rebuilt, and "this change broke the test" can be
+  an artefact of the rebuild rather than of the diff. When a bisect points at
+  something absurd — a one-line capacity change failing a loopback test — rerun
+  it with `CARGO_TARGET_DIR` of its own before believing it. And re-`git
+  checkout` is how a bisect throws work away: snapshot the files to `/tmp`
+  first, or take a patch against the base you started from.
+- **Rebase onto `main` before trusting a long session.** `main` moves under a
+  worktree; a `git checkout <file>` to bisect then silently reverts commits that
+  landed in the meantime, and the result looks exactly like your own regression.
+  Re-apply work as a patch (`diff` the base against your tree, `git apply` onto
+  the new tip) so a three-way overlap is a conflict rather than a lost hunk.
 - Rewrite, do not copy. No upstream line or test enters this tree — learn how
   the pinned implementations do it and write the smaller, cheaper thing.
 - Faster, safer, leaner, or it does not land. Counts prove, durations suggest.

@@ -62,6 +62,15 @@ compares the AEAD seals; neither is a clock. The clock is gate 3's ratio at
 every measured length plus `.github/workflows/parity.yml`'s `vmess-raw`
 scenario. No artefact from this branch has been read.
 
+The tag and the payload are both authenticated over the ciphertext, so this
+method's open path is the [`record-layer`](record-layer.md) open path: the tag is
+checked before any keystream exists and block one onward is xored into the
+frame buffer once. That is what `vmess user-space-copies-per-byte-written 1` and
+`vmess frame-buffer-allocations-per-relay-write 0` above are counting, and the
+Poly1305 rungs it shares — one absorb per padded section, no empty absorb at
+either end of a record, no head recursion into the dispatch on a 64-byte-aligned
+frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
+
 ## What we removed
 
 - **A frame buffer per relay write.** `frames_reuse_the_callers_buffers` is the

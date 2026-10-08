@@ -91,10 +91,8 @@ impl<'a> Addr<'a> {
 }
 
 fn fixed<const N: usize>(b: &[u8]) -> Option<[u8; N]> {
-    let head = b.get(..N)?;
-    let mut out = [0u8; N];
-    out.copy_from_slice(head);
-    Some(out)
+    let head: &[u8; N] = b.get(..N)?.try_into().ok()?;
+    Some(*head)
 }
 
 #[cfg(test)]

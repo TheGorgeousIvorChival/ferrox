@@ -176,16 +176,16 @@ impl Cipher {
         let nonce = self.nonce();
         let split = chunk.len() - TAG_LEN;
         let (body, tag) = chunk.split_at_mut(split);
-        let tag: [u8; TAG_LEN] = tag.try_into().ok()?;
+        let tag: &[u8; TAG_LEN] = (&*tag).try_into().ok()?;
         let opened: Option<()> = match &mut self.aead {
-            Aead::Aes128(cipher) => cipher.open_in_place(&nonce, b"", body, &tag).map(|_| ()),
-            Aead::Aes256(cipher) => cipher.open_in_place(&nonce, b"", body, &tag).map(|_| ()),
+            Aead::Aes128(cipher) => cipher.open_in_place(&nonce, b"", body, tag).map(|_| ()),
+            Aead::Aes256(cipher) => cipher.open_in_place(&nonce, b"", body, tag).map(|_| ()),
             Aead::ChaCha => {
-                chacha20_poly1305_decrypt_in_place(&self.key, &nonce, b"", body, &tag).map(|_| ())
+                chacha20_poly1305_decrypt_in_place(&self.key, &nonce, b"", body, tag).map(|_| ())
             }
             Aead::XChaCha => {
                 let (subkey, inner) = self.xpair();
-                chacha20_poly1305_decrypt_in_place(&subkey, &inner, b"", body, &tag).map(|_| ())
+                chacha20_poly1305_decrypt_in_place(&subkey, &inner, b"", body, tag).map(|_| ())
             }
         };
         opened?;

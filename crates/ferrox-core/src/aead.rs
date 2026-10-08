@@ -25,10 +25,7 @@ pub fn chacha20_poly1305_seal_in_place_unfused(
 fn mac(state: &mut Poly1305, aad: &[u8], ciphertext: &[u8]) {
     for section in [aad, ciphertext] {
         state.update(section);
-        let slack = (16 - section.len() % 16) % 16;
-        if slack != 0 {
-            state.update(&[0u8; 16][..slack]);
-        }
+        state.pad_to_block();
     }
     let mut lengths = [0u8; 16];
     lengths[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
@@ -59,14 +56,9 @@ pub fn chacha20_poly1305_decrypt_in_place(
     buf: &mut [u8],
     tag: &[u8; 16],
 ) -> Option<usize> {
-    // block zero is the one-time key and block one the first body block: one pass
-    // writes both, into the head and into a staging buffer the tag must clear first
-    let mut one_time = [0u8; 32];
-    let mut staged = [0u8; 64];
-    let first = buf.len().min(staged.len());
-    fill_exact_with_head(key, nonce, 0, &mut one_time, &mut staged[..first]);
-
-    let mut state = Poly1305::new(&one_time);
+    // Poly1305 authenticates the ciphertext, so the tag is checked before any
+    // keystream exists: block one onward xors into the caller's buffer once.
+    let mut state = Poly1305::new(&poly_key(key, nonce));
     mac(&mut state, aad, buf);
     let want = state.finish();
 
@@ -78,13 +70,7 @@ pub fn chacha20_poly1305_decrypt_in_place(
         return None;
     }
 
-    let (staged_body, rest) = buf.split_at_mut(first);
-    for (byte, keystream) in staged_body.iter_mut().zip(staged.iter()) {
-        *byte ^= keystream;
-    }
-    if !rest.is_empty() {
-        fill_exact(key, nonce, 2, rest);
-    }
+    fill_exact(key, nonce, 1, buf);
     Some(buf.len())
 }
 
@@ -198,6 +184,76 @@ mod tests {
             }
         }
         assert!(checked > 5_000, "the sweep should be dense, not a sample");
+    }
+
+    #[test]
+    fn every_decrypt_matches_the_crate_it_replaces() {
+        let keys = [
+            std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
+            std::array::from_fn(|i| (i as u8).wrapping_mul(97).wrapping_add(29)),
+        ];
+        let mut checked = 0usize;
+        for key in &keys {
+            for nonce in [[0u8; 12], [0xa7u8; 12], [0xffu8; 12]] {
+                for aad_len in [0usize, 1, 15, 16, 17, 64] {
+                    let aad: Vec<u8> = (0..aad_len).map(|i| i as u8).collect();
+                    for len in (0..=300usize).chain([511, 512, 513, 1024, 4095, 4096, 8192]) {
+                        let plain: Vec<u8> = (0..len)
+                            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+                            .collect();
+                        let mut sealed = plain.clone();
+                        let tag = chacha20_poly1305_seal_in_place(key, &nonce, &aad, &mut sealed);
+
+                        let want = {
+                            let cipher = ChaCha20Poly1305::new_from_slice(key).expect("key");
+                            let mut ct = sealed.clone();
+                            cipher
+                                .decrypt_in_place_detached(
+                                    Nonce::from_slice(&nonce),
+                                    &aad,
+                                    &mut ct,
+                                    (&tag).into(),
+                                )
+                                .expect("the crate opens what it sealed");
+                            ct
+                        };
+
+                        let mut opened = sealed.clone();
+                        assert_eq!(
+                            chacha20_poly1305_decrypt_in_place(
+                                key,
+                                &nonce,
+                                &aad,
+                                &mut opened,
+                                &tag
+                            ),
+                            Some(len),
+                            "aad {aad_len} len {len}"
+                        );
+                        assert_eq!(opened, want, "plaintext: aad {aad_len} len {len}");
+                        assert_eq!(opened, plain, "round trip: aad {aad_len} len {len}");
+
+                        let mut bad = tag;
+                        bad[len % 16] ^= 0x80;
+                        let mut refused = sealed.clone();
+                        assert_eq!(
+                            chacha20_poly1305_decrypt_in_place(
+                                key,
+                                &nonce,
+                                &aad,
+                                &mut refused,
+                                &bad
+                            ),
+                            None,
+                            "a forged tag at aad {aad_len} len {len}"
+                        );
+                        assert_eq!(refused, sealed, "a refused tag must not decrypt");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 6_000, "the sweep should be dense, not a sample");
     }
 
     #[test]

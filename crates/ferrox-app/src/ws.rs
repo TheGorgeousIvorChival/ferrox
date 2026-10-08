@@ -30,14 +30,26 @@ fn fresh_key() -> Option<String> {
     Some(ferrox_core::b64::encode(&raw))
 }
 
+/// Four lanes per pass, so a 64-byte stride is a multiple of the 4-byte mask:
+/// byte `i` of a chunk takes `mask[i & 3]` exactly as the 16-byte stride did,
+/// and the loop overhead per byte falls fourfold at the same vector op count.
 fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
-    let wide = [
+    let lane = [
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3], mask[0], mask[1],
         mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
     ];
-    let (chunks, tail) = buf.as_chunks_mut::<16>();
+    let mut wide = [0u8; 64];
+    let (quarters, _) = wide.as_chunks_mut::<16>();
+    for quarter in quarters {
+        *quarter = lane;
+    }
+    let (chunks, tail) = buf.as_chunks_mut::<64>();
+    let (keys, _) = wide.as_chunks::<16>();
     for chunk in chunks {
-        xor_block(chunk, &wide);
+        let (quarters, _) = chunk.as_chunks_mut::<16>();
+        for (quarter, key) in quarters.iter_mut().zip(keys) {
+            xor_block(quarter, key);
+        }
     }
     for (i, byte) in tail.iter_mut().enumerate() {
         *byte ^= mask[i & 3];
@@ -156,7 +168,7 @@ impl<R: Read> WsReader<R> {
         }
         let room = READ_AHEAD.max(len);
         if self.have.capacity() - self.have.len() < room {
-            self.have.reserve_exact(room);
+            self.have.reserve(room);
         }
         let base = self.have.len();
         unsafe {
@@ -503,7 +515,8 @@ mod tests {
     #[test]
     fn mask_chunks_match_the_byte_loop() {
         for len in [
-            0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 255, 1024, 8192,
+            0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 255, 1024,
+            8192,
         ] {
             for mask in [[0u8, 0, 0, 0], [1, 2, 3, 4], [0xFF, 0x00, 0xA5, 0x5A]] {
                 let plain: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();

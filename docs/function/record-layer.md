@@ -34,6 +34,12 @@ graph TD
     G -- yes --> C
     G -- no --> H["8→4→2→1 tail ladder,<br/>then a scalar last block"]
     H --> I(("buffer, in place, nothing discarded"))
+    J["decrypt_in_place, len bytes"] --> K["poly_key: block 0 only,<br/>32 bytes, no body"]
+    K --> L["Poly1305 over the ciphertext<br/>pad_to_block per section"]
+    L --> M{"tag matches?"}
+    M -- no --> N(("caller's buffer,<br/>still ciphertext, no keystream written"))
+    M -- yes --> O["fill_exact from block 1,<br/>into the caller's buffer"]
+    O --> P(("plaintext, in place,<br/>no staging buffer"))
 ```
 
 ## Measured
@@ -49,6 +55,17 @@ graph TD
 | blocks-per-iteration | 8 | ferrox-core-chacha::backend |
 | fused-head-blocks | 1 | ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted |
 | backends-a-differential-test-cannot-lie-to | 4 | ferrox-bench-gate-1 |
+| keystream-blocks-per-decrypt | 1+ceil(len/64) | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
+
+| staging-bytes-per-decrypt | 0 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
+
+| keystream-passes-per-decrypt | 2 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
+
+| padded-sections-through-a-second-update | 0 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
+
+| padded-sections-per-mac | 2 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
+
+| empty-absorbs-per-record | 0 | ferrox-core-poly1305::tests::byte_at_a_time_matches_one_shot |
 <!-- counts:end -->
 
 ## Ops
@@ -89,14 +106,62 @@ branch has been read.
   a `vec![0; len]` that the caller then overwrites, both fail that gate — which
   is the same finding Zray recorded in its own hot-path allocator gate, where
   `vec![0u8; n]` "zeroes up to 64 KiB that the read then overwrites".
-- **The Poly1305 padding as a second absorb.** `aead::mac` pads each of the AAD
-  and ciphertext sections to a 16-byte boundary by calling `update` again with
-  up to 15 zero bytes, so a section that is already a multiple of 16 costs a
-  call with an empty slice and a section that is not costs a second absorb over
-  the padding. Upstream does the same thing — Xray's `poly1305.Write` in
-  `common/crypto/poly1305.go` and Zray's `chacha20poly1305.rs:47-60` both pad
-  by absorbing zeros — so this is a shared cost, not a place where this tree is
-  behind. It is named here rather than claimed as a win.
+- **The 64-byte staging buffer every open used to carry.** A ChaCha20-Poly1305
+  open has to authenticate the *ciphertext*, so it cannot decrypt before the tag
+  is checked and it cannot check the tag after the buffer holds plaintext. The
+  way out is that Poly1305 needs no keystream at all: `aead.rs` now derives the
+  one-time key, authenticates the ciphertext in place, compares the tag, and
+  only then calls `fill_exact(key, nonce, 1, buf)`. The old shape generated the
+  first 64 bytes of body keystream into a `[u8; 64]` on the stack, XORed them
+  back into the caller's buffer with a 64-iteration scalar loop, and then called
+  `fill_exact(key, nonce, 2, rest)` for the tail. Three things went with it: the
+  staging buffer and its zero-fill, the scalar loop, and the split. The block
+  count is identical at every length (`1 + ceil(len/64)` before and after) and
+  the panic threshold is identical, because `fill_exact_with_head` on a 64-byte
+  head plus `fill_exact` from block 2 on the tail already cost two passes. This
+  is the order `aesgcm::open_impl` in this same tree has always used — GHASH
+  over the ciphertext, verify, then CTR — so the AEADs no longer disagree about
+  when plaintext appears. The 6 000-case sweep
+  `aead::tests::every_decrypt_matches_the_crate_it_replaces` is what proves the
+  reorder is byte-identical: it opens with the `chacha20poly1305` crate and
+  compares, and it also checks that a forged tag leaves the buffer encrypted.
+- **A second `update` and a wasted `absorb(&[])` per padded section.**
+  `Poly1305::pad_to_block` zeroes `buffer` up to a block and absorbs it in one
+  call, replacing `update(&[0u8; 16][..slack])`, which cost a call, a `min`, two
+  bounds checks and a *dynamically sized* `memcpy` for 1..15 bytes. Padding
+  cannot move into `update` itself — `update` cannot know it is last, and
+  `several_updates_are_one_run` and `byte_at_a_time_matches_one_shot` are what
+  hold that contract — so it is a named method rather than a changed semantic.
+  Upstream pads the same way (Xray's `poly1305.Write` in
+  `common/crypto/poly1305.go` absorbs zeros; Zray's `chacha20poly1305.rs:47-60`
+  does the same), so this is the first place in this file where the gap is
+  ours rather than shared.
+- **The empty `absorb` at both ends of every record.** `Poly1305::update` called
+  `absorb(&data[..whole])` and copied `rest` even when `whole` was zero and
+  `rest` was empty, which is exactly the shape of every padding call: a dispatch,
+  three length compares, eight loads of `r`/`s`/`h`, three stores and a call,
+  for no bytes. `update` now guards both, and both 4-lane ladders call
+  `absorb_one_block_chain` directly instead of recursing through `absorb` when
+  the head is zero blocks — which is every 64-byte-aligned record, so every
+  8 KiB VMess frame on the AVX2 and NEON-4 rungs.
+
+
+What is **not** removed, and is named rather than claimed:
+
+- **There is no 512-byte NEON rung, and two tests read as if there were.**
+  `NEON_THRESHOLD_BYTES` and `absorb_neon` are both `#[cfg(all(test,
+  target_arch = "aarch64"))]`, so the 512-byte rung exists only under the test
+  harness — but `every_threshold_reaches_the_same_tag_from_both_sides` sweeps it
+  as a shipping threshold and `the_neon_halves_are_the_three_limbs_at_every_length_around_the_threshold`
+  gates on it. A reader of those two tests believes a shorter aarch64 rung ships.
+  It does not. The shipping ladders are `{128 stride-2, 1024 two-lane, 4096
+  NEON-4}` on aarch64 and `{128 stride-2, 4096 AVX2}` on x86_64, so any page
+  that quotes a threshold has to say which architecture it means.
+- **`ops-retired-instructions` is still `UNBLESSED` on every page.** One symbol
+  in this repository carries a blessed exact count, `der_to_pem`. The removed
+  operations named above are counted in the table — copies, allocations, passes,
+  blocks, absorbs — but the retired-instruction figure for each is not measured,
+  so no page states one.
 
 ## Pins
 

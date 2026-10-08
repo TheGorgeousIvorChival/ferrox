@@ -317,10 +317,27 @@ impl Poly1305 {
             self.held = 0;
         }
         let whole = data.len() / 16 * 16;
-        self.absorb(&data[..whole], HIBIT);
+        if whole > 0 {
+            self.absorb(&data[..whole], HIBIT);
+        }
         let rest = &data[whole..];
-        self.buffer[..rest.len()].copy_from_slice(rest);
-        self.held = rest.len();
+        if !rest.is_empty() {
+            self.buffer[..rest.len()].copy_from_slice(rest);
+            self.held = rest.len();
+        }
+        debug_assert_eq!(self.held, rest.len(), "an empty tail leaves `held` at zero");
+    }
+
+    /// Zero-pads `buffer` up to a whole block and absorbs it, so a padded
+    /// section costs one block instead of a second `update` and its merge.
+    pub fn pad_to_block(&mut self) {
+        if self.held == 0 {
+            return;
+        }
+        self.buffer[self.held..].fill(0);
+        let block = self.buffer;
+        self.absorb(&block, HIBIT);
+        self.held = 0;
     }
 
     #[must_use]
@@ -605,7 +622,12 @@ impl Poly1305 {
         let n = data.len() / 16;
         let e = n % 4;
 
-        self.absorb(&data[..e * 16], HIBIT);
+        // A block count that is a multiple of four needs no head: the rungs
+        // below only ever recurse into the one-block chain, and asking it for
+        // an empty slice costs a dispatch, eight loads and three stores.
+        if e > 0 {
+            self.absorb_one_block_chain(&data[..e * 16], HIBIT);
+        }
 
         let r26 = to_26([self.r0, self.r1, self.r2]);
         let powers = powers4(&r26);
@@ -717,7 +739,12 @@ impl Poly1305 {
         let n = data.len() / 16;
         let e = n % 4;
 
-        self.absorb(&data[..e * 16], HIBIT);
+        // A block count that is a multiple of four needs no head: the rungs
+        // below only ever recurse into the one-block chain, and asking it for
+        // an empty slice costs a dispatch, eight loads and three stores.
+        if e > 0 {
+            self.absorb_one_block_chain(&data[..e * 16], HIBIT);
+        }
 
         let r26 = to_26([self.r0, self.r1, self.r2]);
         let powers = powers4(&r26);
