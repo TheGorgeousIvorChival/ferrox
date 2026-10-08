@@ -207,13 +207,9 @@ fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     }
 }
 
-// The rung a dial starts at: the configured carrier, or the ladder's when it has climbed past it.
-fn ladder_start(ladder: &Ladder, carrier: &Carrier) -> Rung {
-    let start = ladder.start_rung();
-    match rung_of(carrier) {
-        Some(configured) if start < configured => configured,
-        _ => start,
-    }
+// The rung a dial starts at: the carrier this server was configured for, or Raw when it is off the ladder.
+fn ladder_start(carrier: &Carrier) -> Rung {
+    rung_of(carrier).unwrap_or(Rung::Raw)
 }
 
 static FATAL_DIALS: AtomicU64 = AtomicU64::new(0);
@@ -1694,7 +1690,7 @@ fn dial_vless(
             return;
         }
     }
-    let start = ladder_start(ladder, &vless.carrier);
+    let start = ladder_start(&vless.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -2746,7 +2742,7 @@ fn dial_vmess(
             return;
         }
     }
-    let start = ladder_start(ladder, &vmess.carrier);
+    let start = ladder_start(&vmess.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -2909,7 +2905,7 @@ fn dial_trojan(
             return;
         }
     }
-    let start = ladder_start(ladder, &trojan.carrier);
+    let start = ladder_start(&trojan.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -3222,7 +3218,7 @@ fn dial_shadowsocks(
             return;
         }
     }
-    let start = ladder_start(ladder, &ss.carrier);
+    let start = ladder_start(&ss.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -9845,7 +9841,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                ladder_start(&ladder, &carrier),
+                ladder_start(&carrier),
                 want,
                 "{carrier:?} lost the first rung to the ladder"
             );
