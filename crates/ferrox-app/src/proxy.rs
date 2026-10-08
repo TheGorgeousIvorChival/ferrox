@@ -6787,6 +6787,44 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     None
 }
 
+/// Mints one proxy pass from the account in the config and stores it for legs
+/// that must not sign in again: one login per job, not one per carrier, which
+/// is what the account plane's rate limit counts.
+pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
+    let text = std::fs::read_to_string(config)
+        .unwrap_or_else(|error| exit(&format!("cannot read {config}: {error}")));
+    let root = crate::json::parse(&text)
+        .unwrap_or_else(|error| exit(&format!("bad config {config}: {error}")));
+    let Some(foxy) = find_foxy_outbound(&root) else {
+        exit("no foxy outbound with an email or a pass in {config}");
+    };
+    let token = foxy.account.as_ref().map(|account| account.current());
+    let Some(pass) = token else {
+        exit("the account did not sign in, so there is no pass to store");
+    };
+    if pass.token.is_empty() {
+        exit("the account did not sign in, so there is no pass to store");
+    }
+    let mut stored = String::with_capacity(pass.token.len() + 12);
+    stored.push_str("{\"pass\":\"");
+    for byte in pass.token.bytes() {
+        if byte == b'"' || byte == b'\\' {
+            stored.push('\\');
+        }
+        stored.push(byte as char);
+    }
+    stored.push_str("\"}");
+    std::fs::write(out, stored)
+        .unwrap_or_else(|error| exit(&format!("cannot write {out}: {error}")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("minted=1 expires_at={:?}", pass.expires_at);
+    std::process::exit(0);
+}
+
 fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
     let empty = Vec::new();
     let outbounds = root

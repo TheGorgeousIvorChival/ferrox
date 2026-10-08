@@ -28,6 +28,8 @@ fn usage() -> ! {
     eprintln!("  ferrox-app version                print the serving binary's version");
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
+    eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
+    eprintln!("                                sign in once, store the proxy pass (0600)");
     std::process::exit(2);
 }
 
@@ -140,6 +142,22 @@ fn main() {
                 usage();
             }
             proxy::print_version();
+        }
+        "mint-foxy-pass" => {
+            let next = args.next().unwrap_or_else(|| usage());
+            if next != "-c" && next != "-config" {
+                usage();
+            }
+            let config = args.next().unwrap_or_else(|| usage());
+            let flag = args.next().unwrap_or_else(|| usage());
+            if flag != "-o" {
+                usage();
+            }
+            let out = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            proxy::mint_foxy_pass(&config, &out);
         }
         "x25519" => {
             if args.next().is_some() {

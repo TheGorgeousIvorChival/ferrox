@@ -16,7 +16,9 @@ name: Foxy relay (live download check)
 # Needs repository secrets like foxy-live.yml does: FOXY_EMAIL and FOXY_PASS
 # (or USERNAME and PASSWORD). Without them the job skips cleanly. Quota cost
 # is ~1 MB per download leg, so this fires on lane changes and on demand, not
-# per push. Every shell here is `bash` with portable helpers only: no
+# per push. Sign-in happens once per job (`mint-foxy-pass`): the account plane
+# answers 429 to rapid repeat logins, so legs dial with the minted pass and
+# never print it. Every shell here is `bash` with portable helpers only: no
 # `timeout(1)`, no `/dev/tcp`, no `sha256sum`, no `xxd` — none of those exist
 # on all three runners.
 on:
@@ -73,11 +75,28 @@ jobs:
       - name: Build ferrox-app
         if: steps.secrets.outputs.present == 'true'
         run: cargo build --locked -p ferrox-app
-      - name: Download 1 MB through every carrier
+      # One login per job, not one per leg: the account plane rate-limits
+      # rapid sign-ins (429), and every leg after the first would fail with a
+      # pass that was never minted. Legs below dial with this pass and never
+      # print it; the file stays out of every artifact.
+      - name: Mint the proxy pass once
         if: steps.secrets.outputs.present == 'true'
         env:
           FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
           FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_CODE: ${{ secrets.FOXY_CODE }}
+          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+        run: |
+          BIN=target/debug/ferrox-app
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          python3 -c 'import json,os; doc={"inbounds":[],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"code":os.environ.get("FOXY_CODE",""),"country":os.environ["FOXY_COUNTRY"],"carrier":"h2"}}]}; json.dump(doc, open("foxy-mint.json","w"))'
+          chmod 600 foxy-mint.json
+          "$BIN" mint-foxy-pass -c foxy-mint.json -o foxy-pass.json
+          chmod 600 foxy-pass.json
+          rm -f foxy-mint.json
+      - name: Download 1 MB through every carrier
+        if: steps.secrets.outputs.present == 'true'
+        env:
           FOXY_COUNTRY: ${{ inputs.country || 'US' }}
           FOXY_DEBUG: 1
         run: |
@@ -118,7 +137,7 @@ jobs:
           : > ferrox-relay.log
           for carrier in h1 h2 h3 auto; do
             echo "== carrier $carrier =="
-            CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
+            CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
             echo "$!" > ferrox-relay.pid
@@ -161,8 +180,6 @@ jobs:
         # names its leg.
         if: steps.secrets.outputs.present == 'true' && matrix.os == 'ubuntu-latest'
         env:
-          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
-          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
           FOXY_COUNTRY: ${{ inputs.country || 'US' }}
           FOXY_DEBUG: 1
         run: |
@@ -197,7 +214,7 @@ jobs:
             rm -f ferrox-relay.pid
           }
           start_lane() {
-            FRONT="$1" COUNTRY="$2" CARRIER="$3" PORT="$PORT" python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
+            FRONT="$1" COUNTRY="$2" CARRIER="$3" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
             echo "$!" > ferrox-relay.pid
