@@ -352,6 +352,7 @@ struct VlessOut {
     mux: bool,
     quic_roots: Option<Vec<Vec<u8>>>,
     hysteria_roots: Option<Vec<Vec<u8>>>,
+    tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
 macro_rules! refused_carriers {
@@ -391,6 +392,7 @@ struct VmessOut {
     cipher: crate::vmess::Cipher,
     carrier: Carrier,
     host: String,
+    tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -400,6 +402,7 @@ struct TrojanOut {
     key: [u8; 56],
     carrier: Carrier,
     host: String,
+    tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1651,6 +1654,10 @@ fn dial_vless(
     ladder: &Ladder,
 ) {
     let header = vless_header(&vless.id, 1, target);
+    if let Some(cfg) = vless.tls.as_deref() {
+        dial_vless_tls(client, server, cfg, &header);
+        return;
+    }
     let params = stream_params(&vless.carrier);
     let explicit = rung_of(&vless.carrier);
     if explicit.is_none() {
@@ -2700,6 +2707,10 @@ fn dial_vmess(
     target: &SocketAddr,
     ladder: &Ladder,
 ) {
+    if let Some(cfg) = vmess.tls.as_deref() {
+        dial_vmess_tls(client, server, cfg, &vmess.id, vmess.cipher, target);
+        return;
+    }
     let params = stream_params(&vmess.carrier);
     let explicit = rung_of(&vmess.carrier);
     if explicit.is_none() {
@@ -2859,6 +2870,10 @@ fn dial_trojan(
     ladder: &Ladder,
 ) {
     let header = trojan_header(&trojan.key, 1, target);
+    if let Some(cfg) = trojan.tls.as_deref() {
+        dial_trojan_tls(client, server, cfg, &header);
+        return;
+    }
     let params = stream_params(&trojan.carrier);
     let explicit = rung_of(&trojan.carrier);
     if explicit.is_none() {
@@ -2994,6 +3009,175 @@ fn dial_trojan_rung(
             true
         }
     }
+}
+
+// TLS is one attempt with no ladder walk: climbing to plaintext would send what the config asked to encrypt.
+fn tls_failure(error: &ferrox_core::tls::TlsError) -> Failure {
+    use ferrox_core::tls::TlsError as Tls;
+    match error {
+        Tls::BadCertificate => Failure::new(Stage::SocketConnected, Kind::Rejected),
+        Tls::Timeout => Failure::new(Stage::SocketConnected, Kind::Unreachable),
+        Tls::Closed | Tls::NoSharedCipher | Tls::Other(_) => {
+            Failure::new(Stage::SocketConnected, Kind::Dropped)
+        }
+    }
+}
+
+fn dial_tls_session(
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<ferrox_core::tls::RustlsProvider<TcpStream>> {
+    let uplink = match dial(server) {
+        Ok(uplink) => uplink,
+        Err(failure) => {
+            note_dial_failure(server, failure);
+            return None;
+        }
+    };
+    let Ok(mut session) = ferrox_core::tls::RustlsProvider::connect(cfg, uplink) else {
+        note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+        return None;
+    };
+    if let Err(error) = session.handshake() {
+        note_dial_failure(server, tls_failure(&error));
+        return None;
+    }
+    // The relay shares the session behind a lock, so reads cycle on the same timeout the server role sets.
+    if session
+        .get_ref()
+        .set_read_timeout(Some(RELAY_POLL))
+        .is_err()
+    {
+        note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+        return None;
+    }
+    Some(session)
+}
+
+// One session, two owners: the pump takes a reader and a writer, and a TLS session cannot split.
+#[derive(Clone)]
+struct TlsHalf {
+    session: Arc<Mutex<ferrox_core::tls::RustlsProvider<TcpStream>>>,
+}
+
+impl Read for TlsHalf {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            return match self.locked_read(buf) {
+                Err(error) if is_timeout(&error) => continue,
+                outcome => outcome,
+            };
+        }
+    }
+}
+
+impl TlsHalf {
+    fn locked_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        session.read(buf)
+    }
+}
+
+impl Write for TlsHalf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        session.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        session.flush()
+    }
+}
+
+fn dial_vless_tls(
+    client: &TcpStream,
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::TlsConfig,
+    header: &[u8],
+) {
+    let Some(mut session) = dial_tls_session(server, cfg) else {
+        return;
+    };
+    if session.write_all(header).is_err() {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    if read_vless_response(&mut session).is_none() {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    let Ok(downstream) = client.try_clone() else {
+        return;
+    };
+    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    relay_stream(downstream, session);
+}
+
+fn dial_trojan_tls(
+    client: &TcpStream,
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::TlsConfig,
+    header: &[u8],
+) {
+    let Some(mut session) = dial_tls_session(server, cfg) else {
+        return;
+    };
+    let Ok(downstream) = client.try_clone() else {
+        return;
+    };
+    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    if session.write_all(header).is_err() {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    relay_stream(downstream, session);
+}
+
+fn dial_vmess_tls(
+    client: &TcpStream,
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::TlsConfig,
+    id: &[u8; 16],
+    cipher: crate::vmess::Cipher,
+    target: &SocketAddr,
+) {
+    let Some(mut session) = dial_tls_session(server, cfg) else {
+        return;
+    };
+    let Ok(raw) = session.get_ref().try_clone() else {
+        return;
+    };
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        crate::vmess::client_request(id, cipher, target, 1)
+    else {
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+    };
+    if session.write_all(&request).is_err() {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    let shared = Arc::new(Mutex::new(session));
+    let reader = TlsHalf {
+        session: Arc::clone(&shared),
+    };
+    let writer = TlsHalf { session: shared };
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = raw.shutdown(Shutdown::Both);
+    });
+    crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
 }
 
 fn dial_shadowsocks(
@@ -3697,13 +3881,15 @@ fn serve_socks_udp(mut client: TcpStream, out: &Outbound) {
     };
     let _associate = client;
     match out {
-        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Raw) => {
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Raw) && vless.tls.is_none() => {
             serve_socks_udp_vless(&relay, vless);
         }
-        Outbound::Trojan(trojan) if matches!(trojan.carrier, Carrier::Raw) => {
+        Outbound::Trojan(trojan)
+            if matches!(trojan.carrier, Carrier::Raw) && trojan.tls.is_none() =>
+        {
             serve_socks_udp_trojan(&relay, trojan);
         }
-        Outbound::Vmess(vmess) if matches!(vmess.carrier, Carrier::Raw) => {
+        Outbound::Vmess(vmess) if matches!(vmess.carrier, Carrier::Raw) && vmess.tls.is_none() => {
             serve_socks_udp_vmess(&relay, vmess);
         }
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw) => {
@@ -5649,6 +5835,19 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
         let port = server.get("port").and_then(Json::as_port)?;
         let password = server.get("password").and_then(Json::as_str)?;
         let key = trojan_key(password);
+        if let Some((host, tls)) = raw_tls_parts(outbound, &address) {
+            return Some(TrojanOut {
+                address,
+                port,
+                key,
+                carrier: Carrier::Raw,
+                host,
+                tls: Some(tls),
+            });
+        }
+        if !matches!(stream_security(outbound), "" | "none") {
+            continue;
+        }
         let (carrier, host) = outbound_carrier(outbound, &address);
         return Some(TrojanOut {
             address,
@@ -5656,6 +5855,7 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
             key,
             carrier,
             host,
+            tls: None,
         });
     }
     None
@@ -5721,9 +5921,6 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             .and_then(Json::as_str)
             == Some("quic")
             && security == "tls";
-        if !vless_security_supported(security) && !quic_tls {
-            continue;
-        }
         let address = server.get("address").and_then(Json::as_str)?.to_owned();
         let port = server.get("port").and_then(Json::as_port)?;
         let id = server
@@ -5733,11 +5930,31 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             .and_then(|user| user.get("id"))
             .and_then(Json::as_str)
             .and_then(uuid_bytes)?;
-        let (carrier, host) = outbound_carrier(outbound, &address);
         let mux = matches!(
             outbound.get("mux").and_then(|mux| mux.get("enabled")),
             Some(Json::Bool(true))
         );
+        // Mux frames ride above the session, so mux over TLS needs its own dial and stays refused.
+        if security == "tls" && !quic_tls && !mux {
+            let Some((host, tls)) = raw_tls_parts(outbound, &address) else {
+                continue;
+            };
+            return Some(VlessOut {
+                address,
+                port,
+                id,
+                carrier: Carrier::Raw,
+                host,
+                mux,
+                quic_roots: None,
+                hysteria_roots: None,
+                tls: Some(tls),
+            });
+        }
+        if !vless_security_supported(security) && !quic_tls {
+            continue;
+        }
+        let (carrier, host) = outbound_carrier(outbound, &address);
         let quic_roots = match &carrier {
             Carrier::Quic => tls_ca_roots(outbound),
             _ => None,
@@ -5755,6 +5972,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             mux,
             quic_roots,
             hysteria_roots,
+            tls: None,
         });
     }
     None
@@ -5774,6 +5992,21 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 .and_then(Json::as_str)
                 .unwrap_or("auto"),
         );
+        if let Some((host, tls)) = raw_tls_parts(outbound, &address) {
+            return Some(VmessOut {
+                address,
+                port,
+                id,
+                cipher,
+                carrier: Carrier::Raw,
+                host,
+                tls: Some(tls),
+            });
+        }
+        // A security the tree cannot dial is refused, never silently sent plain.
+        if !matches!(stream_security(outbound), "" | "none") {
+            return None;
+        }
         let (carrier, host) = outbound_carrier(outbound, &address);
         return Some(VmessOut {
             address,
@@ -5782,6 +6015,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             cipher,
             carrier,
             host,
+            tls: None,
         });
     }
     None
@@ -5796,6 +6030,84 @@ fn tls_ca_roots(outbound: &Json) -> Option<Vec<Vec<u8>>> {
         .and_then(|path| std::fs::read(path).ok())
         .map(|pem| crate::quic::parse_ca_pem(&pem))
         .filter(|roots| !roots.is_empty())
+}
+
+fn tls_alpn(settings: Option<&Json>) -> Vec<Vec<u8>> {
+    let Some(alpn) = settings.and_then(|s| s.get("alpn")) else {
+        return Vec::new();
+    };
+    if let Some(single) = alpn.as_str() {
+        if single.is_empty() {
+            return Vec::new();
+        }
+        return vec![single.as_bytes().to_vec()];
+    }
+    let Some(items) = alpn.as_arr() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_bytes().to_vec())
+        .collect()
+}
+
+fn outbound_tls(outbound: &Json, address: &str) -> Option<Arc<ferrox_core::tls::TlsConfig>> {
+    let settings = outbound.get("streamSettings")?;
+    if settings.get("security").and_then(Json::as_str) != Some("tls") {
+        return None;
+    }
+    let tls = settings.get("tlsSettings");
+    if matches!(
+        tls.and_then(|s| s.get("allowInsecure")),
+        Some(Json::Bool(true))
+    ) {
+        return None;
+    }
+    let server_name = tls
+        .and_then(|s| s.get("serverName"))
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(address)
+        .to_owned();
+    if server_name.is_empty() {
+        return None;
+    }
+    let alpn = tls_alpn(tls);
+    let system_only = !matches!(
+        tls.and_then(|s| s.get("disableSystemRoot")),
+        Some(Json::Bool(true))
+    );
+    let roots = tls_ca_roots(outbound).or_else(|| {
+        system_only
+            .then(crate::quic::system_roots)
+            .filter(|r| !r.is_empty())
+    })?;
+    if roots.is_empty() {
+        return None;
+    }
+    Some(Arc::new(ferrox_core::tls::TlsConfig {
+        server_name,
+        alpn,
+        roots,
+        pins: ferrox_core::foxy::pin::Pins::default(),
+    }))
+}
+
+// Raw over TLS only; carried TLS keeps the wrong layer order (P31), so those rows stay refused.
+fn raw_tls_parts(
+    outbound: &Json,
+    address: &str,
+) -> Option<(String, Arc<ferrox_core::tls::TlsConfig>)> {
+    if stream_security(outbound) != "tls" {
+        return None;
+    }
+    let (carrier, host) = outbound_carrier(outbound, address);
+    if !matches!(carrier, Carrier::Raw) {
+        return None;
+    }
+    outbound_tls(outbound, address).map(|tls| (host, tls))
 }
 
 fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
@@ -7055,6 +7367,305 @@ mod tests {
     }
 
     #[test]
+    fn vless_tls_outbound_parses_raw_and_refuses_the_rest() {
+        let (ca, ca_json) = stage_ca_pem("vless-tls");
+        let tls_tcp = format!(
+            r#""network": "tcp", "security": "tls", "tlsSettings": {{"serverName": "tls.test", "caCertFile": "{ca_json}", "alpn": ["h2"]}}"#
+        );
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                "streamSettings": {{{tls_tcp}}}}}]}}"#
+        ))
+        .expect("parses");
+        let out = find_vless_outbound(&root).expect("finds raw tls");
+        assert!(matches!(out.carrier, Carrier::Raw));
+        let tls = out.tls.expect("carries tls");
+        assert_eq!(tls.server_name, "tls.test");
+        assert_eq!(tls.alpn, vec![b"h2".to_vec()]);
+        assert_eq!(tls.roots.len(), 1);
+        for settings in [
+            format!(
+                r#""network": "ws", "security": "tls", "wsSettings": {{"path": "/w"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            ),
+            format!(
+                r#""network": "tcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}", "allowInsecure": true}}"#
+            ),
+        ] {
+            let root = crate::json::parse(&format!(
+                r#"{{"outbounds": [{{"protocol": "vless",
+                    "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                        "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                    "streamSettings": {{{settings}}}}}]}}"#
+            ))
+            .expect("parses");
+            assert!(find_vless_outbound(&root).is_none(), "{settings}");
+        }
+        let muxed = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless", "mux": {{"enabled": true}},
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                "streamSettings": {{{tls_tcp}}}}}]}}"#
+        ))
+        .expect("parses");
+        assert!(find_vless_outbound(&muxed).is_none());
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn trojan_tls_outbound_parses_raw_and_refuses_the_rest() {
+        let (ca, ca_json) = stage_ca_pem("trojan-tls");
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let out = find_trojan_outbound(&root).expect("finds raw tls");
+        assert!(matches!(out.carrier, Carrier::Raw));
+        let tls = out.tls.expect("carries tls");
+        assert_eq!(tls.server_name, "127.0.0.1");
+        let carried = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{"network": "ws", "security": "tls",
+                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        assert!(find_trojan_outbound(&carried).is_none());
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "trojan",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_trojan_outbound(&plain).expect("finds plain");
+        assert!(out.tls.is_none());
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn vmess_tls_outbound_parses_raw_and_refuses_the_rest() {
+        let (ca, ca_json) = stage_ca_pem("vmess-tls");
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "security": "auto"}}]}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"serverName": "tls.test", "caCertFile": "{ca_json}"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let out = find_vmess_outbound(&root).expect("finds raw tls");
+        assert!(matches!(out.carrier, Carrier::Raw));
+        assert!(out.tls.is_some());
+        let carried = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                "streamSettings": {{"network": "ws", "security": "tls",
+                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        assert!(find_vmess_outbound(&carried).is_none());
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&plain).expect("finds plain");
+        assert!(out.tls.is_none());
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn vless_over_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x44u8; 16];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            tls.write_all(&[0, 0]).expect("answers");
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            tls.write_all(&buf).expect("echoes");
+        });
+        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw,
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+            };
+            dial_vless(&client, &server, &vless, &target, Ladder::global());
+        });
+        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        sock.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn trojan_over_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let key = trojan_key("an-example-shared-password");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((cmd, _target)) = decode_trojan_request(&mut tls, &key) else {
+                panic!("reads a trojan header");
+            };
+            assert_eq!(cmd, 1);
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            tls.write_all(&buf).expect("echoes");
+        });
+        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let trojan = TrojanOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                key,
+                carrier: Carrier::Raw,
+                host: String::new(),
+                tls: Some(Arc::new(client_config)),
+            };
+            dial_trojan(&client, &server, &trojan, &target, Ladder::global());
+        });
+        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        sock.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vmess_over_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x33u8; 16];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((_target, mut send, mut recv, prefix, cmd)) =
+                crate::vmess::accept_request(&mut tls, &id)
+            else {
+                panic!("reads a vmess header");
+            };
+            assert_eq!(cmd, 1);
+            tls.write_all(&prefix).expect("answers");
+            let mut scratch = Vec::with_capacity(16 * 1024);
+            let chunk = crate::vmess::read_frame(&mut tls, &mut recv, &mut scratch)
+                .expect("reads a frame")
+                .to_vec();
+            let mut staging = Vec::with_capacity(16 * 1024);
+            let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
+            assert!(crate::vmess::write_frame(
+                &mut tls,
+                &mut send,
+                &chunk,
+                &mut staging,
+                &mut pad
+            ));
+        });
+        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let vmess = VmessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                cipher: crate::vmess::Cipher::Auto,
+                carrier: Carrier::Raw,
+                host: String::new(),
+                tls: Some(Arc::new(client_config)),
+            };
+            dial_vmess(&client, &server, &vmess, &target, Ladder::global());
+        });
+        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        sock.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    fn stage_ca_pem(name: &str) -> (std::path::PathBuf, String) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["tls.test".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("ferrox-{name}-{}-{stamp}.pem", std::process::id()));
+        std::fs::write(&path, minted.cert.pem().as_bytes()).expect("stages ca");
+        let text = path
+            .to_str()
+            .expect("ascii")
+            .to_owned()
+            .replace('\\', "\\\\");
+        (path, text)
+    }
+
+    #[test]
     fn vmess_outbounds_carry_their_carriers() {
         let root = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vmess", "settings": {"vnext": [{"address": "192.0.2.1", "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "security": "chacha20-poly1305"}]}]}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "host": "oracle.example"}}}]}"#,
@@ -7114,6 +7725,7 @@ mod tests {
                 path: "/share".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -7484,6 +8096,7 @@ mod tests {
             mux: false,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -7672,6 +8285,7 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::Raw,
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -7806,6 +8420,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Chacha,
             carrier: Carrier::Raw,
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8222,6 +8837,7 @@ mod tests {
             mux: true,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8412,6 +9028,7 @@ mod tests {
             mux: true,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8503,6 +9120,7 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8567,6 +9185,7 @@ mod tests {
                 path: "/tunnel".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8631,6 +9250,7 @@ mod tests {
                 path: "/TunnelService/Tun".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8694,6 +9314,7 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8756,6 +9377,7 @@ mod tests {
                 path: "/tunnel".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8818,6 +9440,7 @@ mod tests {
                 path: "/Tun".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8880,6 +9503,7 @@ mod tests {
                 path: "/tunnel".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -8942,6 +9566,7 @@ mod tests {
                 path: "/tunnel".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -9051,6 +9676,7 @@ mod tests {
             mux: false,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         };
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let source = Arc::new(Mutex::new(None));
@@ -9072,6 +9698,7 @@ mod tests {
             mux: false,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         };
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let source = Arc::new(Mutex::new(None));
@@ -9137,6 +9764,7 @@ mod tests {
             mux: false,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
@@ -9907,6 +10535,7 @@ mod tests {
             mux: false,
             quic_roots: Some(roots),
             hysteria_roots: None,
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -9950,6 +10579,7 @@ mod tests {
             mux: true,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -10733,6 +11363,7 @@ mod tests {
             mux: false,
             quic_roots: None,
             hysteria_roots: None,
+            tls: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -10793,6 +11424,7 @@ mod tests {
             key,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            tls: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -10817,6 +11449,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Auto,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            tls: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");

@@ -159,6 +159,14 @@ impl VlessLink {
                 return Support::Implemented { method };
             }
         }
+        if self.transport_kind() == TransportKind::Tcp
+            && self.security() == Security::Tls
+            && matches!(self.flow(), "" | "none")
+        {
+            return Support::Implemented {
+                method: "vless-tcp-tls",
+            };
+        }
         Support::Planned {
             reason: planned_reason(self),
         }
@@ -495,7 +503,7 @@ fn planned_reason(link: &VlessLink) -> &'static str {
     let kind = link.transport_kind();
     match kind {
         TransportKind::Tcp => match link.security() {
-            Security::Tls => "vless-tcp-tls: parses, dials after the reality rung lands",
+            Security::Tls => "vless-tcp-tls with vision: parses, vision framing over TLS is not wired",
             Security::None => {
                 "vless-tcp-none without encryption=none and no flow: parses, unsupported combination"
             }
@@ -872,6 +880,25 @@ mod tests {
                 "{link}"
             );
         }
+    }
+
+    #[test]
+    fn tcp_tls_without_vision_is_implemented() {
+        let l = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:443?security=tls&type=tcp#tls",
+        )
+        .expect("parses");
+        assert_eq!(
+            l.support(),
+            Support::Implemented {
+                method: "vless-tcp-tls"
+            }
+        );
+        let vision = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=tls&type=tcp&flow=xtls-rprx-vision#tls-vision",
+        )
+        .expect("parses");
+        assert!(matches!(vision.support(), Support::Planned { .. }));
     }
 
     #[test]

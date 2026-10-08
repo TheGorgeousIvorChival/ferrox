@@ -973,7 +973,7 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
     let send = Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)?;
     Some((target, send, recv, prefix, cmd))
 }
-fn accept_request(
+pub(crate) fn accept_request(
     stream: &mut dyn Read,
     id: &[u8; 16],
 ) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)> {

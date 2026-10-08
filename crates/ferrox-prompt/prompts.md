@@ -915,3 +915,19 @@ Do not widen this into a general MASQUE stack. One endpoint, one `:protocol = co
 
 ```
 
+
+## P44 · Carry the TLS-client remainder: mux, UDP and vision over the session
+
+**When to use:** When a `security: tls` row with `mux.enabled`, a UDP flow, or `flow: xtls-rprx-vision` is next to carry: the raw-TCP TLS dial lands those rows as refused-with-a-reason instead of dialling them.
+**Status:** todo
+**Leverage:** 4
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with the `ws_tls`, `httpupgrade_tls` and `grpc_tls` rows executed against `ferrox-app`
+**Touches:** crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+The raw-carrier TLS dial is deliberately the narrow one: one TCP dial, one handshake, the protocol header inside the session, no ladder walk because climbing to plaintext would send what the config asked to encrypt. What it refuses, by name: mux over TLS (the mux handshake and frame relay are `TcpStream`-shaped and need a session-shaped dial of their own), UDP over TLS (the SOCKS UDP front opens raw uplinks and is gated off TLS configs rather than leaking plain), vision framing over TLS (the link table reports it planned, the binary ignores `flow` the way it already does on plaintext), and carried TLS in either direction (P31 owns the layer order there).
+
+Each of those is its own proof: a loopback pair in each direction per row, the way the raw rows earned theirs, and each row joins the suite command only with its own passing run. A row that dials because its refusal was deleted is the failure this slice exists to prevent.
+```
