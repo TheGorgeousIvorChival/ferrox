@@ -313,12 +313,6 @@ impl std::fmt::Debug for Shared {
 
 fn take_window(shared: &Shared, need: u64) -> bool {
     let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
-    if send.conn < need || send.stream < need {
-        eprintln!(
-            "LTAG W-wait need={need} conn={} stream={}",
-            send.conn, send.stream
-        );
-    }
     while send.conn < need || send.stream < need {
         if shared.dead.load(Ordering::SeqCst) {
             return false;
@@ -547,10 +541,7 @@ impl<R: Read> GrpcReader<R> {
 
     fn pump(&mut self) -> Option<()> {
         let head = read_head(&mut self.read);
-        let Some((len, kind, flags, id)) = head else {
-            eprintln!("LTAG G-no-head server={}", self.server);
-            return None;
-        };
+        let (len, kind, flags, id) = head?;
         let mut frame = std::mem::take(&mut self.frame);
         crate::proxy::resize_scratch(&mut frame, len);
         if len > 0 && crate::proxy::read_exact(&mut self.read, &mut frame).is_err() {

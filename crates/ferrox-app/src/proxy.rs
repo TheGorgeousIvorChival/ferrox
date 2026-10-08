@@ -3114,10 +3114,6 @@ fn dial_tls_session(
 fn tls_halves(
     session: ferrox_core::tls::RustlsProvider<TcpStream>,
 ) -> Option<(ClientHalf, ClientHalf, Arc<TcpStream>)> {
-    eprintln!(
-        "LTAG D-halves peer={:?}",
-        session.get_ref().peer_addr().ok()
-    );
     let raw = Arc::new(session.get_ref().try_clone().ok()?);
     let shared = Arc::new(Mutex::new(session));
     let reader = TlsHalf {
@@ -3213,14 +3209,6 @@ impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
         loop {
             return match self.locked_read(buf) {
                 Err(error) if is_timeout(&error) => continue,
-                Err(error) => {
-                    eprintln!("LTAG H-read-err {error:?}");
-                    Err(error)
-                }
-                Ok(0) => {
-                    eprintln!("LTAG H-read-eof");
-                    Ok(0)
-                }
                 outcome => outcome,
             };
         }
@@ -5308,7 +5296,6 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     F: FnOnce(&mut R),
 {
     const CHUNK: usize = 16 * 1024;
-    eprintln!("LTAG R-sink peer={:?}", peer.peer_addr().ok());
     let Ok(peer_read) = peer.try_clone() else {
         return;
     };
@@ -5324,18 +5311,10 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
             match peer_read.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     if !uplink.send(&buf[..n]) {
-                        eprintln!("LTAG R-uplink-send-fail");
                         break;
                     }
                 }
-                Ok(_) => {
-                    eprintln!("LTAG R-uplink-eof");
-                    break;
-                }
-                Err(error) => {
-                    eprintln!("LTAG R-uplink-err {error:?}");
-                    break;
-                }
+                _ => break,
             }
         }
         if CLOSE_FIRST {
@@ -5348,18 +5327,10 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
         match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
                 if peer_write.write_all(&buf[..n]).is_err() {
-                    eprintln!("LTAG R-downlink-write-fail");
                     break;
                 }
             }
-            Ok(_) => {
-                eprintln!("LTAG R-downlink-eof");
-                break;
-            }
-            Err(error) => {
-                eprintln!("LTAG R-downlink-err {error:?}");
-                break;
-            }
+            _ => break,
         }
     }
     if CLOSE_FIRST {
@@ -8369,11 +8340,9 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            eprintln!("LTAG S-accepted port={port}");
             let mut tls = ferrox_core::tls::RustlsServerProvider::accept(&server_config, stream)
                 .expect("accepts");
             tls.handshake().expect("handshakes");
-            eprintln!("LTAG S-handshake port={port}");
             let shared = Arc::new(Mutex::new(tls));
             let (mut reader, mut writer) = accept(
                 TlsHalf {
@@ -8382,7 +8351,6 @@ mod tests {
                 TlsHalf { session: shared },
             )
             .expect("accepts carrier");
-            eprintln!("LTAG S-carrier port={port}");
             match kind {
                 TlsEcho::Vless(id) => {
                     let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
@@ -8394,7 +8362,6 @@ mod tests {
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
                     writer.write_all(&buf).expect("echoes");
-                    eprintln!("LTAG S-echo vless port={port}");
                 }
                 TlsEcho::Trojan(key) => {
                     let Some((cmd, _target)) = decode_trojan_request(&mut reader, &key) else {
@@ -8404,7 +8371,6 @@ mod tests {
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
                     writer.write_all(&buf).expect("echoes");
-                    eprintln!("LTAG S-echo trojan port={port}");
                 }
                 TlsEcho::Vmess(id) => {
                     let Some((_target, mut send, mut recv, prefix, cmd)) =
@@ -8427,7 +8393,6 @@ mod tests {
                         &mut staging,
                         &mut pad
                     ));
-                    eprintln!("LTAG S-echo vmess port={port}");
                 }
             }
             // Exit only after the client closed: closing with its frames unread resets the echo with it.
