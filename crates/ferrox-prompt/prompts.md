@@ -931,3 +931,236 @@ The TLS dial covers raw and every framed carrier with one attempt on the configu
 
 Each of those is its own proof: a loopback pair in each direction per row, the way the carried rows earned theirs, and each row joins the suite command only with its own passing run. A row that dials because its refusal was deleted is the failure this slice exists to prevent.
 ```
+
+## P45 · Carry the SplitHTTP modes, not only stream-one
+
+**When to use:** When `xhttpSettings.mode` is anything but `stream-one`: the carrier today POST-chunks one body both ways, while the reference splits uplink from downlink (`stream-up`) or frames each upload as its own POST (`packet-up`), and padding/placement keys are unread.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `conformance.yml` green with the xhttp rows run in each named `mode`
+**Depends on:** P16
+**Touches:** crates/ferrox-app/src/xhttp.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+Read `upstream/xray-core/transport/internet/splithttp/dialer.go:332` and `hub.go:197` for what `stream-up` and `packet-up` put on the wire: session id in the uplink path, sequence-numbered upload POSTs, padding extracted by `ExtractXPaddingFromRequest` at `config.go:110`. The chunked reader/writer in `crates/ferrox-app/src/xhttp.rs` is the stream-one half; the uplink POSTs are new request shape on the same path, sequenced by the client and merged in order by the server. Padding placement (header, query, cookie, body) changes what the reader must skip, which is why it lands in the same slice: one parse of the request head must decide session, sequence and padding together. Name the modes this tree carries when it is done, in `docs/function/carrier-xhttp.md`, the way the KCP page names its refused modes.
+```
+
+## P46 · Answer DNS: app, resolvers, fakeDNS
+
+**When to use:** When a config carries `dns:` at all: today it is an unread section, so every outbound dial is a raw upstream hostname, and there is no DoH, DoQ, hosts file, or fakeDNS to route on.
+**Status:** todo
+**Leverage:** 5
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: a `dns` inbound row from `xray-rust` executed against `ferrox-app`
+**Touches:** crates/ferrox-app/src/json.rs, crates/ferrox-app/src/proxy.rs, +crates/ferrox-app/src/dns.rs
+**Random weight:** 2
+
+```text
+The surface is `upstream/xray-core/app/dns/`: UDP/TCP nameservers, DoH, DoQ over quiche, a local resolver, a `hosts` map, and `fakedns` handing out pool addresses so the router can decide on the name rather than the IP. Scope this slice to the client side of a name: parse `dns.servers`, resolve through the first reachable one in order, honour `hosts`, and answer the `dns` inbound protocol. Route-on-answer lands in P47; a resolver without a router is half of it and this is the half every user dials first. Do not shell out to the system resolver as a rung: the config names the servers, and silent fallback is a second way of doing it.
+```
+
+## P47 · Route, with balancers, on the answer from P46
+
+**When to use:** When two outbounds exist and a config says which one a flow takes: today the outbound is picked by protocol only, every inbound binds a fixed port, and `routing.rules` is an unread section.
+**Status:** todo
+**Leverage:** 5
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: a routing row from `xray-rust` executed against `ferrox-app`
+**Depends on:** P46
+**Touches:** crates/ferrox-app/src/json.rs, crates/ferrox-app/src/proxy.rs, +crates/ferrox-app/src/routing.rs
+**Random weight:** 2
+
+```text
+Read `upstream/xray-core/app/router/` and `features/routing` for the rule shape: domain (suffix/domain/full), IP CIDR, port, network, and an outbound tag, plus `balancers` over leastload/leastping/random. This tree already knows the destination before the SOCKS front dials, so the router is a pure function of session plus rule list; leastping needs the observatory probe, which is P59's slice and must not be invented here — leastload and random cover the matrix without it. GeoIP/geosite data files are P58.
+```
+
+## P48 · Dial REALITY
+
+**When to use:** When a client config names `security: reality`: the server half is written and tested, the crypto is in `crates/ferrox-core/src/tls/reality.rs`, and the client role refuses the handshake instead of opening it.
+**Status:** todo
+**Leverage:** 4
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: the `reality` client rows from `xray-rust` executed against `ferrox-app`
+**Depends on:** P17, P18
+**Touches:** crates/ferrox-core/src/tls/reality.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 2
+
+```text
+The server checks `shortId` and mints a cert per session; the client must present the matching X25519 public key it is pinned to, open with the fingerprinted ClientHello P18 produces, and authenticate the session by the server's signature over the same transcript. `crates/ferrox-core/src/tls/reality.rs` already has the key schedule, so this is the ClientHello extension and the transcript check on top of it. uTLS shapes stay P18's concern; the client role of the handshake shape is this one.
+```
+
+## P49 · Carry Shadowsocks-2022
+
+**When to use:** When `method` names `2022-blake3-*`: today those methods are refused by name, and `proxy/shadowsocks_2022/` in the pin is self-contained about it.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace`; CI: a `shadowsocks_2022` row from `xray-rust` executed against `ferrox-app`
+**Touches:** crates/ferrox-core/src/shadowsocks.rs, crates/ferrox-app/src/shadowsocks.rs
+**Random weight:** 1
+
+```text
+2022 changes the key schedule (blake3 KDF), the replay filter, and the session header. Read `upstream/xray-core/proxy/shadowsocks_2022/{cipher,kdf,stream,packet,replay}.go` for the exact wire shapes and port no lines: the existing AEAD chunk code in `crates/ferrox-core/src/shadowsocks.rs` is the shape to wrap, the method name is the only thing that selects it today, and the replay window is a small fixed bitmap rather than a map.
+```
+
+## P50 · Answer blackhole and loopback
+
+**When to use:** When a config names the `blackhole` outbound or the `loopback` inbound: both are refused today, and both are small next to a router — blackhole is an outbound that discards, loopback is an inbound that hands its own dial back.
+**Status:** todo
+**Leverage:** 2
+**Effort:** small
+**Gates:** `cargo test --workspace`
+**Depends on:** P47
+**Touches:** crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+A `blackhole` outbound never reads the request: it answers the inbound's relay with EOF on the first read, which is one line in the relay loop and one config arm. `loopback` is the inverse: the inbound's accepted stream is dialled back through the same outbound table with the destination rewritten to the inbound itself, which matters the day one config wants a chain on one binary. Both ride the dispatcher P47 introduces; before that they are two names on the same refuse list and this slice should not be started.
+```
+
+## P51 · Carry the HTTP proxy, not only SOCKS
+
+**When to use:** When an inbound names `http`: today the binary serves SOCKS and refuses everything else, and a client that only speaks CONNECT is turned away.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace`; CI: an `http` inbound row from `xray-rust` executed against `ferrox-app`
+**Touches:** crates/ferrox-app/src/proxy.rs, +crates/ferrox-app/src/http_proxy.rs
+**Random weight:** 1
+
+```text
+The surface is small: CONNECT with a `host:port` authority, a 200 answer, and a raw relay — plus absolute-URI GETs and friends if the follow bridge needs them. `upstream/xray-core/proxy/http` is the shape; the relay after the 200 is the same one SOCKS uses, so this is a head parser and a config arm, not a new data path. UDP-over-HTTP CONNECT (RFC 9298) is a separate row and stays out of this slice.
+```
+
+## P52 · Dokodemo inbound, and TUN through zeptun
+
+**When to use:** When the config names `dokodemo-door` or a native `tun` inbound: both are refused today, and the zeptun goal in the README is carried by a pin this tree never reads.
+**Status:** todo
+**Leverage:** 4
+**Effort:** large
+**Gates:** `cargo test --workspace`; a loopback transparent-dial through the dokodemo inbound
+**Depends on:** P47
+**Touches:** crates/ferrox-app/src/proxy.rs, +crates/ferrox-app/src/tun.rs
+**Random weight:** 2
+
+```text
+Dokodemo is an inbound that accepts TCP and rewrites the destination from a fixed target or the original destination of the socket. The TUN inbound is zeptun's engine: TUN device to TCP/UDP/ICMP through a SOCKS5 or direct handler, userspace/hybrid/system stacks. Read `upstream/zeptun` and `upstream/xray-core/proxy/{tun,dokodemo}`; the dispatcher from P47 is what the TUN handler hands a flow to. Permission model (a TUN device needs privileges SOCKS never asks for) belongs in the README, not in code.
+```
+
+## P53 · Sniff before the router, not after it
+
+**When to use:** When a rule keys on something other than the address the dial already has: today `routing.rules` can only match what the caller sent, because nothing reads the first bytes of the flow.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace`; a loopback dial whose SNI the router matches on
+**Depends on:** P47
+**Touches:** crates/ferrox-app/src/proxy.rs, +crates/ferrox-app/src/sniff.rs
+**Random weight:** 1
+
+```text
+The reference peeks at TLS ClientHello for SNI, HTTP Host, and QUIC long headers, in `upstream/xray-core/common/protocol/{http,tls,quic,bittorrent}`. A peek that changes the TLS record boundary the relay sees is the bug this slice watches for: the bytes taken off the front of the relay are the bytes the relay owes the other side, which is why the sniffed prefix rides the relay's own buffer instead of a copy. Version-and-name, TLS-version-and-SNI, HTTP method-and-Host — name the protocols this tree sniffs when it is done.
+```
+
+## P54 · Carry MASQUE
+
+**When to use:** When a config names `masque` or `connectip`: the pin has both the proxy and the transport, the Foxy lane already proved a MASQUE-over-HTTP/2 shape at the edge (P43), and this row is the open one.
+**Status:** todo
+**Leverage:** 4
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: a `masque` row from `conformance` executed against `ferrox-app`
+**Depends on:** P30
+**Touches:** crates/ferrox-app/src/proxy.rs, crates/ferrox-core/src/transport.rs, +crates/ferrox-app/src/masque.rs
+**Random weight:** 2
+
+```text
+RFC 9484 CONNECT-IP carries IP packets in H2/H3 datagrams or streams; Xray's `proxy/masque` pairs with `transport/internet/masque` over HTTP/2 and the QUIC carrier through quiche. P43 proves the one datagram shape at the Foxy edge; this slice proves the request/response handshake and the close semantics against the pinned server. CONNECT-UDP over HTTP/2 is P43's row and merges if the two shapes share their first flight.
+```
+
+## P55 · Fingerprint with uTLS shapes and ECH
+
+**When to use:** When `fingerprint` names something other than the rustls default, or `ech` is configured: both are refused today, and both live in `transport/internet/tls/` and `transport/internet/reality/` in the pin.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; a loopback handshake whose ClientHello matches the pinned uTLS shape byte-for-byte
+**Depends on:** P48
+**Touches:** crates/ferrox-core/src/tls/mod.rs, crates/ferrox-core/src/tls/rustls_backend.rs
+**Random weight:** 1
+
+```text
+Fingerprint parity means the ClientHello bytes match the pinned uTLS shape — version, cipher order, extension order, padding — which rustls cannot emit on its own; a thin ClientHello builder over rustls's transcript, or a delegated handshake, is the decision this slice makes and names. ECH rides the same ClientHello: the inner config is encrypted to the public name's key, and a server without ECH answers the outer ClientHello, which the router can still see. One fingerprint in the first row, not a matrix.
+```
+
+## P56 · Carry VLESS stream encryption, and Vision UDP-443
+
+**When to use:** When a VLESS link carries `encryption` or `flow: xtls-rprx-vision-udp443`: both are refused today, and both move bytes the current relay would send raw.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace`; CI: the `encryption` row from `xray-rust` executed against `ferrox-app`
+**Depends on:** P7, P31
+**Touches:** crates/ferrox-core/src/vless.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+`proxy/vless/encryption/` in the pin post-handshakes the session into an XOR or MLKEM-shaped stream; the relay boundary is the only change, so the framer this tree already tested around VLESS wraps a new layer rather than a new carrier. Vision UDP-443 is the same shape at the flow level: the padded framing stays, the carried protocol becomes `udp/443` with the header the vision spec names. Read `upstream/xray-core/proxy/vless/encoding/{client,server}.go` for the key schedule before writing the layer.
+```
+
+## P57 · FinalMask, named by name
+
+**When to use:** When a transport config carries `finalmask`: today the section is an unread name, and the pin ships fragment, header/custom, mkcp, noise, realm (STUN hole-punch + portmap), salamander, sudoku, udphop, xdns, xicmp, xmc.
+**Status:** todo
+**Leverage:** 2
+**Effort:** large
+**Gates:** `cargo test --workspace`; a loopback dial through the first carried mask, byte-checked
+**Touches:** crates/ferrox-app/src/proxy.rs, +crates/ferrox-app/src/finalmask.rs
+**Random weight:** 1
+
+```text
+Pick by interop value: salamander first, because Hysteria's obfs shape already rides here and the config syntax shares its name; then fragment, because freedom's fragment option and XFrag are the same idea. Each mask is a wrapper around the carrier the way a layer wraps a recorded path: reads and writes cross it, and a byte-level loopback test per mask is the gate, the way the KCP oracle gates KCP. Name the carried masks on the carrier's page when the slice lands; a page that lists only wins is not evidence.
+```
+
+## P58 · WireGuard, geodata, observatory: the app slices
+
+**When to use:** When a config carries `wireguard`, `geoip`/`geosite`, or an observatory probe: all three are unread today, and each is a single shape in the pin rather than a carrier.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: one row per sub-feature from `xray-rust`
+**Touches:** crates/ferrox-app/src/proxy.rs, +crates/ferrox-app/src/wireguard.rs, +crates/ferrox-app/src/geodata.rs
+**Random weight:** 1
+
+```text
+WireGuard is `proxy/wireguard`: Noise IKpsk2, a gVisor netstack, and ICMP — read it rather than porting, and implement the client half first. Geodata is `app/geodata`: a loader for the .dat files and a downloader that refuses to run unverified. Observatory is `app/observatory`: health pings per outbound that the leastping balancer from P47 consumes. One slice named three sub-features because each has the same shape — a config section, one loop, one test pin — and splitting them would triple the prompt overhead for the same review.
+```
+
+## P59 · Stats, metrics, and the commander API
+
+**When to use:** When anything outside the process needs to ask a question of it: today an operator edits a config and restarts, because there is no stats counter, no Prometheus metrics, no gRPC control channel.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace`; a loopback inbound/outbound row driven only through the API
+**Touches:** crates/ferrox-app/src/main.rs, +crates/ferrox-app/src/api.rs
+**Random weight:** 1
+
+```text
+Read `upstream/xray-core/app/{stats,metrics,commander,log}`: counters per inbound/outbound, online-user tracking, Prometheus exposition, and the gRPC service that adds and removes nodes at runtime. The runtime-node half is the load-bearing one — an operator adding a port without a restart is the feature — and it lands first, behind the gRPC server grpc.rs already frames. Log commands trail because every other slice wants the counter increments but only this one wants the streaming reads.
+```
+
+## P60 · XDrive and the browser dialer
+
+**When to use:** When a config names `xdrive`, or the dialer moves into a browser page: the pin ships both, and both are exotic-carrier tier — nothing else in this tree needs them.
+**Status:** todo
+**Leverage:** 1
+**Effort:** medium
+**Gates:** `cargo test --workspace`; a loopback dial through the XDrive storage backend
+**Touches:** crates/ferrox-app/src/proxy.rs
+**Random weight:** 0
+
+```text
+XDrive ferries streams through a WebDrive backend; last in the queue because it is the least asked-for carrier and the largest new dependency shape. The browser dialer is a local HTML page plus a forwarder that turns page connectivity into a dialer; it waits for MASQUE (P54), because a browser that cannot open a plain TCP socket to the dialer is the browser MASQUE exists for.
+```

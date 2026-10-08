@@ -201,7 +201,7 @@ fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
         Carrier::Ws { path, ed } => Some((path, *ed)),
         Carrier::HttpUpgrade { path }
         | Carrier::Grpc { path }
-        | Carrier::Xhttp { path }
+        | Carrier::Xhttp { path, .. }
         | Carrier::HttpHeader { path } => Some((path, 0)),
         _ => None,
     }
@@ -363,13 +363,20 @@ macro_rules! refused_carriers {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XhttpMode {
+    StreamOne,
+    StreamUp,
+    PacketUp,
+}
+
 #[derive(Debug, Clone)]
 enum Carrier {
     Raw,
     Ws { path: String, ed: u32 },
     HttpUpgrade { path: String },
     Grpc { path: String },
-    Xhttp { path: String },
+    Xhttp { path: String, mode: XhttpMode },
     HttpHeader { path: String },
     Quic,
     Kcp(ferrox_core::kcp::Config),
@@ -451,7 +458,7 @@ fn accept_loop(address: &str, role: &Role) {
                 Carrier::Grpc { path } => {
                     serve_trojan_grpc(stream, &key, path.as_str(), freedom);
                 }
-                Carrier::Xhttp { path } => {
+                Carrier::Xhttp { path, .. } => {
                     serve_trojan_xhttp(stream, &key, path.as_str(), freedom);
                 }
                 Carrier::HttpHeader { path } => {
@@ -468,7 +475,7 @@ fn accept_loop(address: &str, role: &Role) {
                 Carrier::Ws { path, .. } => {
                     crate::vmess::serve_ws(stream, path.as_str(), &id, freedom);
                 }
-                Carrier::Xhttp { path } => {
+                Carrier::Xhttp { path, .. } => {
                     crate::vmess::serve_xhttp(stream, path.as_str(), &id, freedom);
                 }
                 Carrier::HttpHeader { path } => {
@@ -511,7 +518,7 @@ fn serve_shadowsocks(
         Carrier::Grpc { path } => {
             crate::shadowsocks::serve_grpc(stream, password, method, path.as_str(), freedom);
         }
-        Carrier::Xhttp { path } => {
+        Carrier::Xhttp { path, .. } => {
             crate::shadowsocks::serve_xhttp(stream, password, method, path.as_str(), freedom);
         }
         Carrier::HttpHeader { path } => {
@@ -578,7 +585,10 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
             }
             crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
         }
-        Carrier::Xhttp { path } => {
+        Carrier::Xhttp { path, mode } => {
+            if *mode != XhttpMode::StreamOne {
+                eprintln!("xhttp mode `{mode:?}` is configured; the stream-one framing is what this rung serves, and the mode wire formats land with P45");
+            }
             let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
                 return;
             };
@@ -1142,7 +1152,7 @@ fn serve_vless_tls(
             };
             serve_carried_tls(CarrierStream { reader, writer }, id, freedom, server);
         }
-        Carrier::Xhttp { path } => {
+        Carrier::Xhttp { path, .. } => {
             let Some((reader, writer)) = crate::xhttp::accept(stream, path) else {
                 return;
             };
@@ -1245,7 +1255,7 @@ fn serve_vless_reality(
             };
             finish_reality(session, None, id, freedom);
         }
-        Carrier::Xhttp { path } => {
+        Carrier::Xhttp { path, .. } => {
             let Some((reader, writer)) = crate::xhttp::accept(stream, path) else {
                 return;
             };
@@ -3345,7 +3355,7 @@ fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, tar
             }
             relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
         }
-        Carrier::Xhttp { path } => {
+        Carrier::Xhttp { path, .. } => {
             let Some((mut reader, writer)) = tls_xhttp(server, session, &vless.host, path) else {
                 return;
             };
@@ -3426,7 +3436,7 @@ fn dial_trojan_tls(client: &TcpStream, server: &SocketAddr, trojan: &TrojanOut, 
             }
             relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
         }
-        Carrier::Xhttp { path } => {
+        Carrier::Xhttp { path, .. } => {
             let Some((reader, writer)) = tls_xhttp(server, session, &trojan.host, path) else {
                 return;
             };
@@ -3552,7 +3562,7 @@ fn vmess_tls_carried(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
             crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
         }
-        Carrier::Xhttp { path } => {
+        Carrier::Xhttp { path, .. } => {
             let Some((reader, writer)) = tls_xhttp(server, session, &vmess.host, path) else {
                 return;
             };
@@ -6665,6 +6675,7 @@ fn stream_carrier(settings: Option<&Json>) -> Carrier {
         },
         Some("xhttp" | "splithttp") => Carrier::Xhttp {
             path: xhttp_path(settings),
+            mode: xhttp_mode(settings),
         },
         Some("quic") => Carrier::Quic,
         Some("kcp" | "mkcp") => Carrier::Kcp(kcp_config(settings)),
@@ -6745,6 +6756,40 @@ fn xhttp_path(settings: Option<&Json>) -> String {
         }
     }
     "/".to_owned()
+}
+
+fn xhttp_mode(settings: Option<&Json>) -> XhttpMode {
+    let xhttp = settings.and_then(|s| {
+        s.get("xhttpSettings")
+            .or_else(|| s.get("splithttpSettings"))
+    });
+    let raw = xhttp
+        .and_then(|s| s.get("mode"))
+        .and_then(Json::as_str)
+        .unwrap_or("auto");
+    match raw {
+        "stream-one" | "streamone" => XhttpMode::StreamOne,
+        "stream-up" => XhttpMode::StreamUp,
+        "packet-up" => XhttpMode::PacketUp,
+        // `auto`/`""` resolve the way the reference's dialer.go:332 does:
+        // packet-up by default, stream-one under REALITY, stream-up when the
+        // link also carries downloadSettings.
+        _ => {
+            let reality = settings
+                .and_then(|s| s.get("security"))
+                .and_then(Json::as_str)
+                .is_some_and(|s| s == "reality");
+            if reality {
+                if xhttp.and_then(|s| s.get("downloadSettings")).is_some() {
+                    XhttpMode::StreamUp
+                } else {
+                    XhttpMode::StreamOne
+                }
+            } else {
+                XhttpMode::PacketUp
+            }
+        }
+    }
 }
 
 fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
@@ -7570,7 +7615,7 @@ mod tests {
         .expect("parses");
         assert!(matches!(
             stream_carrier(xhttp.get("streamSettings")),
-            Carrier::Xhttp { path } if path == "/share"
+            Carrier::Xhttp { path, .. } if path == "/share"
         ));
         let legacy = crate::json::parse(
             r#"{"streamSettings": {"network": "xhttp", "splithttpSettings": {"path": "/legacy"}}}"#,
@@ -7578,7 +7623,29 @@ mod tests {
         .expect("parses");
         assert!(matches!(
             stream_carrier(legacy.get("streamSettings")),
-            Carrier::Xhttp { path } if path == "/legacy"
+            Carrier::Xhttp { path, .. } if path == "/legacy"
+        ));
+        let packet = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"mode": "packet-up"}}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(packet.get("streamSettings")),
+            Carrier::Xhttp {
+                mode: XhttpMode::PacketUp,
+                ..
+            }
+        ));
+        let reality = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "security": "reality", "xhttpSettings": {}}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(reality.get("streamSettings")),
+            Carrier::Xhttp {
+                mode: XhttpMode::StreamOne,
+                ..
+            }
         ));
         let camouflage = crate::json::parse(
             r#"{"streamSettings": {"network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/camouflage"]}}}}}"#,
@@ -7666,6 +7733,7 @@ mod tests {
         vless_over_carrier_reaches_echo(
             &Carrier::Xhttp {
                 path: "/share".to_owned(),
+                mode: XhttpMode::StreamOne,
             },
             "oracle.example",
             "/share",
@@ -8548,6 +8616,7 @@ mod tests {
                     id,
                     Carrier::Xhttp {
                         path: "/share".to_owned(),
+                        mode: XhttpMode::StreamOne,
                     },
                     client_config,
                 )
@@ -8649,6 +8718,7 @@ mod tests {
                     id,
                     Carrier::Xhttp {
                         path: "/share".to_owned(),
+                        mode: XhttpMode::StreamOne,
                     },
                     client_config,
                 )
@@ -8750,6 +8820,7 @@ mod tests {
                     key,
                     Carrier::Xhttp {
                         path: "/share".to_owned(),
+                        mode: XhttpMode::StreamOne,
                     },
                     client_config,
                 )
@@ -8854,6 +8925,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Chacha,
             carrier: Carrier::Xhttp {
                 path: "/share".to_owned(),
+                mode: XhttpMode::StreamOne,
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
@@ -9052,6 +9124,7 @@ mod tests {
         socks_dials_ss_via(
             Carrier::Xhttp {
                 path: "/ss-xhttp".to_owned(),
+                mode: XhttpMode::StreamOne,
             },
             crate::shadowsocks::serve_xhttp,
             "/ss-xhttp",
@@ -10745,6 +10818,7 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::Xhttp {
                 path: "/tunnel".to_owned(),
+                mode: XhttpMode::StreamOne,
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
@@ -10975,6 +11049,7 @@ mod tests {
             (
                 Carrier::Xhttp {
                     path: "/t".to_owned(),
+                    mode: XhttpMode::StreamOne,
                 },
                 Rung::Xhttp,
             ),
