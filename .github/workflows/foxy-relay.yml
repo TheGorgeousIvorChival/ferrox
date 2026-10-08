@@ -114,6 +114,10 @@ jobs:
       - name: DNS through the tunnel over UDP
         if: steps.secrets.outputs.present == 'true'
         run: |
+          # Control first: plain TCP to the DNS port through the same tunnel.
+          # A fast connect proves egress; a refusal proves the target, and any
+          # UDP verdict below must be read against this line.
+          timeout 15 curl -v --max-time 12 --socks5-hostname 127.0.0.1:10808 telnet://1.1.1.1:53 || true
           python3 - <<'PY'
           import random, socket, struct, sys, time
           def udp_addr(packet):
@@ -179,21 +183,30 @@ jobs:
               port = struct.unpack('>H', recv_exact(tcp, 2))[0]
           relay = ('127.0.0.1', port)
           udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-          udp.settimeout(20)
-          deadline = time.time() + 240
+          udp.settimeout(10)
+          # One query per target shape: two IP literals and one DNS name, so
+          # the lane log shows one CONNECT-UDP verdict per shape.
+          targets = [
+              (b'\x00\x00\x00\x01\x01\x01\x01\x01', 53, '1.1.1.1'),
+              (b'\x00\x00\x00\x01\x08\x08\x08\x08', 53, '8.8.8.8'),
+              (b'\x00\x00\x00\x03\x0eone.one.one.one', 53, 'one.one.one.one'),
+          ]
           answers = []
-          while time.time() < deadline and not answers:
-              qid, query = dns_query('one.one.one.one')
-              target = b'\x00\x00\x00\x01\x01\x01\x01\x01' + struct.pack('>H', 53)
-              udp.sendto(target + query, relay)
-              try:
-                  packet, _ = udp.recvfrom(65535)
-              except socket.timeout:
-                  continue
-              assert packet[:3] == b'\x00\x00\x00', 'bad socks udp header'
-              hlen, _ = udp_addr(packet[3:])
-              answers = dns_answers(packet[3 + hlen:], qid)
-          assert answers, 'no dns answer through the tunnel within 240s'
+          for hdr, port, name in targets:
+              for _ in range(3):
+                  qid, query = dns_query('one.one.one.one')
+                  udp.sendto(hdr + struct.pack('>H', port) + query, relay)
+                  try:
+                      packet, _ = udp.recvfrom(65535)
+                  except socket.timeout:
+                      continue
+                  assert packet[:3] == b'\x00\x00\x00', 'bad socks udp header'
+                  hlen, _ = udp_addr(packet[3:])
+                  got = dns_answers(packet[3 + hlen:], qid)
+                  if got:
+                      answers.append((name, got))
+                      break
+          assert answers, 'no dns answer through the tunnel'
           print('dns through the tunnel:', answers)
           PY
       - name: Stop the lane and show its log
