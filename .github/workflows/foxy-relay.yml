@@ -184,14 +184,18 @@ jobs:
           relay = ('127.0.0.1', port)
           udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
           udp.settimeout(10)
-          # UDP shapes: NTP to Cloudflare (name and literal) plus the DNS
-          # control that the edge refuses at TCP level too. One CONNECT-UDP
-          # verdict per shape lands in the lane log; a 200 with answer bytes
-          # is the datagram path proven.
+          # UDP shapes: NTP and DNS (both refused at this edge, kept as the
+          # policy record) plus a QUIC Version-Negotiation bait to a :443
+          # target the edge already carries over TCP. A 200 there with any
+          # answer bytes is the datagram path proven.
+          import os
+          bait = b'\xc0\xde\xad\xbe\xef\x08' + os.urandom(8) + b'\x08' + os.urandom(8)
+          bait += b'\x00\x44\x00' + bytes(1200 - len(bait))
           targets = [
               (b'\x00\x00\x00\x03\x13time.cloudflare.com', 123, 'ntp-name', b'\x1b' + b'\x00' * 47, 48),
               (b'\x00\x00\x00\x01\xa2\x9f\xc8\x01', 123, 'ntp-literal', b'\x1b' + b'\x00' * 47, 48),
               (b'\x00\x00\x00\x01\x08\x08\x08\x08', 53, 'dns', None, 0),
+              (b'\x00\x00\x00\x03\x14speed.cloudflare.com', 443, 'quic-vn', bait, 0),
           ]
           answers = []
           for hdr, port, name, probe, want in targets:
@@ -210,7 +214,7 @@ jobs:
                   hlen, _ = udp_addr(packet[3:])
                   body = packet[3 + hlen:]
                   print(name, 'answered', len(body), 'B', flush=True)
-                  if probe is not None and len(body) == want:
+                  if probe is not None and (want == 0 or len(body) == want):
                       answers.append((name, len(body)))
                       break
                   if probe is None:
