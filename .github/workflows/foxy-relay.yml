@@ -81,6 +81,15 @@ jobs:
       - name: Download a real file through the tunnel
         if: steps.secrets.outputs.present == 'true'
         run: |
+          # Diagnosis first, one shot each: full SOCKS+TLS transcript and the
+          # raw bytes a plain-HTTP GET brings back through the same tunnel.
+          curl -v --max-time 25 --socks5-hostname 127.0.0.1:10808 \
+            https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>&1 | tail -n 30 || true
+          curl -sS --max-time 25 --socks5-hostname 127.0.0.1:10808 \
+            http://www.cloudflare.com/cdn-cgi/trace -o body.bin || true
+          echo "== plain-http body =="
+          wc -c body.bin 2>/dev/null || echo "(no answer)"
+          xxd body.bin 2>/dev/null | head -n 8 || true
           # Plain HTTP first: it discriminates a tunnel that moves bytes from
           # one that only opens. TLS through the same tunnel comes next.
           curl -sS --max-time 60 --socks5-hostname 127.0.0.1:10808 \
