@@ -4352,8 +4352,117 @@ fn serve_socks_udp(mut client: TcpStream, out: &Outbound) {
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw) => {
             serve_socks_udp_shadowsocks(&relay, ss);
         }
+        Outbound::Foxy(foxy) => {
+            serve_socks_udp_foxy(&relay, foxy);
+        }
         _ => {}
     }
+}
+
+/// UDP over the Foxy lane: one CONNECT-UDP stream per destination, opened
+/// lazily on the first datagram. UDP rides H2 only — the H1 upgrade form is
+/// unimplemented and no published edge answers QUIC — so the configured
+/// carrier does not apply here.
+fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
+    const POLL: Duration = Duration::from_millis(10);
+    let _ = relay.set_read_timeout(Some(POLL));
+    let mut streams: HashMap<SocketAddr, crate::foxy::Tls2> = HashMap::new();
+    let mut buf = vec![0u8; UDP_BUF];
+    let mut datagram = vec![0u8; UDP_BUF];
+    let mut reply = Vec::with_capacity(UDP_BUF);
+    let mut client = None;
+    loop {
+        match relay.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                client = Some(src);
+                let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                    continue;
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(slot) = streams.entry(dest) {
+                    if let Some(lane) = foxy_udp_dial(foxy, &dest) {
+                        slot.insert(lane);
+                    }
+                }
+                if let Some(lane) = streams.get_mut(&dest) {
+                    if lane.write_datagram(payload).is_err() {
+                        streams.remove(&dest);
+                    }
+                }
+            }
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => break,
+        }
+        let mut dead = Vec::new();
+        for (dest, lane) in &mut streams {
+            match lane.read_datagram(&mut datagram) {
+                Ok(0) => {}
+                Ok(n) => {
+                    if let Some(src) = client {
+                        reply.clear();
+                        reply.extend_from_slice(&[0, 0, 0]);
+                        push_socks_addr(&mut reply, dest);
+                        reply.extend_from_slice(&datagram[..n]);
+                        let _ = relay.send_to(&reply, src);
+                    }
+                }
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => dead.push(*dest),
+            }
+        }
+        for dest in dead {
+            streams.remove(&dest);
+        }
+    }
+}
+
+/// Opens a CONNECT-UDP stream to one destination on the first edge that
+/// answers, H2 only. The pass is read fresh per dial so a renewal between
+/// datagrams is picked up without reopening anything else.
+fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Tls2> {
+    let order = ferrox_core::foxy::catalog::tier(
+        &foxy.candidates,
+        &foxy.country,
+        &foxy.city,
+        MAX_FOXY_ALTERNATES,
+    );
+    for edge in ferrox_core::foxy::dial_order(
+        &order,
+        &foxy.country,
+        foxy.stored.as_ref(),
+        MAX_FOXY_ALTERNATES,
+    ) {
+        let pass = foxy
+            .account
+            .as_ref()
+            .map_or_else(|| foxy.pass.clone(), |account| account.current());
+        let dial = crate::foxy::FoxyDial {
+            host: edge.host.clone(),
+            port: edge.port,
+            address: foxy.edge_address,
+            carrier: crate::foxy::Carrier::H2,
+            roots: foxy.roots.clone(),
+            pins: foxy.pins.clone(),
+            pass,
+        };
+        match crate::foxy::open_udp(&dial, &dest.ip().to_string(), dest.port()) {
+            Ok(lane) => {
+                debug_lane(
+                    &edge,
+                    crate::foxy::Carrier::H2,
+                    &format!("udp opened for {dest}"),
+                );
+                let _ = lane.set_read_quantum(RELAY_QUANTUM);
+                return Some(lane);
+            }
+            Err(failure) => {
+                debug_lane(&edge, crate::foxy::Carrier::H2, &failure.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {

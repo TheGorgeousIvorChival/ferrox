@@ -153,7 +153,7 @@ fn huffman_encode(bytes: &[u8], out: &mut Vec<u8>) {
 }
 
 /// An integer in one byte carrying `prefix` low bits, continued in base-128.
-fn integer(out: &mut Vec<u8>, prefix: u8, mask: u8, value: usize) {
+pub(crate) fn integer(out: &mut Vec<u8>, prefix: u8, mask: u8, value: usize) {
     let max = (1usize << prefix) - 1;
     if value < max {
         out.push(mask | value as u8);

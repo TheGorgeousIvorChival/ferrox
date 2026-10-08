@@ -11,6 +11,7 @@ pub mod flow;
 pub mod frames;
 pub mod hpack;
 pub mod link;
+pub mod masque;
 pub mod pin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

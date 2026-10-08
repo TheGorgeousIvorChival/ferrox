@@ -901,7 +901,7 @@ The loopback account plane is proven end to end, so nothing about this is about 
 ## P43 · Carry MASQUE CONNECT-UDP over the HTTP/2 edge that answers
 
 **When to use:** When the country is pinned, the pass is minted, and every carrier is refused: the published edge answers TCP and ignores QUIC, so the carrier that would reach it is HTTP/2 carrying a MASQUE datagram rather than HTTP/3 carrying a stream.
-**Status:** todo
+**Status:** doing
 **Leverage:** 5
 **Effort:** large
 **Gates:** a loopback MASQUE edge proving CONNECT-UDP through the tunnel; `foxy-live.yml` reporting a tunnel and its exit country

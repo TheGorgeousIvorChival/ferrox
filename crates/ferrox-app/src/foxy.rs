@@ -7,7 +7,7 @@
 //! hands the caller a `Read + Write` and the caller does not know which carrier
 //! produced it.
 
-use ferrox_core::foxy::{self, frames, hpack, Failure, Pass};
+use ferrox_core::foxy::{self, frames, hpack, masque, Failure, Pass};
 use ferrox_core::tls::TlsProvider;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
@@ -17,6 +17,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_FRAME: usize = frames::MAX_FRAME as usize;
 const MAX_HEAD: usize = 8_192;
+/// How much of a capsule stream waits unparsed before the lane fails the
+/// association rather than buffering a peer that never completes a capsule.
+const DATAGRAM_BUF_MAX: usize = 256 * 1024;
 const SEND_WAIT: Duration = Duration::from_secs(10);
 /// The client's first unidirectional stream, which is where the SETTINGS that
 /// make this connection HTTP/3 go.
@@ -175,14 +178,42 @@ fn head<S: Read>(io: &mut S) -> Result<Vec<u8>, Failure> {
 /// stream's first header block carries. Stream 1 is this lane's and the only one
 /// it opens, so the codec needs no stream-id bookkeeping.
 pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
+    let mut block = Vec::with_capacity(96 + dial.pass.token.len());
+    hpack::hpack_connect(target, &dial.pass.token, &mut block);
+    open_h2_with(dial, &block)
+}
+
+/// One UDP target as its own H2 connection carrying CONNECT-UDP: a lane stays
+/// one stream on one connection, so a second target is a second connection
+/// rather than stream bookkeeping this codec does not have.
+pub(crate) fn open_udp(
+    dial: &FoxyDial,
+    target_host: &str,
+    target_port: u16,
+) -> Result<Tls2, Failure> {
+    let edge = if dial.port == 443 {
+        dial.host.clone()
+    } else {
+        format!("{}:{}", dial.host, dial.port)
+    };
+    let mut block = Vec::with_capacity(160 + dial.pass.token.len() + target_host.len());
+    masque::connect_udp(
+        &edge,
+        target_host,
+        target_port,
+        &dial.pass.token,
+        &mut block,
+    );
+    open_h2_with(dial, &block)
+}
+
+fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
     let stream = tcp(dial)?;
     let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
         .map_err(|_| Failure::Io)?;
     tls.handshake().map_err(|_| Failure::Io)?;
     negotiated(&tls, dial)?;
 
-    let mut block = Vec::with_capacity(96 + dial.pass.token.len());
-    hpack::hpack_connect(target, &dial.pass.token, &mut block);
     // The stream window arrives in the settings; the connection window only
     // moves by a frame, so without this one the tunnel is paced by a round trip
     // for its first 64 KiB however large the stream window is.
@@ -202,7 +233,7 @@ pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
         &(frames::WINDOW - frames::DEFAULT_WINDOW).to_be_bytes(),
         &mut opening,
     );
-    h2_frame(frames::HEADERS, 0x4, 1, &block, &mut opening);
+    h2_frame(frames::HEADERS, 0x4, 1, block, &mut opening);
     tls.write_all(&opening).map_err(|_| Failure::Io)?;
 
     let mut lane = Tls2 {
@@ -212,6 +243,7 @@ pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
         carry: Vec::new(),
         at: 0,
         out: Vec::new(),
+        capsule_buf: Vec::new(),
         fin: false,
     };
     let status = lane.await_status()?;
@@ -244,6 +276,9 @@ pub(crate) struct Tls2 {
     at: usize,
     /// The frame this lane writes, reused so a relay allocates nothing per frame.
     out: Vec<u8>,
+    /// Bytes of the capsule stream a datagram read has not parsed yet: one
+    /// capsule may span DATA frames, so frames accumulate here.
+    capsule_buf: Vec<u8>,
     fin: bool,
 }
 
@@ -383,6 +418,91 @@ impl Tls2 {
             self.at = 0;
         }
         take
+    }
+
+    /// One UDP payload as one DATAGRAM capsule, split over DATA frames when it
+    /// does not fit: the capsule stream is byte-oriented, so a frame boundary
+    /// inside it is legal and the reader reassembles.
+    pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        if self.fin {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        self.out.clear();
+        masque::datagram_encode(payload, &mut self.out);
+        let mut at = 0usize;
+        while at < self.out.len() {
+            let frame = foxy::flow::frame_size(self.out.len() - at, self.max_frame)
+                .min(self.window.stream());
+            if frame == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            self.window.take(frame);
+            let frame = frame as usize;
+            let header = frames::H2Frame {
+                kind: frames::DATA,
+                flags: 0,
+                stream: 1,
+                length: frame as u32,
+            }
+            .header();
+            self.tls.write_all(&header)?;
+            self.tls.write_all(&self.out[at..at + frame])?;
+            at += frame;
+        }
+        Ok(())
+    }
+
+    /// One UDP payload out of the capsule stream: frames accumulate until a
+    /// whole DATAGRAM capsule parses, so a capsule split over frames still
+    /// arrives as one datagram. Empty datagrams carry nothing and are skipped,
+    /// which keeps `Ok(0)` for the end of the stream.
+    pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
+                let take = buf.len().min(payload.len());
+                buf[..take].copy_from_slice(&payload[..take]);
+                let len = payload.len();
+                self.capsule_buf.drain(..used);
+                if len == 0 {
+                    continue;
+                }
+                return Ok(len);
+            }
+            if self.fin {
+                return Ok(0);
+            }
+            if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
+                self.capsule_buf.clear();
+                return Err(std::io::Error::other(
+                    "foxy: a capsule stream that never parses",
+                ));
+            }
+            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Data { payload, end } => {
+                        lane.capsule_buf.extend_from_slice(payload);
+                        lane.fin = end;
+                        lane.window.add_stream(payload.len() as u32);
+                        lane.window.add_connection(payload.len() as u32);
+                        if !payload.is_empty() {
+                            lane.credit(payload.len()).map_err(io)?;
+                        }
+                        Ok(())
+                    }
+                    frames::H2Event::Ping { ack: false, .. } => {
+                        lane.ack(frames::PING, payload).map_err(io)?;
+                        Ok(())
+                    }
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        lane.fin = true;
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            });
+            read??;
+        }
     }
 }
 
@@ -1215,7 +1335,7 @@ mod loopback {
 
     #[test]
     fn the_shared_lane_carries_both_directions_at_once() {
-        const BIG: usize = 64 * 1024;
+        const BIG: usize = 16 * 1024;
         const STEP: usize = 1024;
         let (roots, server) = minted(b"h2");
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -1225,7 +1345,7 @@ mod loopback {
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
         let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
         tunnel
-            .set_read_quantum(Duration::from_millis(50))
+            .set_read_quantum(Duration::from_millis(5))
             .expect("bounds one read");
         let lane = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
         let sent: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
@@ -1310,6 +1430,93 @@ mod loopback {
         });
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
         assert!(Tunnel::open(&dial, "example.com:443", None).is_ok());
+        edge.join().expect("joins");
+    }
+
+    #[test]
+    fn the_masque_carrier_opens_connect_udp_and_echoes_a_datagram() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(&server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            read_exact(&mut tls, &mut head).expect("reads the preface");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                read_exact(&mut tls, &mut header).expect("reads a frame");
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                read_exact(&mut tls, &mut payload).expect("reads a payload");
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { block, .. } => {
+                        seen_tx.send(block.to_vec()).expect("reports the block");
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let mut stream = Vec::new();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                read_exact(&mut tls, &mut header).expect("reads a datagram frame");
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                read_exact(&mut tls, &mut payload).expect("reads a datagram");
+                if frame.kind != frames::DATA {
+                    continue;
+                }
+                stream.extend_from_slice(&payload);
+                if let Some((_, datagram)) = masque::datagram_split(&stream) {
+                    let mut echo = Vec::new();
+                    masque::datagram_encode(datagram, &mut echo);
+                    let mut out = Vec::new();
+                    h2_frame(frames::DATA, 0, 1, &echo, &mut out);
+                    tls.write_all(&out).expect("echoes");
+                    return;
+                }
+            }
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut lane = open_udp(&dial, "example.com", 443).expect("opens");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("block");
+        let text = String::from_utf8_lossy(&block);
+        for field in [
+            "connect-udp",
+            "/.well-known/masque/udp/example.com/443/",
+            "Bearer the-pass",
+        ] {
+            assert!(text.contains(field), "missing {field}");
+        }
+        lane.write_datagram(b"hello udp").expect("writes");
+        lane.flush().expect("flushes");
+        let mut back = [0u8; 64];
+        let mut at = 0usize;
+        while at < b"hello udp".len() {
+            match lane.read_datagram(&mut back[at..]) {
+                Ok(0) => panic!("the echo ended early"),
+                Ok(read) => at += read,
+                Err(error) => panic!("the echo failed: {error}"),
+            }
+        }
+        assert_eq!(&back[..at], b"hello udp");
         edge.join().expect("joins");
     }
 

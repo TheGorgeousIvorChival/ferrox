@@ -31,7 +31,7 @@ env:
 
 jobs:
   foxy-relay:
-    name: Foxy relay live (exit country + 1 MB download)
+    name: Foxy relay live (tcp download + udp dns)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -111,6 +111,74 @@ jobs:
             'https://speed.cloudflare.com/__down?bytes=1000000' -o file.bin
           test "$(wc -c < file.bin)" = 1000000
           sha256sum file.bin
+      - name: DNS through the tunnel over UDP
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          python3 - <<'PY'
+          import random, socket, struct, sys, time
+          def udp_addr(packet):
+              atyp = packet[0]
+              if atyp == 1:
+                  return 4 + 2, socket.inet_ntoa(packet[1:5])
+              if atyp == 4:
+                  return 16 + 2, socket.inet_ntop(socket.AF_INET6, packet[1:17])
+              ln = packet[1]
+              return 1 + 1 + ln + 2, packet[2:2 + ln].decode()
+          def dns_query(name):
+              qid = random.randint(1, 65534)
+              head = struct.pack('>HHHHHH', qid, 0x0100, 1, 0, 0, 0)
+              body = b''.join(bytes([len(p)]) + p.encode() for p in name.split('.')) + b'\x00'
+              return qid, head + body + struct.pack('>HH', 1, 1)
+          def dns_answers(reply, qid):
+              (rid, flags, qd, an, _, _) = struct.unpack('>HHHHHH', reply[:12])
+              assert rid == qid, 'query id came back different'
+              assert flags & 0x000F == 0, 'dns rcode is not zero'
+              assert an > 0, 'no answer records'
+              at = 12
+              for _ in range(qd):
+                  while reply[at] != 0:
+                      at += 1 + reply[at]
+                  at += 5
+              out = []
+              for _ in range(an):
+                  if reply[at] & 0xC0 == 0xC0:
+                      at += 2
+                  else:
+                      while reply[at] != 0:
+                          at += 1 + reply[at]
+                      at += 1
+                  rtype, _, _, rdlen = struct.unpack('>HHIH', reply[at:at + 8])
+                  at += 8
+                  if rtype == 1 and rdlen == 4:
+                      out.append(socket.inet_ntoa(reply[at:at + 4]))
+                  at += rdlen
+              return out
+          tcp = socket.create_connection(('127.0.0.1', 10808), timeout=30)
+          tcp.sendall(bytes([5, 1, 0]))
+          assert tcp.recv(2) == b'\x05\x00', 'no method'
+          tcp.sendall(bytes([5, 3, 0, 1, 0, 0, 0, 0, 0, 0]))
+          reply = tcp.recv(64)
+          assert reply[:3] == b'\x05\x00\x00', 'associate refused'
+          skip, _ = udp_addr(reply[3:])
+          relay = ('127.0.0.1', struct.unpack('>H', reply[3 + skip:3 + skip + 2])[0])
+          udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          udp.settimeout(20)
+          deadline = time.time() + 240
+          answers = []
+          while time.time() < deadline and not answers:
+              qid, query = dns_query('one.one.one.one')
+              target = b'\x00\x00\x00\x03\x0eone.one.one.one' + struct.pack('>H', 53)
+              udp.sendto(target + query, relay)
+              try:
+                  packet, _ = udp.recvfrom(65535)
+              except socket.timeout:
+                  continue
+              assert packet[:3] == b'\x00\x00\x00', 'bad socks udp header'
+              hlen, _ = udp_addr(packet[3:])
+              answers = dns_answers(packet[3 + hlen:], qid)
+          assert answers, 'no dns answer through the tunnel within 240s'
+          print('dns through the tunnel:', answers)
+          PY
       - name: Stop the lane and show its log
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
