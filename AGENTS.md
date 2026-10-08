@@ -102,6 +102,14 @@ not call the slice complete.
   shows up as a number that only goes up. The same test found that `trim()`
   returning early on `base == 0` made the reclaim branch unreachable. **Write the
   capacity assertion before the buffer, not after.**
+- **A pool filled by one thread and drained by another has one owner, and the
+  parse order has to respect it.** Inbound KCP buffers are filled by the socket
+  thread and returned by the reader, so the pool lives in the connection both
+  touch — and the accept loop reads the conversation from four header bytes
+  before parsing, because parsing needs the pool and the pool needs the session.
+  Parsing first and looking up second would parse twice or lend a stranger's
+  buffers, and an unparsable datagram from a new source still creates no session,
+  the way it did before the pool.
 - **A loopback test cannot gate a syscall count, and a scheduler-dependent count
   is not a gate at all.** Drive the counter from an in-memory stream that always
   answers the whole buffer, where the number is exact; assert only the bytes

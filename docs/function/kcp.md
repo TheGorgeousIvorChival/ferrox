@@ -45,6 +45,8 @@ graph TD
 | app-rows-serving-over-kcp | 4 | ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback |
 | send-payload-buffers-per-window | 1 | ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing |
 | send-payload-reallocations-per-window | 0 | ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing |
+| receive-payload-reallocations-per-window | 0 | ferrox-core-kcp::connection::tests::the_receive_pool_serves_every_segment_without_growing |
+| receive-parse-allocations-per-segment | 0 | ferrox-core-kcp::segment::tests::a_data_segment_is_parsed_into_the_lent_buffer |
 | segment-header-staging-copies-per-segment | 0 | ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one |
 
 | segment-list-vectors-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
@@ -239,22 +241,27 @@ What is **not** removed, and is named rather than claimed:
   Removing it means `AckSegment` borrowing the caller's buffer, which puts a
   lifetime on a public segment type for 50 allocations a second. That is more
   code for less, so it stays.
-- **A `Vec<u8>` per received data segment — the same problem the send path just
-  solved, and the next real one.** `DataSegment::parse` does
-  `buf.get(..)?.to_vec()`, so receiving is also about 9 400 allocation pairs a
-  second per direction at 100 Mbps. An arena works on the send path because
-  segments are consumed in order; here the receiving window deliberately holds
-  out-of-order segments, so the live ranges are not a prefix and a single
-  `Vec` cannot be trimmed without a minimum over the window's keys. A chunked
-  arena, or a `ReceivingWorker`-owned ring with a head that is only advanced to
-  the first gap, is the shape. It is not a patch: it is untested territory on the
-  path that must not drop or reorder a byte, and there is no measurement behind
-  it. Named as the next KCP slice rather than landed.
-- **A `Vec` per 1 332-byte send chunk.** `SendingWindow` has to own each
-  outbound payload for retransmission, so the payload cannot be a borrow of the
-  caller's read buffer. An arena with front-trimming would remove the
-  allocation, and it is a real refactor of `window.rs` with real aliasing
-  hazards. Open.
+- **A `Vec<u8>` per received data segment — the same 9 400/s the send path had.**
+  `DataSegment::parse` did `buf.get(..)?.to_vec()`, so receiving allocated and
+  freed once per segment. The buffers now come from a pool owned by
+  `ReceivingWorker`: the socket thread lends one per segment through
+  `Connection::take_payload`, parsing fills it, and `read` returns it when
+  drained. That is `receive-payload-reallocations-per-window 0`, gated by spare
+  **capacity** steady over 64 rounds of eight 1 332-byte segments, and
+  `receive-parse-allocations-per-segment 0`, gated by the parsed payload's base
+  address *being* the lent buffer's at five lengths — a byte test passes with
+  the copy either way, so pointer identity is the witness. Against the pins
+  this is the same sizing win as the send arena: Xray's pool hands out 8 KiB
+  for a 1 332-byte payload, while these buffers settle at the payloads they
+  carry times the deepest the window ever held.
+
+  Two orderings matter and both are pinned. The accept loop reads the
+  conversation from the first four bytes *before* it has a session to lend
+  from, so an unparsable datagram from a new source still creates no session —
+  creating one would spawn its update thread for garbage. And lending goes
+  through the connection the segments are fed to, never a thread-local, because
+  the reader that returns the buffers is a different thread from the socket
+  that fills them.
 
 ## Pins
 

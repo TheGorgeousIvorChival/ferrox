@@ -35,6 +35,13 @@ impl Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentOption(pub u8);
 
+/// Hands out the buffer for the next inbound data-segment payload. The
+/// socket thread supplies one; `ReceivingWorker::read` returns spent buffers to
+/// the same place. A datagram's payloads then cost no allocation once the
+/// window has been full once, which at the default 1 332-byte MSS is about
+/// 9 400 malloc/free pairs a second per direction at 100 Mbps.
+pub type TakePayload<'a> = dyn Fn() -> Vec<u8> + 'a;
+
 impl SegmentOption {
     pub const NONE: Self = Self(0);
     pub const CLOSE: Self = Self(1);
@@ -67,11 +74,20 @@ impl DataSegment {
         &self.payload
     }
 
-    fn parse(conv: u16, option: SegmentOption, buf: &[u8]) -> Option<(Self, &[u8])> {
+    fn parse<'a>(
+        conv: u16,
+        option: SegmentOption,
+        buf: &'a [u8],
+        take: &TakePayload<'_>,
+    ) -> Option<(Self, &'a [u8])> {
         if buf.len() < 15 {
             return None;
         }
         let data_len = usize::from(be16(buf, 12));
+        let body = buf.get(14..14 + data_len)?;
+        let mut payload = take();
+        payload.clear();
+        payload.extend_from_slice(body);
         Some((
             Self {
                 conv,
@@ -79,7 +95,7 @@ impl DataSegment {
                 timestamp: be32(buf, 0),
                 number: be32(buf, 4),
                 sending_next: be32(buf, 8),
-                payload: buf.get(14..14 + data_len)?.to_vec(),
+                payload,
                 timeout: 0,
                 transmit: 0,
             },
@@ -353,7 +369,7 @@ impl Segment {
 }
 
 #[must_use]
-pub fn read_segment(buf: &[u8]) -> Option<(Segment, &[u8])> {
+pub fn read_segment<'a>(buf: &'a [u8], take: &TakePayload<'_>) -> Option<(Segment, &'a [u8])> {
     if buf.len() < 4 {
         return None;
     }
@@ -367,7 +383,7 @@ pub fn read_segment(buf: &[u8]) -> Option<(Segment, &[u8])> {
             Some((Segment::Ack(seg), tail))
         }
         1 => {
-            let (seg, tail) = DataSegment::parse(conv, opt, rest)?;
+            let (seg, tail) = DataSegment::parse(conv, opt, rest, take)?;
             Some((Segment::Data(seg), tail))
         }
         _ => {
@@ -380,6 +396,49 @@ pub fn read_segment(buf: &[u8]) -> Option<(Segment, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `parse` fills the buffer it is lent instead of allocating: the payload's
+    /// pointer is the lent buffer's and its capacity survives the fill, so a
+    /// byte-level test passing either way cannot stand in for this one.
+    #[test]
+    fn a_data_segment_is_parsed_into_the_lent_buffer() {
+        for len in [1usize, 100, 1332, 1400, 2048] {
+            let seg = DataSegment {
+                conv: 1,
+                option: SegmentOption::NONE,
+                timestamp: 3,
+                number: 4,
+                sending_next: 5,
+                payload: vec![0x5Au8; len],
+                timeout: 0,
+                transmit: 0,
+            };
+            let mut buf = Vec::new();
+            Segment::Data(seg).serialize(&mut buf);
+            let slot = std::cell::RefCell::new(Some(Vec::with_capacity(2048)));
+            let lent = slot.borrow().as_ref().expect("a lent buffer").as_ptr();
+            let (got, rest) = read_segment(&buf, &|| {
+                slot.borrow_mut().take().expect("one data segment")
+            })
+            .unwrap();
+            assert_eq!(rest.len(), 0, "len {len}");
+            let Segment::Data(got) = got else {
+                panic!("len {len}: a data segment parses as data");
+            };
+            assert_eq!(
+                got.payload.as_ptr(),
+                lent,
+                "len {len}: parse allocated instead of filling"
+            );
+            assert_eq!(
+                got.payload.capacity(),
+                2048,
+                "len {len}: the fill grew the lent buffer"
+            );
+            assert_eq!(got.payload.len(), len, "len {len}");
+            assert!(got.payload.iter().all(|&b| b == 0x5A), "len {len}");
+        }
+    }
 
     #[test]
     fn a_data_segment_round_trips() {
@@ -396,7 +455,7 @@ mod tests {
         let mut buf = Vec::new();
         Segment::Data(seg.clone()).serialize(&mut buf);
         assert_eq!(buf.len(), DATA_SEGMENT_OVERHEAD as usize + 4);
-        let (got, rest) = read_segment(&buf).unwrap();
+        let (got, rest) = read_segment(&buf, &|| Vec::new()).unwrap();
         assert_eq!(rest.len(), 0);
         assert_eq!(got, Segment::Data(seg));
     }
@@ -412,7 +471,7 @@ mod tests {
         seg.put_number(2);
         let mut buf = Vec::new();
         Segment::Ack(seg.clone()).serialize(&mut buf);
-        let (got, _) = read_segment(&buf).unwrap();
+        let (got, _) = read_segment(&buf, &|| Vec::new()).unwrap();
         match got {
             Segment::Ack(a) => {
                 assert_eq!(a.numbers, vec![1, 2]);
@@ -497,7 +556,7 @@ mod tests {
         raw.extend_from_slice(&1u32.to_be_bytes());
         raw.extend_from_slice(&2u32.to_be_bytes());
         raw.extend_from_slice(&3u32.to_be_bytes());
-        let (seg, _) = read_segment(&raw).unwrap();
+        let (seg, _) = read_segment(&raw, &|| Vec::new()).unwrap();
         match seg {
             Segment::CmdOnly(c) => assert_eq!(c.cmd, 250),
             _ => panic!("wrong variant"),
@@ -537,7 +596,7 @@ mod tests {
                 Segment::Data(seg.clone()).serialize(&mut buf);
                 buf.extend_from_slice(&trailer);
                 assert_eq!(buf.len(), DATA_SEGMENT_OVERHEAD as usize + len + tail_len);
-                let (got, rest) = read_segment(&buf).expect("parses");
+                let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("parses");
                 assert_eq!(got, Segment::Data(seg));
                 assert_eq!(rest, trailer);
             }
@@ -552,7 +611,7 @@ mod tests {
         raw.extend_from_slice(&3u32.to_be_bytes());
         raw.extend_from_slice(&9u16.to_be_bytes());
         raw.extend_from_slice(b"short");
-        assert!(read_segment(&raw).is_none());
+        assert!(read_segment(&raw, &|| Vec::new()).is_none());
     }
 
     #[test]
@@ -579,9 +638,9 @@ mod tests {
         Segment::Data(first.clone()).serialize(&mut buf);
         Segment::CmdOnly(second).serialize(&mut buf);
         assert_eq!(buf.len(), 23 + CMD_HEADER);
-        let (got, rest) = read_segment(&buf).expect("first parses");
+        let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("first parses");
         assert_eq!(got, Segment::Data(first));
-        let (got, rest) = read_segment(rest).expect("second parses");
+        let (got, rest) = read_segment(rest, &|| Vec::new()).expect("second parses");
         assert!(matches!(got, Segment::CmdOnly(_)));
         assert_eq!(rest.len(), 0);
     }
@@ -600,7 +659,7 @@ mod tests {
             let mut buf = Vec::new();
             Segment::CmdOnly(seg).serialize(&mut buf);
             assert_eq!(buf.len(), CMD_HEADER);
-            let (got, rest) = read_segment(&buf).expect("parses");
+            let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("parses");
             assert_eq!(got, Segment::CmdOnly(seg));
             assert_eq!(rest.len(), 0);
         }
@@ -611,7 +670,7 @@ mod tests {
         for cmd in [0u8, 1u8] {
             let mut buf = vec![0xbe, 0xef, cmd, 0xa5];
             buf.extend_from_slice(&[0u8; CMD_HEADER]);
-            let (got, _) = read_segment(&buf).expect("parses");
+            let (got, _) = read_segment(&buf, &|| Vec::new()).expect("parses");
             match (cmd, got) {
                 (0, Segment::Ack(a)) => assert_eq!((a.conv, a.option.0), (0xbeef, 0xa5)),
                 (1, Segment::Data(d)) => assert_eq!((d.conv, d.option.0), (0xbeef, 0xa5)),
@@ -634,7 +693,7 @@ mod tests {
             let mut buf = Vec::new();
             Segment::Ack(seg.clone()).serialize(&mut buf);
             assert_eq!(buf.len(), ACK_HEADER + count * 4);
-            let (got, rest) = read_segment(&buf).expect("parses");
+            let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("parses");
             assert_eq!(got, Segment::Ack(seg));
             assert_eq!(rest.len(), 0);
         }
@@ -647,6 +706,6 @@ mod tests {
         raw.extend_from_slice(&4u32.to_be_bytes());
         raw.extend_from_slice(&5u32.to_be_bytes());
         raw.extend_from_slice(&0u16.to_be_bytes());
-        assert!(read_segment(&raw).is_none());
+        assert!(read_segment(&raw, &|| Vec::new()).is_none());
     }
 }
