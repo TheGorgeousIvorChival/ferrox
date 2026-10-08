@@ -687,12 +687,34 @@ fn write_mux_frame(
     frame: ferrox_core::mux::Outgoing<'_>,
     data: Option<&[u8]>,
 ) -> bool {
-    let len = data.map_or(0, <[u8]>::len);
-    resize_scratch(staging, frame.frame_len(len));
-    let written = frame.encode_into(data, staging);
-    staging.truncate(written);
+    // A mux payload is framed, not sealed, so it goes to the socket from
+    // where it was read: one writev, and no copy of the relayed byte.
+    if let Some(payload) = data {
+        assert!(
+            payload.len() <= ferrox_core::mux::CHUNK_MAX,
+            "mux chunk longer than a length field"
+        );
+        let at = frame.encode_header_into(staging);
+        frame.patch_payload_len(staging, at, payload.len());
+        write_mux_two(shared, staging, payload)
+    } else {
+        resize_scratch(staging, frame.frame_len(0));
+        let written = frame.encode_into(None, staging);
+        staging.truncate(written);
+        match shared.lock() {
+            Ok(mut stream) => stream.write_all(staging).is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// One `writev` of a frame header and the read buffer behind a shared uplink.
+/// That is what makes both mux relay directions cost zero copies of the
+/// payload, and `a_two_part_write_hands_the_payload_over_by_pointer` is the
+/// gate — a byte-level test cannot see it either way.
+fn write_mux_two(shared: &Arc<Mutex<TcpStream>>, first: &[u8], second: &[u8]) -> bool {
     match shared.lock() {
-        Ok(mut stream) => stream.write_all(staging).is_ok(),
+        Ok(mut stream) => write_all_two(&mut stream, first, second),
         Err(_) => false,
     }
 }
@@ -9110,6 +9132,28 @@ mod tests {
             "the payload must be the writev part itself, not a copy of it"
         );
         assert_eq!(parts[1].iov_len, 1400);
+    }
+
+    /// The relay refuses a payload the frame format cannot carry, the way the
+    /// single-buffer encoder always did: patching the two-byte length must
+    /// never truncate, so oversize is a panic and not a wrap.
+    #[test]
+    #[should_panic(expected = "mux chunk longer than a length field")]
+    fn a_relay_payload_longer_than_a_frame_is_refused_not_truncated() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("dials");
+        let shared = Arc::new(Mutex::new(stream));
+        let keep = ferrox_core::mux::Outgoing {
+            id: 1,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: None,
+            global_id: None,
+        };
+        let mut staging = Vec::new();
+        let big = vec![0u8; ferrox_core::mux::CHUNK_MAX + 1];
+        let _ = write_mux_frame(&shared, &mut staging, keep, Some(&big));
     }
 
     /// The uplink writes a header it built once and a payload it never copied,
