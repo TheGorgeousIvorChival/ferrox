@@ -359,9 +359,9 @@ const QPACK_STATIC: [(&[u8], &[u8]); 99] = [
 ];
 
 /// The `:status` entries of a static table, HPACK's from index 8 and QPACK's
-/// from the table above. Every other index is a field this lane never reads,
-/// so an index outside these two tables is refused rather than skipped: a
-/// block carrying one is a block whose dynamic table this lane does not have.
+/// from the table above. Callers skip any other index: an indexed entry is one
+/// integer with nothing following it, so a field this lane never reads costs
+/// nothing to walk past.
 fn static_status(index: usize, h2: bool) -> Option<u16> {
     if h2 {
         const H2: [u16; 7] = [200, 204, 206, 304, 400, 404, 500];
@@ -386,34 +386,45 @@ fn status_of(bytes: &[u8]) -> Option<u16> {
     )
 }
 
-/// Reads the `:status` of an HPACK header block. The top three bits of a
-/// representation say which of the four forms it is, and this lane implements
-/// the two that carry a literal: everything else either needs a table it never
-/// fills — a dynamic size update, an incremental index — or is a field it does
-/// not read, which is skipped.
+/// Reads the `:status` of an HPACK header block. An indexed entry is one
+/// integer and nothing follows, so any index outside the `:status` range is
+/// skipped; a literal is a name plus a value, and only a `:status` name is
+/// read. A dynamic size update carries no entry and is skipped, because this
+/// lane keeps no dynamic table either way.
 pub fn hpack_status(block: &[u8]) -> Option<u16> {
     let mut at = 0usize;
     let mut status = None;
     while at < block.len() {
         let first = block[at];
-        let name_is_status = match first & 0xE0 {
-            0x80 => {
-                let index = read_integer(block, &mut at, 7)?;
-                status = Some(static_status(index, true)?);
-                continue;
+        if first & 0x80 != 0 {
+            let index = read_integer(block, &mut at, 7)?;
+            if let Some(code) = static_status(index, true) {
+                status = Some(code);
             }
-            0x40 => {
-                let index = read_integer(block, &mut at, 6)?;
-                if index != 8 {
-                    return None;
-                }
-                true
-            }
-            0x00 => {
-                at += 1;
+            continue;
+        }
+        if first & 0xC0 == 0x40 {
+            let index = read_integer(block, &mut at, 6)?;
+            let name_is_status = if index == 0 {
                 string_literal(block, &mut at)?.is_status()
+            } else {
+                static_status(index, true).is_some()
+            };
+            let value = string_literal(block, &mut at)?;
+            if name_is_status {
+                status = Some(status_of(value.as_bytes())?);
             }
-            _ => return None,
+            continue;
+        }
+        if first & 0xE0 == 0x20 {
+            read_integer(block, &mut at, 5)?;
+            continue;
+        }
+        let index = read_integer(block, &mut at, 4)?;
+        let name_is_status = if index == 0 {
+            string_literal(block, &mut at)?.is_status()
+        } else {
+            static_status(index, true).is_some()
         };
         let value = string_literal(block, &mut at)?;
         if name_is_status {
@@ -806,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn a_response_naming_a_table_this_lane_never_fills_is_refused() {
+    fn a_block_with_no_status_in_it_yields_none() {
         assert_eq!(hpack_status(&[0x3f, 0xe1, 0x1f]), None, "a size update");
         assert_eq!(
             hpack_status(&[0x0f, 0x61, 0x62, 0x63]),
@@ -839,6 +850,31 @@ mod tests {
             None,
             "a post-base index"
         );
+    }
+
+    #[test]
+    fn an_encoder_beyond_the_minimal_one_still_yields_its_status() {
+        // A size update, an indexed field this lane never reads, a literal
+        // with incremental indexing naming one, and then the indexed status.
+        let mut block = vec![0x3f, 0xe1, 0x1f, 0x80 | 0x21];
+        block.push(0x40);
+        integer_into(&mut block, 6, 33);
+        integer(&mut block, 7, 0x00, 1);
+        block.extend_from_slice(b"x");
+        block.push(0x88);
+        assert_eq!(hpack_status(&block), Some(200));
+        // The same status as a literal under its indexed name, with a literal
+        // date first: the name decides, not the representation.
+        let mut named = vec![0x00];
+        integer(&mut named, 7, 0x00, 4);
+        named.extend_from_slice(b"date");
+        integer(&mut named, 7, 0x00, 1);
+        named.extend_from_slice(b"x");
+        named.push(0x40);
+        integer_into(&mut named, 6, 13);
+        integer(&mut named, 7, 0x00, 3);
+        named.extend_from_slice(b"404");
+        assert_eq!(hpack_status(&named), Some(404));
     }
 
     #[test]

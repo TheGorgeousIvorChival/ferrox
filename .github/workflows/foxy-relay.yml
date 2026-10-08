@@ -68,6 +68,16 @@ jobs:
           echo "country=$FOXY_COUNTRY" >> "$GITHUB_ENV"
           ./target/debug/ferrox-app run -c foxy-relay.json > ferrox-relay.log 2>&1 &
           echo "$!" > ferrox-relay.pid
+      - name: Wait for the SOCKS port
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/10808) 2>/dev/null; then exit 0; fi
+            sleep 2
+          done
+          echo "the lane never listened" >&2
+          tail -n 30 ferrox-relay.log
+          exit 1
       - name: Download a real file through the tunnel
         if: steps.secrets.outputs.present == 'true'
         run: |

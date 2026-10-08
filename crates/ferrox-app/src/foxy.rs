@@ -330,8 +330,7 @@ impl Tls2 {
                 .with_frame(
                     |lane, frame, payload| match frames::h2_event(frame, payload, 1) {
                         frames::H2Event::Headers { block: more, .. } => {
-                            block.extend_from_slice(more);
-                            hpack::hpack_status(&block).map(Some).ok_or(Failure::Frame)
+                            header_status(&mut block, more, frame.flags & frames::END_HEADERS != 0)
                         }
                         frames::H2Event::Settings { ack: false, .. } => {
                             let mut at = 0usize;
@@ -351,6 +350,16 @@ impl Tls2 {
                         frames::H2Event::Push => lane.refuse_push().map(|()| None),
                         frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
                             Err(Failure::Stream)
+                        }
+                        // A status larger than one frame arrives in pieces: each
+                        // fragment is appended and the block is read once the
+                        // peer's `END_HEADERS` says it is whole.
+                        frames::H2Event::Other { kind } if kind == frames::CONTINUATION => {
+                            header_status(
+                                &mut block,
+                                payload,
+                                frame.flags & frames::END_HEADERS != 0,
+                            )
                         }
                         _ => Ok(None),
                     },
@@ -441,6 +450,31 @@ impl Read for Tls2 {
 
 /// The HTTP/1.1 relay: bytes in, bytes out, once the status has been read.
 pub(crate) struct Tls1(pub(crate) ferrox_core::tls::RustlsProvider<TcpStream>);
+
+/// Temporary undecodable-block dump behind `FOXY_DEBUG`: the hex of a header
+/// block no codec in this tree reads, so a red live run names the encoding.
+fn debug_block(block: &[u8]) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: undecodable header block {block:02x?}");
+    }
+}
+
+/// Appends one header-block fragment and reads the status once the peer's
+/// `END_HEADERS` says the block is whole; a partial block is never parsed.
+fn header_status(
+    block: &mut Vec<u8>,
+    piece: &[u8],
+    end_headers: bool,
+) -> Result<Option<u16>, Failure> {
+    block.extend_from_slice(piece);
+    if !end_headers {
+        return Ok(None);
+    }
+    hpack::hpack_status(block).map(Some).ok_or_else(|| {
+        debug_block(block);
+        Failure::Frame
+    })
+}
 
 /// Bounds one blocking read so a relay holding one lock for both directions
 /// can interleave: the backward read returns `WouldBlock` within the quantum
@@ -1228,6 +1262,53 @@ mod loopback {
             .recv_timeout(Duration::from_secs(30))
             .expect("both directions flow at once");
         assert_eq!(back, sent);
+    }
+
+    #[test]
+    fn the_http2_carrier_assembles_a_status_split_over_continuation() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(&server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            read_exact(&mut tls, &mut head).expect("reads the preface");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                read_exact(&mut tls, &mut header).expect("reads a frame");
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                read_exact(&mut tls, &mut payload).expect("reads a payload");
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        // The status in two fragments: an indexed field the
+                        // lane skips, then the indexed 200 on a CONTINUATION.
+                        let mut first = Vec::new();
+                        h2_frame(frames::HEADERS, 0x0, 1, &[0x80 | 0x21], &mut first);
+                        tls.write_all(&first).expect("sends the fragment");
+                        let mut rest = Vec::new();
+                        h2_frame(frames::CONTINUATION, 0x4, 1, &[0x88], &mut rest);
+                        tls.write_all(&rest).expect("sends the tail");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        assert!(Tunnel::open(&dial, "example.com:443", None).is_ok());
+        edge.join().expect("joins");
     }
 
     #[test]
