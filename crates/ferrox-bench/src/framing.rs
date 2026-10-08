@@ -177,7 +177,13 @@ fn header_row(host: &str) -> Row {
     )
 }
 
-const AEAD_LENGTHS: [usize; 5] = [64, 256, 1024, 4096, 16384];
+/// The lengths the seal and its halves are measured at. The two rows between
+/// the pass sizes are the point: the fused shape's head rides in a pass the body
+/// needs anyway, which pays while a pass is most of the call and stops paying
+/// once the body's passes fill a sequence. Gate 7's own columns put that
+/// crossover between 4 and 16 KiB on at least one runner, and without rows
+/// between them the threshold would be a guess.
+const AEAD_LENGTHS: [usize; 7] = [64, 256, 1024, 2048, 4096, 8192, 16384];
 
 pub(crate) fn gate_aead(key: &[u8; 32], nonce: &[u8; 12]) -> Vec<Row> {
     AEAD_LENGTHS
@@ -386,7 +392,17 @@ pub(crate) fn aead_report(rows: &[Row]) -> String {
          replaced, where the one-time key came out of its own 64-byte pass and the message\n\
          was encrypted by a second. Same ciphertext and same tag on both sides, asserted\n\
          before either is timed. Best of {} rounds per side. The bar is the same {:.2}x as\n\
-         gate 3.\n",
+         gate 3.\n\
+         \n\
+         The rows bracket the length at which the fused shape's head could stop paying\n\
+         for itself: a head takes a lane of every pass it rides in, so a body that fills\n\
+         whole passes could pay one more of them, while the two-call shape pays a narrow\n\
+         dependent chain once. Measured on all four runners of run `37763295337`, it does\n\
+         not: from 1 KiB up the two shapes read 0.98x-1.06x of each other on every runner\n\
+         and at every length, and the fused shape's win is where a pass is most of the\n\
+         call — 1.44x-1.75x at 64 bytes and 1.25x-1.54x at 256. The 0.96x at 16 KiB on\n\
+         macos aarch64 in run `37749274086` is one runner's noise and not a crossover, so\n\
+         no length threshold belongs in the seal.\n",
         crate::ROUNDS,
         crate::BAR
     );

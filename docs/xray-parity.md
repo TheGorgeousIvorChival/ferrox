@@ -77,25 +77,25 @@ This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 
 ## What to implement next (stop refusing, build instead)
 
-Each item is a slice in `crates/ferrox-prompt/prompts.md` (P45–P60).
+Each item names the roadmap slice that carries it; xhttp modes ride with P16, the rest are tracked in `crates/ferrox-prompt/prompts.md`.
 
 Priority by user value ÷ amount of pinned-upstream knowledge already in-tree:
 
-1. **P45 · SplitHTTP/xHTTP modes** — padding/placement modes + browser-client shape. The codec is already here; the modes are config surface (`proxy.rs:720` names this).
-2. **P46 · DNS app + DoH/DoQ client + fakeDNS** — row 26 flips to implemented; enables real routing later. Pin is in `upstream/xray-core/app/dns`.
-3. **P47 · Routing engine** — rules on domain/IP/port/network with balancers. Without it ferrox cannot be a drop-in for any multi-outbound config.
-4. **P48 · REALITY client dial** — row 36; the server half and the crypto are already here.
-5. **P49 · Shadowsocks-2022** — row 28; `proxy/shadowsocks_2022` pinned, KDF/replay logic is self-contained.
-6. **P50 · blackhole + loopback** — rows 25/27; both are tiny outbounds/inbounds once the dispatcher has a seam.
-7. **P51 · HTTP proxy inbound/outbound** — completes the "drop-in" inbound set next to socks.
-8. **P52 · dokodemo + TUN inbound (via zeptun)** — rows 24/29; needed for the goal-3 tun2socks claim to be wired, not aspirational.
-9. **P53 · Dokodemo → dispatcher sniffer** — HTTP/TLS/QUIC sniffing to feed the router.
-10. **P54 · MASQUE CONNECT-IP / CONNECT-UDP** — rows P33/P43; pinned in `upstream/xray-core/proxy/masque`, quiche available.
-11. **P55 · uTLS fingerprints + ECH** — rows 38/39; utls pinned upstream, pick by name the fingerprints we support.
-12. **P56 · VLESS `encryption` (XOR/MLKEM) + Vision UDP-443** — rows 34/35.
-13. **P57 · finalmask** — row 31; implement by name which masks we carry (salamander first: Hysteria already depends on it shape-wise).
-14. **P58 · WireGuard proxy** — replace with a thin Noise IKpsk2 wrapper (`proxy/wireguard` pinned) or name it refused-permanent.
-15. **P59 · Observatory/burst, stats, metrics, commander API, geodata, reverse portal** — one API slice at a time; start with stats + leastping balancer since balancers ride on stats.
-16. **P60 · xdrive + browser dialer** — rows 32; only after MASQUE, both are "exotic carrier" tier.
+1. **SplitHTTP/xHTTP modes** — padding/placement modes + browser-client shape. The codec is already here; the modes are config surface (`proxy.rs:720` names this).
+2. **DNS app + DoH/DoQ client + fakeDNS** — row 26 flips to implemented; enables real routing later. Pin is in `upstream/xray-core/app/dns`.
+3. **Routing engine** — rules on domain/IP/port/network with balancers. Without it ferrox cannot be a drop-in for any multi-outbound config.
+4. **REALITY client dial** — row 36; the server half and the crypto are already here.
+5. **Shadowsocks-2022** — row 28; `proxy/shadowsocks_2022` pinned, KDF/replay logic is self-contained.
+6. **blackhole + loopback** — rows 25/27; both are tiny outbounds/inbounds once the dispatcher has a seam.
+7. **HTTP proxy inbound/outbound** — completes the "drop-in" inbound set next to socks.
+8. **dokodemo + TUN inbound (via zeptun)** — rows 24/29; needed for the goal-3 tun2socks claim to be wired, not aspirational.
+9. **Dokodemo → dispatcher sniffer** — HTTP/TLS/QUIC sniffing to feed the router.
+10. **MASQUE CONNECT-IP / CONNECT-UDP** — pinned in `upstream/xray-core/proxy/masque`, quiche available.
+11. **uTLS fingerprints + ECH** — rows 38/39; utls pinned upstream, pick by name the fingerprints we support.
+12. **VLESS `encryption` (XOR/MLKEM) + Vision UDP-443** — rows 34/35.
+13. **finalmask** — row 31; implement by name which masks we carry (salamander first: Hysteria already depends on it shape-wise).
+14. **WireGuard proxy** — replace with a thin Noise IKpsk2 wrapper (`proxy/wireguard` pinned) or name it refused-permanent.
+15. **Observatory/burst, stats, metrics, commander API, geodata, reverse portal** — one API slice at a time; start with stats + leastping balancer since balancers ride on stats.
+16. **xdrive + browser dialer** — rows 32; only after MASQUE, both are "exotic carrier" tier.
 
 Sequencing note: 2 then 3 then 1 unblock real-world configs; 4–6 are parity fillers; 8 is required for the zeptun goal to be real rather than a row.

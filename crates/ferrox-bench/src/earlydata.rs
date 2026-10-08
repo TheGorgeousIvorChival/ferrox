@@ -53,27 +53,37 @@ fn check_encode(len: usize, data: &[u8]) {
     assert!(!digits.contains('='), "{len}: unpadded");
 }
 
+/// The room the shipped path already has. The request the line is appended to
+/// is built with its own headers' capacity, so what an encode may spend is the
+/// room it is handed: the digits, the header name and the CRLF at worst.
+fn request(len: usize) -> String {
+    String::with_capacity(len * 2 + 32)
+}
+
 fn check_encode_allocs(len: usize, data: &[u8]) -> (usize, usize) {
-    let mut out = String::with_capacity(len * 2);
-    early_line_into(&mut out, data);
-    out.clear();
+    let mut out = request(len);
     let ((), ours) = count::measure(|| {
         for _ in 0..ALLOC_ITERS {
+            out.clear();
             early_line_into(std::hint::black_box(&mut out), std::hint::black_box(data));
         }
     });
-    previous_line_into(&mut out, data);
-    out.clear();
     let ((), theirs) = count::measure(|| {
         for _ in 0..ALLOC_ITERS {
+            out.clear();
             previous_line_into(std::hint::black_box(&mut out), std::hint::black_box(data));
         }
     });
+    assert_eq!(
+        (ours.allocs, ours.bytes, ours.zeroed),
+        (0, 0, 0),
+        "{len}: the shipped encode appends into the caller's room and must not allocate"
+    );
     assert!(
-        ours.allocs < ALLOC_ITERS as usize,
-        "{len}: the shipped encode must not allocate per call, and it allocated {} times over \
+        theirs.allocs >= 2 * ALLOC_ITERS as usize,
+        "{len}: the reference must keep costing two Strings per call, and it spent {} over \
          {ALLOC_ITERS}",
-        ours.allocs
+        theirs.allocs
     );
     (ours.allocs, theirs.allocs)
 }
@@ -158,10 +168,12 @@ pub(crate) fn report(rows: &[Row]) -> String {
          `format!` into a second, then a copy of that into the request already being\n\
          built. Ours appends the digits to that request, so the reference makes two\n\
          allocations and two copies for one header line that this side makes none of.\n\
-         Every row asserts the finished line is equal and decodes back before it is timed,\n\
-         holds this side under one allocation per encode with the counting allocator while\n\
-         the reference's shape stays at two or more, both printed on every row. The bar is\n\
-         not zero and the file says why twice. Best of {} interleaved rounds per side.\n\
+         Every row asserts the finished line is equal and decodes back before it is timed, and\n\
+         holds this side to **zero** allocations per encode with the counting allocator while\n\
+         the reference's shape stays at two or more, both printed on every row. The zero is\n\
+         exact because the window counts the thread that opened it: the encode appends into\n\
+         room the request already holds, so an allocation here would be a buffer it grew\n\
+         itself. Best of {} interleaved rounds per side.\n\
          \n\
          **This is not a differential against a pinned in-process oracle** — the four\n\
          cannot be, and `docs/conformance.md` measures why per suite. The identity half\n\

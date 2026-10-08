@@ -587,7 +587,7 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
         }
         Carrier::Xhttp { path, mode } => {
             if *mode != XhttpMode::StreamOne {
-                eprintln!("xhttp mode `{mode:?}` is configured; the stream-one framing is what this rung serves, and the mode wire formats land with P45");
+                eprintln!("xhttp mode `{mode:?}` is configured; the stream-one framing is what this rung serves, and the mode wire formats land with P16");
             }
             let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
                 return;
@@ -5208,7 +5208,11 @@ pub(crate) fn read_http_head(stream: &mut TcpStream, limit: usize) -> Option<Vec
         if head.len() >= limit {
             return None;
         }
-        let n = stream.peek(&mut probe).ok()?;
+        let n = match stream.peek(&mut probe) {
+            Ok(n) => n,
+            Err(error) if is_timeout(&error) => continue,
+            Err(_) => return None,
+        };
         if n == 0 {
             return None;
         }
@@ -5314,6 +5318,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                         break;
                     }
                 }
+                Err(error) if is_timeout(&error) => {}
                 _ => break,
             }
         }
@@ -5330,6 +5335,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                     break;
                 }
             }
+            Err(error) if is_timeout(&error) => {}
             _ => break,
         }
     }
@@ -5372,6 +5378,7 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
                         break;
                     }
                 }
+                Err(error) if is_timeout(&error) => {}
                 _ => break,
             }
         }
@@ -5386,6 +5393,7 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
                     break;
                 }
             }
+            Err(error) if is_timeout(&error) => {}
             _ => break,
         }
     }
@@ -5393,11 +5401,13 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
     let _ = done.join();
 }
 
+// A quiet socket is not a dead one: retry the relay's poll grain, fail only a closed stream.
 pub(crate) fn read_exact(stream: &mut dyn Read, mut buf: &mut [u8]) -> std::io::Result<()> {
     while !buf.is_empty() {
         match stream.read(buf) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             Ok(n) => buf = &mut buf[n..],
+            Err(error) if is_timeout(&error) => {}
             Err(error) => return Err(error),
         }
     }
@@ -5676,8 +5686,10 @@ fn trojan_take(
 ) -> bool {
     while *filled < want {
         match stream.read(&mut head[*filled..want]) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) => return false,
             Ok(n) => *filled += n,
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => return false,
         }
     }
     true
@@ -8197,12 +8209,10 @@ mod tests {
             dial_vless(&client, &server, &vless, &target, Ladder::global());
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
@@ -8245,12 +8255,10 @@ mod tests {
             dial_trojan(&client, &server, &trojan, &target, Ladder::global());
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
@@ -8307,18 +8315,39 @@ mod tests {
             dial_vmess(&client, &server, &vmess, &target, Ladder::global());
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
     }
 
     type ServerHalf = TlsHalf<ferrox_core::tls::RustlsServerProvider<TcpStream>>;
+
+    /// Reads one echo off a socket the relay also holds: the relay resets
+    /// the shared timeout to its own poll grain, so a quiet socket is
+    /// retried up to the whole budget and only a closed one fails.
+    fn read_echo(sock: &mut TcpStream) -> [u8; 4] {
+        let start = std::time::Instant::now();
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < back.len() {
+            match sock.read(&mut back[at..]) {
+                Ok(0) => panic!("echoes: closed after {:?}", start.elapsed()),
+                Ok(n) => at += n,
+                Err(error) => {
+                    assert!(
+                        is_timeout(&error) && start.elapsed() < Duration::from_secs(120),
+                        "echoes: {error:?} after {:?}",
+                        start.elapsed()
+                    );
+                }
+            }
+        }
+        back
+    }
 
     enum TlsEcho {
         Vless([u8; 16]),
@@ -8408,12 +8437,10 @@ mod tests {
             dial_socks_outbound(&client, &out(port), &server, &target);
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
     }
 
     fn tls_vless_out(

@@ -90,11 +90,12 @@ fn check_allocs(method: Method, len: usize, plain: &[u8], windows: &mut Vec<Wind
             let _ = recv.open_in_place(std::hint::black_box(&mut staging));
         }
     });
-    assert!(
-        counts.per_iter(ALLOC_ITERS) < 1.0,
-        "{} {len}: {} allocations over {ALLOC_ITERS} chunks is not under one per chunk",
-        method.name(),
-        counts.allocs
+    assert_eq!(
+        (counts.allocs, counts.bytes, counts.zeroed),
+        (0, 0, 0),
+        "{} {len}: the seal and the open both write into the caller's buffer and must not \
+         allocate",
+        method.name()
     );
     windows.push(Window {
         method: method.name(),
@@ -139,7 +140,7 @@ pub(crate) fn report(rows: &[Row], windows: &[Window]) -> String {
          over the same chunk sizes. The reference is `aes-256-gcm`: not a flattering\n\
          choice but the method that shipped, and the one the conformance row names. Every\n\
          row asserts the two sides produce the same bytes before either is timed, and\n\
-         asserts **under one allocation per chunk** for all three methods, in place, in a\n\
+         asserts **zero allocations per chunk** for all three methods, in place, in a\n\
          buffer the relay stages once.\n\
          \n\
          **The ratios are printed and not judged, and that is a decision recorded rather\n\
@@ -193,9 +194,9 @@ pub(crate) fn report(rows: &[Row], windows: &[Window]) -> String {
     let _ = writeln!(
         out,
         "\nAllocations per chunk, over the window each row measured, from the same\n\
-         counting global allocator gates 2 and 7 use. The bar is **under one per chunk**,\n\
-         not zero: `count::measure` raises one process-wide flag, so a window also counts\n\
-         whatever else the process allocates while it is open. See `check_allocs`.\n\
+         counting global allocator gates 2 and 7 use. The bar is **zero**, and the count is\n\
+         exact: the window is open on the thread that opened it and on no other, so an\n\
+         allocation inside it is this code's rather than the process's. See `check_allocs`.\n\
          \n\
          | method | bytes | chunks | allocations | per chunk | bytes allocated |\n\
          | --- | ---: | ---: | ---: | ---: | ---: |"

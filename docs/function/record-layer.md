@@ -12,7 +12,10 @@ cannot disagree with another about the algorithm — it can only be slower. The
 portable backend is safe Rust, which is what lets Miri interpret the ladder at
 all; the SIMD backends are five instructions each whose only failure mode is a
 wrong answer, and a wrong answer is caught by a differential test before any
-timing runs.
+timing runs. Above the ladder sit the passes — `chacha::soa` on `aarch64` and
+`chacha::wide` over `chacha::avx512` on `x86_64` — and those are one body over a
+wider trait rather than one body over a wider register, for the reason the
+section below counts out.
 
 Above 512 bytes on aarch64 a fifth implementation takes over, `chacha::soa`: it
 gives a register one *word* of eight blocks instead of one row of one block, so
@@ -37,6 +40,49 @@ byte for byte at every length to 1032 bytes and at four start counters, head and
 headless, and gate 1 asserts the same bytes against the pinned `chacha20` crate
 before gate 3 times anything.
 
+From 1024 bytes on `x86_64` — 960 when the buffer carries a head, since the head
+is one of the pass's own blocks — and when the machine has both `avx512f` and
+`avx2`, one more pass takes over before that one: `chacha::wide`, the
+sixteen-block pass, instantiated over `__m512i` in `chacha::avx512`. It exists
+for two reasons that are counts and not tastes. The first is the register file.
+
+```bash
+CARGO_TARGET_DIR=/tmp/xtarget cargo rustc --release --target x86_64-apple-darwin \
+  -p ferrox-core --lib -- --emit=asm -C debuginfo=0
+# then read the round loop of `ferrox_core6chacha6avx210xor_blocks`
+# and of `ferrox_core6chacha6avx51210xor_blocks`: `decl`/`jne` close each.
+```
+
+The AVX2 pass's round loop body is **143 instructions a double round for eight
+blocks**: 128 operations, thirteen `vmovdqa` to and from the frame, and the
+loop's own two. Sixteen live state words fill a sixteen-register file, so the
+temporaries a rotate by twelve and a rotate by seven need come out of memory;
+`avx512f` has thirty-two registers and `vprold`, which makes all four rotations
+one instruction. Its loop body is **98 instructions for sixteen blocks**: 96
+operations and the loop's two, with no stack operand anywhere inside it. Per byte
+of keystream the rounds cost 2.79 instructions against 0.96, and that is the
+number the pass below 1024 bytes is measured against. The transpose is the other
+half of the trade and it also comes out ahead: sixty-four gathers for sixteen
+blocks, four a block, against the forty-eight the AVX2 pass's four 12-instruction
+transposes spend on eight — six a block for the same permutation, because a
+gather can move a 32-bit element across the whole register where an unpack
+network moves 128-bit lanes twice.
+
+Those instructions are the assembler's and not the clock's, which is why they
+can be counted for a target this machine cannot run. The equality cannot: the
+pass is instantiated a second time over sixteen `u32` in the same module, and
+`chacha::wide::tests::the_portable_pass_is_the_ladder_at_every_length` holds that
+instantiation to `portable::U4` at every length to 2072 bytes, four start
+counters, head and headless — the counter lanes, the diagonal, the index network
+and the head, all of it on the machine reading this. What is left to a machine
+with AVX-512 is the one instruction that applies the index network, and
+`chacha::avx512::tests::the_sixteen_block_pass_is_the_ladder_at_every_length` is
+that check on the two `x86_64` runners of `bench.yml` — both of which report
+`avx512f` in the machine line of every run quoted under `## Time` — and in the
+`x86_64` job of `ci.yml`, which runs the same test. A machine without `avx512f`
+neither reaches the code nor runs the test, and the report says which one it is:
+`ferrox_core::chacha_backend()` names the pass the dispatch found.
+
 `fill_exact_with_head` is the interesting entry point. ChaCha20-Poly1305 needs
 block 0 as the Poly1305 one-time key and blocks 1.. as the payload keystream,
 and a naive seal generates block 0, throws away 32 of its bytes, generates
@@ -50,7 +96,15 @@ discards nothing.
 ```mermaid
 graph TD
     A["fill_exact_with_head, len bytes"] --> B["base_state: constants,<br/>key, nonce, counter 0"]
-    B -->    C{"a wide target, and 512 bytes or more?"}
+    B --> Z0{"x86_64 with avx512f, and 1024 bytes or more?"}
+    Z0 -- yes --> Z["16 broadcasts, one word per register,<br/>the sixteen blocks in the lanes"]
+    Z --> ZT["10 double rounds over all sixteen,<br/>the diagonal is a register rename"]
+    ZT --> ZU["add the base back, then four index stages:<br/>each swaps one bit of the register name<br/>with one bit of the lane"]
+    ZU --> ZV["xor a whole block at a time<br/>into the caller's buffer,<br/>sixteen blocks a pass"]
+    ZV --> ZW{"another whole pass?"}
+    ZW -- yes --> Z
+    ZW -- no --> C{"a wide target, and 512 bytes or more?"}
+    Z0 -- no --> C
     C -- yes --> S["16 broadcasts, one word per register:<br/>aarch64 keeps two sets of four,<br/>x86_64 one set of eight, the blocks in the lanes"]
     S --> T["10 double rounds over every set,<br/>the diagonal is a register rename"]
     T --> U["add the base back,<br/>transpose one row of eight blocks"]
@@ -84,8 +138,9 @@ graph TD
 | zero-filled-bytes-per-fill | 0 | ferrox-bench-gate-2 |
 | blocks-per-byte | 1/64 | ferrox-bench-gate-2 |
 | blocks-per-iteration | 8 | ferrox-core-chacha::backend |
+| blocks-per-iteration-on-avx512 | 16 | ferrox-core-chacha::backend |
 | fused-head-blocks | 1 | ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted |
-| backends-a-differential-test-cannot-lie-to | 5 | ferrox-bench-gate-1 |
+| backends-a-differential-test-cannot-lie-to | 6 | ferrox-bench-gate-1 |
 <!-- counts:end -->
 
 ## Ops
@@ -213,8 +268,68 @@ own groups — 320 bytes reads 1.47x (185 ns) in the pass's run against 1.48x
 (179 ns) in the run before it, and 448 bytes 1.51x (312 ns) against 1.52x
 (304 ns).
 
+Run `37749274086` carries the sixteen-block pass — `f2c624e`, the commit this
+page ships with — against run `37740838172`, the eight-block pass at
+`d31ddae`, on the same two runner classes. Both `x86_64` reports name the pass in
+their own machine line: `ferrox core` reads `4-lane core: AVX-512, one word per
+register, 16 blocks a pass, the eight-block pass below a pass, at
+runtime-detected width`, and that line is `ferrox_core::chacha_backend()`, which
+returns it only when the runner's own `is_x86_feature_detected!("avx512f")` and
+`is_x86_feature_detected!("avx2")` both read true — the same condition that lets
+`chacha::avx512`'s differential test execute its body, so a run whose machine
+line names the pass is a run in which gate 1's 7 200 shapes went through it.
+Every length below 1024 bytes compiles to the same call in both runs, and the
+reference's own clock moved between them — 8 057 ns at 16 KiB against 9 316 ns
+on linux `x86_64`, 9 203 ns against 7 781 ns on windows `x86_64` — so each pair
+of columns is read as two runs and not one:
+
+| bytes | linux x86_64, eight-block pass | linux x86_64, sixteen-block pass | windows x86_64, eight-block pass | windows x86_64, sixteen-block pass |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 1.38x (428 ns) | 2.39x (213 ns) | 1.29x (392 ns) | 2.71x (220 ns) |
+| 4 KiB | 1.36x (1 743 ns) | 2.44x (831 ns) | 1.32x (1 483 ns) | 2.76x (841 ns) |
+| 16 KiB | 1.36x (6 846 ns) | 2.40x (3 359 ns) | 1.33x (5 863 ns) | 2.71x (3 400 ns) |
+| 64 KiB | 1.36x (27 188 ns) | 2.36x (13 688 ns) | 1.32x (23 561 ns) | 2.63x (13 977 ns) |
+
+The 16 KiB row is the record-sized one, and it halves on both runners: 6 846 ns
+to 3 359 ns on linux `x86_64` and 5 863 ns to 3 400 ns on windows `x86_64`,
+against a reference that read 13% *faster* on linux `x86_64` this time and 18%
+*slower* on windows `x86_64`, so the windows ratio is the flattered one of the
+two. That is the same shape the counts above predict from both halves of the
+trade: 0.96 round-loop instructions a byte against 2.79, and four transpose
+gathers a block against six, with the whole of the pass's extra setup inside a
+rate the eight-block pass already pays. The lengths that straddle a pass are
+where it pays for what it cannot cover — 1 023 bytes reads 1.63x (469 ns) on
+linux `x86_64` while 1 025 reads 2.00x (310 ns), the first being the eight-block
+pass plus a tail and the second a whole pass plus a one-block remainder. Gate
+3's own line for the run is 235 lengths with none below 0.95x, worst 1.00x at
+256 bytes, best 2.86x at 224 bytes; no length under 1024 bytes reaches the pass
+in either run, so those rows — the 1.15x worst the run before this one carried
+at the same 256 bytes included — are the runner and not either change.
+
+Gate 7 measures the seal against the two-call shape it replaced, and for one
+run it carried a length at which the fused shape's head looked like it stopped
+paying for itself: a head takes a lane of every pass it rides in, so a body that
+fills whole passes pays one more of them, and run `37749274086` read 0.96x at
+16 KiB on macos `aarch64` — the one sub-1.00x row of the seal. Rows at 2 KiB and
+8 KiB were added to bracket it, and in run `37763295337` the crossover is not
+there on any runner: from 1 KiB up the two shapes read 0.98x-1.06x of each other
+at every length, on all four, and the fused shape's win is where a pass is most
+of the call — 1.44x-1.75x at 64 bytes, 1.25x-1.54x at 256 — so the 0.96x was
+one runner's noise and no length threshold belongs in the seal. That is a
+negative result the rows were added to be able to state, and the reason no
+dispatch sits in `aead.rs`.
+
 ## What we removed
 
+- **Thirteen stack moves a double round, and four operations a quarter round.**
+  `vprold` makes all four of a quarter round's rotations one instruction where
+  `avx2` spends a shift, a shift and an or on each of the two that are not byte
+  moves, and the thirty-two-register file holds sixteen live state words with
+  room for the temporaries that a sixteen-register file has to send to the frame:
+  the AVX2 pass's round loop body is 143 instructions for eight blocks, thirteen
+  of them `vmovdqa` against the frame, and the AVX-512 pass's is 98 for sixteen
+  blocks — 96 operations and no stack operand at all. Per byte of keystream,
+  2.79 instructions against 0.96.
 - **Six lane permutations a double round a block on `aarch64`, and ten
   single-cycle shuffles a double round a state on `x86_64`.** Both lane layouts
   diagonalise by rotating the lane order of the row registers: `neon::N4`
@@ -316,11 +431,23 @@ What is **not** removed, and is named rather than claimed:
   harness — but `every_threshold_reaches_the_same_tag_from_both_sides` sweeps it
   as a shipping threshold and `the_neon_halves_are_the_three_limbs_at_every_length_around_the_threshold`
   gates on it. A reader of those two tests believes a shorter aarch64 rung ships.
-  It does not. The shipping ladders are `{128 stride-2, 1024 two-lane, 4096
-  NEON-4}` on aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64, so any page
-  that quotes a threshold has to say which architecture it means — the two do
-  not agree, and the x86 AVX2 rung moved to 1 KiB in `815eeb2` because its
-  fixed setup cost is repaid by then.
+  It does not. The shipping ladders are `{128 stride-2, 1024 NEON-4}` on
+  aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64, so any page that quotes a
+  threshold has to say which architecture it means — the two do not agree, and
+  each four-lane rung moved to 1 KiB where the other's gate sits: the AVX2 one
+  in `815eeb2` because its fixed setup cost is repaid by then, and the NEON-4
+  one in `89f9714` on the same measurement, taken again after the four blocks'
+  limbs came out of one `TBL4` a group.
+
+  **The two-lane rung below the four-lane one is unreachable, and this page
+  said otherwise until the line above was corrected.** `89f9714` moved
+  `NEON4_THRESHOLD_BYTES` down to `TWO_LANE_THRESHOLD_BYTES` at 1 024 and
+  `absorb` tests the four-lane rung first, so on `aarch64` every slice of 1 024
+  bytes or more reaches `absorb_neon4` and `absorb_two_lane` is entered by the
+  test at `poly1305.rs:1553` and by nothing else. The `4096` this page quoted
+  for NEON-4 was the reading that made the ladder look like three rungs on
+  `aarch64`; the code has two, and the dead one is a slice in the roadmap
+  rather than a threshold to tune here.
 
   This also bounds what the ladder-head guards on the four-lane rungs can
   assume: the head is `e = blocks % 4` blocks, so at most 48 bytes, and the
@@ -328,6 +455,24 @@ What is **not** removed, and is named rather than claimed:
   guards may call `absorb_one_block_chain` directly instead of going back
   through `absorb` — a 48-byte slice can never reach another rung, so there is
   no dispatch to skip.
+- **The sixteen-block pass is checked by the runners, not here.** Nothing this
+  repository builds on can execute `avx512f` without a machine that has it, so
+  `chacha::avx512::Z16` is not run on the machine reading this — and an emulator
+  does not stand in: a `x86_64` build of this crate run under Rosetta on Apple
+  silicon reports `avx512f` false, which is the very `is_x86_feature_detected!`
+  the test reads on its first line and the dispatch itself calls, so the body
+  returns before it runs a block. The pass's *shape* is checked everywhere:
+  `chacha::wide` carries the same body over sixteen `u32`, and the differential
+  test beside it holds that instantiation to `portable::U4` at every length to
+  2072 bytes and four start counters, head and headless. What is left to a
+  machine with AVX-512 is one instruction — the gather whose `idx & 0x10` bit
+  picks the source register — so the honest split is: the index table is proved a
+  transpose here, the pass over it is proved the ladder here, and the one
+  instruction that applies it is proved on the two `x86_64` runners of
+  `bench.yml` and in the `x86_64` job of `ci.yml`. If no runner carried
+  `avx512f`, the test would still return without testing anything, which is why
+  the machine line of each run quoted under `## Time` is quoted beside the
+  number: the claim is a claim about those machines.
 - **`ops-retired-instructions` is still `UNBLESSED` on every page.** One symbol
   in this repository carries a blessed exact count, `der_to_pem`. The removed
   operations named above are counted in the table — copies, allocations, passes,

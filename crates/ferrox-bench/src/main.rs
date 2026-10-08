@@ -756,7 +756,7 @@ fn gate_eight(report: &mut String) -> Vec<framing::Row> {
     let rows = earlydata::gate_early_data();
     println!(
         "gate 8 passed: {} early-data encode rows, byte-identical to their references, none \
-         below {BAR:.2}x, and under one allocation per encode on this side",
+         below {BAR:.2}x, and zero allocations per encode on this side",
         rows.len()
     );
     report.push_str(&earlydata::report(&rows));
@@ -776,8 +776,8 @@ fn linkconfig_exit() -> Option<i32> {
 fn gate_nine(report: &mut String) {
     let (rows, windows) = ciphers::gate_ciphers();
     println!(
-        "gate 9 passed: {} shadowsocks cipher rows, byte-identical to the reference and under \
-         one allocation per chunk on all three methods; the timing rows are printed only",
+        "gate 9 passed: {} shadowsocks cipher rows, byte-identical to the reference and zero \
+         allocations per chunk on all three methods; the timing rows are printed only",
         rows.len()
     );
     report.push_str(&ciphers::report(&rows, &windows));
@@ -787,7 +787,7 @@ fn gate_ten(report: &mut String) -> Vec<framing::Row> {
     let (rows, windows) = aesgcm::gate_aesgcm();
     println!(
         "gate 10 passed: {} aes-128/256-gcm rows, ciphertext and tag identical to the crate and \
-         under one allocation per seal+open pair",
+         zero allocations per seal+open pair",
         rows.len()
     );
     let engine = ferrox_core::aesgcm::Aes128Gcm::new(&[7u8; 16]);
