@@ -213,6 +213,8 @@ impl SendingWorker {
 
 pub struct ReceivingWorker {
     ctx: Arc<Ctx>,
+    /// Spent payload buffers, ready to be filled by the next inbound segment.
+    spare: Vec<Vec<u8>>,
     left_over: VecDeque<Vec<u8>>,
     left_over_off: usize,
     window: ReceivingWindow,
@@ -233,6 +235,7 @@ impl ReceivingWorker {
         let window_size = config.receiving_in_flight_size();
         Self {
             ctx,
+            spare: Vec::new(),
             left_over: VecDeque::new(),
             left_over_off: 0,
             window: ReceivingWindow::new(),
@@ -284,6 +287,24 @@ impl ReceivingWorker {
         }
     }
 
+    /// One payload buffer for the socket thread to fill. Drained buffers go back
+    /// to `spare`, so the count settles at the deepest the window ever held.
+    pub fn take_payload(&mut self) -> Vec<u8> {
+        let mut buf = self.spare.pop().unwrap_or_default();
+        buf.clear();
+        buf
+    }
+
+    #[must_use]
+    pub fn spare_buffers(&self) -> usize {
+        self.spare.len()
+    }
+
+    #[must_use]
+    pub fn spare_capacity(&self) -> usize {
+        self.spare.iter().map(Vec::capacity).sum()
+    }
+
     pub fn read(&mut self, b: &mut [u8]) -> usize {
         if self.left_over.is_empty() {
             self.drain_window();
@@ -300,8 +321,9 @@ impl ReceivingWorker {
             n += take;
             self.left_over_off += take;
             if self.left_over_off == self.left_over[0].len() {
-                self.left_over.pop_front();
+                let spent = self.left_over.pop_front().expect("a drained segment");
                 self.left_over_off = 0;
+                self.spare.push(spent);
             }
         }
         n
@@ -332,6 +354,7 @@ impl ReceivingWorker {
     pub fn release(&mut self) {
         self.left_over.clear();
         self.left_over_off = 0;
+        self.spare.clear();
         self.window = ReceivingWindow::new();
     }
 }

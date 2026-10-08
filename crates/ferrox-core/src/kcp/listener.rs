@@ -21,13 +21,22 @@ fn next_conversation() -> u16 {
     NEXT_CONVERSATION.fetch_add(1, Ordering::Relaxed).max(1)
 }
 
-fn parse_segments(buf: &[u8], out: &mut Vec<Segment>) {
+fn parse_segments(buf: &[u8], out: &mut Vec<Segment>, take: &super::segment::TakePayload<'_>) {
     out.clear();
     let mut rest = buf;
-    while let Some((seg, tail)) = read_segment(rest) {
+    while let Some((seg, tail)) = read_segment(rest, take) {
         out.push(seg);
         rest = tail;
     }
+}
+
+/// The conversation a datagram belongs to, from its first four bytes, so the accept loop has a session to lend payload buffers from before parsing.
+fn peek_conversation(buf: &[u8]) -> Option<(u16, bool)> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let conv = u16::from_be_bytes(buf[0..2].try_into().ok()?);
+    Some((conv, buf[2] == Command::Terminate.to_byte()))
 }
 
 fn feed(sock: &UdpSocket, conn: &Connection) {
@@ -36,7 +45,7 @@ fn feed(sock: &UdpSocket, conn: &Connection) {
     loop {
         match sock.recv_from(&mut buf) {
             Ok((n, _)) => {
-                parse_segments(&buf[..n], &mut segs);
+                parse_segments(&buf[..n], &mut segs, &|| conn.take_payload());
                 conn.input(&mut segs);
             }
             Err(ref e)
@@ -132,18 +141,20 @@ impl Listener {
                 match sock_r.recv_from(&mut buf) {
                     Ok((n, src)) => {
                         let Some(inner) = weak.upgrade() else { break };
-                        parse_segments(&buf[..n], &mut segs);
-                        if segs.is_empty() {
+                        let Some((conv, terminates)) = peek_conversation(&buf[..n]) else {
                             continue;
-                        }
-                        let conv = segs[0].conversation();
+                        };
                         let key = (src, conv);
                         let existing = inner.sessions.lock().unwrap().get(&key).cloned();
                         if let Some(session) = existing {
+                            parse_segments(&buf[..n], &mut segs, &|| session.take_payload());
+                            if segs.is_empty() {
+                                continue;
+                            }
                             session.input(&mut segs);
                             continue;
                         }
-                        if segs[0].command() == Some(Command::Terminate) {
+                        if terminates {
                             continue;
                         }
                         let Ok(sock_w) = sock_r.try_clone() else {
@@ -173,6 +184,11 @@ impl Listener {
                             .lock()
                             .unwrap()
                             .insert(key, Arc::clone(&session));
+                        parse_segments(&buf[..n], &mut segs, &|| session.take_payload());
+                        if segs.is_empty() {
+                            inner.sessions.lock().unwrap().remove(&key);
+                            continue;
+                        }
                         session.input(&mut segs);
                         inner.ready.lock().unwrap().push_back(session);
                         inner.ready_cv.notify_all();

@@ -79,7 +79,7 @@ claim with no checker is not made.
 | QUIC | [carrier-quic](docs/function/carrier-quic.md) | 1 handshake per server | quiche's | `UNBLESSED` | not measured |
 | Hysteria v2 | [carrier-hysteria](docs/function/carrier-hysteria.md) | 1 handshake per flow | 1 backlog plus the relay's own | `UNBLESSED` | not measured |
 | REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake, rustls | per handshake, rustls | `UNBLESSED` | not measured |
-| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, **1 send buffer for the whole window** (was one per 1 332 B) | `UNBLESSED` | not measured |
+| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, **1 send buffer for the whole window, pooled receive buffers** (was one per 1 332 B each way) | `UNBLESSED` | not measured |
 
 Two columns read "not measured" on every row, and that is the honest state
 rather than a gap in the table:
@@ -119,6 +119,7 @@ a number, so only the first table below appears in `scripts/method-counts.txt`.
 | [mux-cool](docs/function/mux-cool.md) | a `memcpy` of every relayed byte on the uplink, plus a full header rebuild per read | `relay-copies-per-byte-written 0`, by the `writev` part's base address being the read buffer |
 | [mux-cool](docs/function/mux-cool.md) | nothing removed — two copy rows *corrected*, one of which named a gate that counts allocations | `codec-copies-per-byte-written 1` replaces a `0` that was never observed |
 | [kcp](docs/function/kcp.md) | a `malloc`/`free` per 1 332 bytes sent — about **9 400 pairs a second per direction** at 100 Mbps | `send-payload-buffers-per-window 1` and `send-payload-reallocations-per-window 0`, by arena capacity over 64 rounds |
+| [kcp](docs/function/kcp.md) | a `malloc`/`free` per 1 332 bytes received — the same **9 400 pairs a second** | `receive-payload-reallocations-per-window 0`, by spare capacity over 64 rounds, and `receive-parse-allocations-per-segment 0`, by the parsed payload's base address being the lent buffer's |
 | [kcp](docs/function/kcp.md) | an 18-byte header staging array and three per-segment stores, per segment | `segment-header-staging-copies-per-segment 0` |
 | [vmess](docs/function/vmess.md) | a silent truncation of any relay read wider than one batch | argued; `stage_frames` now refuses, and nothing reaches the wire when it does |
 | [xtls-vision](docs/function/xtls-vision.md) | nothing removed — a row *renamed* because its gate did not cover the page's subject | `seal-open-staging-allocations 0` now names `vless::VisionSeal`, not `vision::Link` |
