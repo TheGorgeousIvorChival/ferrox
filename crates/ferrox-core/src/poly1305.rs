@@ -19,7 +19,7 @@ const STRIDE2_THRESHOLD_BYTES: usize = 128;
 const TWO_LANE_THRESHOLD_BYTES: usize = 1024;
 
 #[cfg(target_arch = "aarch64")]
-const NEON4_THRESHOLD_BYTES: usize = 4096;
+const NEON4_THRESHOLD_BYTES: usize = 1024;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const M26: u64 = 0x03ff_ffff;
@@ -106,6 +106,64 @@ static WINDOW_MASKS: [[i8; 32]; 5] = [
     window_mask(9),
     window_mask(12),
 ];
+
+/// A four-byte window at `offset` of each of four blocks, zeroed past, for one TBL4.
+#[cfg(target_arch = "aarch64")]
+const fn neon_window(offset: usize) -> [u8; 16] {
+    let mut index = [0x80u8; 16];
+    let mut lane = 0;
+    while lane < 4 {
+        let mut byte = 0;
+        while byte < 4 {
+            index[lane * 4 + byte] = (lane * 16 + offset + byte) as u8;
+            byte += 1;
+        }
+        lane += 1;
+    }
+    index
+}
+
+#[cfg(target_arch = "aarch64")]
+static NEON_WINDOWS: [[u8; 16]; 5] = [
+    neon_window(0),
+    neon_window(3),
+    neon_window(6),
+    neon_window(9),
+    neon_window(12),
+];
+
+/// The low limb of four consecutive blocks: its window starts on a byte, so no shift.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::wildcard_imports, reason = "flat lane primitives")]
+fn neon_low_limb(
+    blocks: core::arch::aarch64::uint8x16x4_t,
+    m26: core::arch::aarch64::uint32x4_t,
+) -> core::arch::aarch64::uint32x4_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let index = vld1q_u8(NEON_WINDOWS[0].as_ptr());
+        vandq_u32(vreinterpretq_u32_u8(vqtbl4q_u8(blocks, index)), m26)
+    }
+}
+
+/// One limb of four consecutive blocks out of one TBL4, its window cut mid-byte.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::wildcard_imports, reason = "flat lane primitives")]
+fn neon_limb_window<const SHIFT: i32, const WINDOW: usize>(
+    blocks: core::arch::aarch64::uint8x16x4_t,
+    m26: core::arch::aarch64::uint32x4_t,
+) -> core::arch::aarch64::uint32x4_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let index = vld1q_u8(NEON_WINDOWS[WINDOW].as_ptr());
+        vandq_u32(
+            vshrq_n_u32::<SHIFT>(vreinterpretq_u32_u8(vqtbl4q_u8(blocks, index))),
+            m26,
+        )
+    }
+}
 
 /// One limb of four consecutive blocks, four lanes wide, the window mask as the shuffle operand.
 #[cfg(target_arch = "x86_64")]
@@ -809,6 +867,7 @@ impl Poly1305 {
         };
 
         let mut hv: [uint32x4_t; 5] = unsafe { [vdupq_n_u32(0); 5] };
+        let mask26: uint32x4_t = unsafe { vdupq_n_u32(M26_U32) };
 
         let mut groups = &data[e * 16..];
         while let Some(g) = groups.first_chunk::<64>() {
@@ -890,27 +949,26 @@ impl Poly1305 {
                 ]
             };
 
-            let w = |blk: &[u8], at: usize| {
-                u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]])
+            let blocks = unsafe {
+                uint8x16x4_t(
+                    vld1q_u8(g[0..16].as_ptr()),
+                    vld1q_u8(g[16..32].as_ptr()),
+                    vld1q_u8(g[32..48].as_ptr()),
+                    vld1q_u8(g[48..64].as_ptr()),
+                )
             };
-            let limbs = |blk: &[u8]| {
-                [
-                    w(blk, 0) & M26_U32,
-                    (w(blk, 3) >> 2) & M26_U32,
-                    (w(blk, 6) >> 4) & M26_U32,
-                    (w(blk, 9) >> 6) & M26_U32,
-                    (w(blk, 12) >> 8) + HIBIT26,
-                ]
-            };
-            let l0 = limbs(&g[0..16]);
-            let l1 = limbs(&g[16..32]);
-            let l2 = limbs(&g[32..48]);
-            let l3 = limbs(&g[48..64]);
-            for (j, lane) in hv.iter_mut().enumerate() {
-                let mv = [l0[j], l1[j], l2[j], l3[j]];
-                unsafe {
-                    *lane = vaddq_u32(*lane, vld1q_u32(mv.as_ptr()));
-                }
+            unsafe {
+                hv[0] = vaddq_u32(hv[0], neon_low_limb(blocks, mask26));
+                hv[1] = vaddq_u32(hv[1], neon_limb_window::<2, 1>(blocks, mask26));
+                hv[2] = vaddq_u32(hv[2], neon_limb_window::<4, 2>(blocks, mask26));
+                hv[3] = vaddq_u32(hv[3], neon_limb_window::<6, 3>(blocks, mask26));
+                hv[4] = vaddq_u32(
+                    hv[4],
+                    vaddq_u32(
+                        neon_limb_window::<8, 4>(blocks, mask26),
+                        vdupq_n_u32(HIBIT26),
+                    ),
+                );
             }
 
             groups = &groups[64..];
@@ -920,10 +978,9 @@ impl Poly1305 {
         for (j, lane) in hv.iter().enumerate() {
             let mut arr = [0u32; 4];
             unsafe { vst1q_u32(arr.as_mut_ptr(), *lane) };
-            lanes[0][j] = arr[0];
-            lanes[1][j] = arr[1];
-            lanes[2][j] = arr[2];
-            lanes[3][j] = arr[3];
+            for (i, value) in arr.into_iter().enumerate() {
+                lanes[i][j] = value;
+            }
         }
 
         self.h = combine4(self.h, &lanes, &r26, &powers, n / 4);

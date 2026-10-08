@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::config::Config;
 use super::connection::{Ctx, State};
-use super::segment::{AckSegment, DataSegment, SegmentOption};
+use super::segment::{AckSegment, DataSegment, OutgoingHeader, SegmentOption};
 use super::window::{AckList, ReceivingWindow, SendingWindow};
 
 pub struct SendingWorker {
@@ -122,7 +122,7 @@ impl SendingWorker {
         }
     }
 
-    pub fn push(&mut self, payload: Vec<u8>) -> bool {
+    pub fn push(&mut self, payload: &[u8]) -> bool {
         if self.closed {
             return false;
         }
@@ -171,18 +171,26 @@ impl SendingWorker {
             let rto = self.ctx.round_trip.lock().unwrap().timeout();
             let first_unack = self.first_unacknowledged;
             let ctx = Arc::clone(&self.ctx);
-            let rate = self
-                .window
-                .flush(current, rto, cwnd, &mut |d: &mut DataSegment| {
-                    d.conv = ctx.meta.conversation;
-                    d.sending_next = first_unack;
-                    d.option = if ctx.state.load(Ordering::SeqCst) == State::ReadyToClose as i32 {
-                        SegmentOption::CLOSE
-                    } else {
-                        SegmentOption::NONE
-                    };
-                    let _ = ctx.emit_data(d);
-                });
+            // The three fields the wire header needs that are not the
+            // segment's own are the same for every segment in this flush, so
+            // they are computed once instead of per segment.
+            let conv = ctx.meta.conversation;
+            let option = if ctx.state.load(Ordering::SeqCst) == State::ReadyToClose as i32 {
+                SegmentOption::CLOSE
+            } else {
+                SegmentOption::NONE
+            };
+            let rate = self.window.flush(
+                current,
+                rto,
+                cwnd,
+                &mut |mut header: OutgoingHeader, payload: &[u8]| {
+                    header.conv = conv;
+                    header.sending_next = first_unack;
+                    header.option = option;
+                    let _ = ctx.emit_data_parts(header, payload);
+                },
+            );
             if let Some(rate) = rate {
                 self.on_packet_loss(rate);
             }
@@ -205,6 +213,8 @@ impl SendingWorker {
 
 pub struct ReceivingWorker {
     ctx: Arc<Ctx>,
+    /// Spent payload buffers, ready to be filled by the next inbound segment.
+    spare: Vec<Vec<u8>>,
     left_over: VecDeque<Vec<u8>>,
     left_over_off: usize,
     window: ReceivingWindow,
@@ -225,6 +235,7 @@ impl ReceivingWorker {
         let window_size = config.receiving_in_flight_size();
         Self {
             ctx,
+            spare: Vec::new(),
             left_over: VecDeque::new(),
             left_over_off: 0,
             window: ReceivingWindow::new(),
@@ -276,6 +287,24 @@ impl ReceivingWorker {
         }
     }
 
+    /// One payload buffer for the socket thread to fill. Drained buffers go back
+    /// to `spare`, so the count settles at the deepest the window ever held.
+    pub fn take_payload(&mut self) -> Vec<u8> {
+        let mut buf = self.spare.pop().unwrap_or_default();
+        buf.clear();
+        buf
+    }
+
+    #[must_use]
+    pub fn spare_buffers(&self) -> usize {
+        self.spare.len()
+    }
+
+    #[must_use]
+    pub fn spare_capacity(&self) -> usize {
+        self.spare.iter().map(Vec::capacity).sum()
+    }
+
     pub fn read(&mut self, b: &mut [u8]) -> usize {
         if self.left_over.is_empty() {
             self.drain_window();
@@ -292,8 +321,9 @@ impl ReceivingWorker {
             n += take;
             self.left_over_off += take;
             if self.left_over_off == self.left_over[0].len() {
-                self.left_over.pop_front();
+                let spent = self.left_over.pop_front().expect("a drained segment");
                 self.left_over_off = 0;
+                self.spare.push(spent);
             }
         }
         n
@@ -324,6 +354,7 @@ impl ReceivingWorker {
     pub fn release(&mut self) {
         self.left_over.clear();
         self.left_over_off = 0;
+        self.spare.clear();
         self.window = ReceivingWindow::new();
     }
 }

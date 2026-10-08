@@ -13,7 +13,7 @@
 # inlining even with line tables, so gate the caller that survives, not the
 # leaf that does not. The syscall table the script prints alongside is
 # information, not a gate.
-# Re-blessed 2640 by 08949a2: a new test in the ferrox-app bin shifted
-# thin-LTO symbol attribution; der_to_pem itself is untouched, -13 Ir.
+# Re-blessed 2653 by 37eeb71: its loopback ladder test is one more test in the
+# same ferrox-app bin, putting back the 13 Ir that 08949a2's took out; quic.rs untouched.
 
-der_to_pem 2640
+der_to_pem 2653

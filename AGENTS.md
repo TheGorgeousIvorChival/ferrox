@@ -63,6 +63,15 @@ not call the slice complete.
   is what makes `user-space-copies-per-byte-written 1` a claim rather than an
   intention, and it is the gate to copy when a rewrite claims it removed a
   copy, a `memmove` or a per-record allocation.
+- **A byte-level test cannot see a copy, because the bytes are identical either
+  way.** Reverting the mux uplink from a `writev` of header-plus-read-buffer to
+  the old copy-into-a-frame-buffer still passes every framing test. The only
+  witness is pointer identity: assert the `writev` part's base address *is* the
+  buffer that was read into, the way `frames_reuse_the_callers_buffers` asserts a
+  returned slice lives inside the caller's. Three copy rows on `main` named
+  `ferrox-bench-gate-6`, which counts allocations, bytes allocated and zero-fills
+  — and one of them claimed `0` where the codec copies once, so the value was
+  wrong as well as unchecked.
 - **The named checker has to observe the thing in the row.** Pointer identity
   observes copies and reallocations. A differential sweep against a reference
   crate observes *bytes*, not the operation count that produced them: it will
@@ -77,6 +86,40 @@ not call the slice complete.
   counter `read` snapshots and `wait_since` compares, so its delta *is* the
   wakeup count. Look for the quantity already lying around as state before
   writing a test that reconstructs it.
+- **A blessed count is a claim about a gate, so audit the gate before the code.**
+  Three rows on `main` were numbers nothing was checking: the VMess
+  four-frame batch was swept by a test whose longest input produced three frames,
+  its syscall row wrote into a `Vec` that cannot count syscalls, and the
+  xtls-vision allocation row named a gate that drives a different
+  implementation of the same framing. Before adding an optimisation to a file,
+  read the test the manifest row names and ask what it actually executes — a row
+  that has never been observed is worse than an `UNBLESSED` one, because it reads
+  as a number.
+- **An allocator claim is gated by capacity, and capacity catches the leak the
+  change would otherwise ship.** `send-payload-reallocations-per-window 0` is
+  witnessed by the arena's own `capacity()` over 64 push/acknowledge rounds: a
+  per-segment `Vec` cannot hold capacity steady, and a trim that stopped firing
+  shows up as a number that only goes up. The same test found that `trim()`
+  returning early on `base == 0` made the reclaim branch unreachable. **Write the
+  capacity assertion before the buffer, not after.**
+- **A pool filled by one thread and drained by another has one owner, and the
+  parse order has to respect it.** Inbound KCP buffers are filled by the socket
+  thread and returned by the reader, so the pool lives in the connection both
+  touch — and the accept loop reads the conversation from four header bytes
+  before parsing, because parsing needs the pool and the pool needs the session.
+  Parsing first and looking up second would parse twice or lend a stranger's
+  buffers, and an unparsable datagram from a new source still creates no session,
+  the way it did before the pool.
+- **A loopback test cannot gate a syscall count, and a scheduler-dependent count
+  is not a gate at all.** Drive the counter from an in-memory stream that always
+  answers the whole buffer, where the number is exact; assert only the bytes
+  over a real socket. `xhttp` does both, and the first attempt at a hard bound on
+  the real socket failed about one run in three because TCP segmentation moves
+  with the scheduler.
+- **Changing a read's granularity is a count change.** Reading a window instead of
+  a two-byte read removes a syscall *and* changes how many times the caller's
+  `Read::read` returns. Both are counted quantities in this tree, so both belong
+  on the page — see `carrier-xhttp read-syscalls-per-16KiB-chunk`.
 - **A rewrite that passes the test suite can still be a regression, so do the
   arithmetic on the case the tests do not reach.** Two on this branch looked
   like wins and were not, and the arithmetic found both without a benchmark.

@@ -132,7 +132,7 @@ fn feed(sock: UdpSocket, conn: Arc<Connection>, peer: Arc<Mutex<Option<SocketAdd
         }
         let mut rest = &buf[..n];
         let mut segs = Vec::new();
-        while let Some((seg, tail)) = read_segment(rest) {
+        while let Some((seg, tail)) = read_segment(rest, &|| conn.take_payload()) {
             segs.push(seg);
             rest = tail;
         }

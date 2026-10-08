@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 
 use super::config::Config;
 use super::roundtrip::RoundTripInfo;
-use super::segment::{AckSegment, CmdOnlySegment, Command, DataSegment, Segment, SegmentOption};
+#[cfg(test)]
+use super::segment::DataSegment;
+use super::segment::{
+    serialize_data, AckSegment, CmdOnlySegment, Command, OutgoingHeader, Segment, SegmentOption,
+};
 use super::worker::{ReceivingWorker, SendingWorker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +147,10 @@ impl Ctx {
         Err(last.unwrap_or_else(|| io::Error::other("segment write")))
     }
 
-    pub(crate) fn emit_data(&self, d: &DataSegment) -> io::Result<()> {
-        self.emit(|buf| d.serialize(buf))
+    /// The sender's path: the payload is a borrowed slice of the sending
+    /// window's arena, so nothing here owns a copy of it.
+    pub(crate) fn emit_data_parts(&self, header: OutgoingHeader, payload: &[u8]) -> io::Result<()> {
+        self.emit(|buf| serialize_data(header, payload, buf))
     }
 
     pub(crate) fn emit_ack(&self, a: &AckSegment) -> io::Result<()> {
@@ -294,6 +300,13 @@ impl Connection {
     #[must_use]
     pub fn round_trip_timeout(&self) -> u32 {
         self.ctx.round_trip.lock().unwrap().timeout()
+    }
+
+    /// Hands the socket thread one payload buffer to fill for the next inbound
+    /// data segment. Spent buffers come back through `ReceivingWorker::read`, so
+    /// a connection that has been busy once allocates no more per segment.
+    pub fn take_payload(&self) -> Vec<u8> {
+        self.receiving.lock().unwrap().take_payload()
     }
 
     /// Takes the caller's datagram buffer by `drain`, so the socket thread
@@ -524,12 +537,7 @@ impl Connection {
             }
             let snap = self.data_output.gen();
             let n = (b.len() - offset).min(self.mss as usize);
-            if !self
-                .sending
-                .lock()
-                .unwrap()
-                .push(b[offset..offset + n].to_vec())
-            {
+            if !self.sending.lock().unwrap().push(&b[offset..offset + n]) {
                 if pushed {
                     self.wake_update();
                     pushed = false;
@@ -716,6 +724,64 @@ mod tests {
         let mut buf = [0u8; 32];
         assert_eq!(read_once(&conn, &mut buf), Ok(11));
         assert_eq!(&buf[..11], b"firstsecond");
+    }
+
+    /// Spent payload buffers go back to `spare` and the socket thread fills from
+    /// it, so after the window has been full once no received segment
+    /// allocates. Capacity is the witness, the way it is for the send arena: a
+    /// fill that allocated could not hold it steady, and neither could a drain
+    /// that stopped returning buffers.
+    #[test]
+    fn the_receive_pool_serves_every_segment_without_growing() {
+        let conn = echoing_connection();
+        let mut out = vec![0u8; 8 * 1332];
+        let mut settled = 0usize;
+        for round in 0..64u32 {
+            let base = round * 8;
+            let mut segs = Vec::new();
+            for n in base..base + 8 {
+                let mut payload = conn.take_payload();
+                payload.extend_from_slice(&[n as u8; 1332]);
+                segs.push(Segment::Data(super::DataSegment {
+                    conv: 4,
+                    option: super::SegmentOption::NONE,
+                    timestamp: 0,
+                    number: n,
+                    sending_next: base + 8,
+                    payload,
+                    timeout: 0,
+                    transmit: 0,
+                }));
+            }
+            conn.input(&mut segs);
+            assert_eq!(read_once(&conn, &mut out), Ok(8 * 1332), "round {round}");
+            for (i, n) in (base..base + 8).enumerate() {
+                let body = &out[i * 1332..(i + 1) * 1332];
+                assert!(
+                    body.iter().all(|&b| b == n as u8),
+                    "round {round}: segment {n} came back as another's bytes"
+                );
+            }
+            let receiving = conn.receiving.lock().unwrap();
+            if round == 2 {
+                settled = receiving.spare_capacity();
+            } else if round > 2 {
+                assert_eq!(
+                    receiving.spare_capacity(),
+                    settled,
+                    "round {round}: the pool grew, so a segment allocated"
+                );
+            }
+        }
+        assert!(
+            settled >= 8 * 1332,
+            "the pool must hold the window's worth: {settled}"
+        );
+        assert_eq!(
+            conn.receiving.lock().unwrap().spare_buffers(),
+            8,
+            "every drained buffer comes back"
+        );
     }
 
     /// The segment list is the socket thread's, and `input` drains rather than

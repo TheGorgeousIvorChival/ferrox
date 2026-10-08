@@ -21,7 +21,7 @@ record-layer zero-filled-bytes-per-fill 0 ferrox-bench-gate-2
 record-layer blocks-per-byte 1/64 ferrox-bench-gate-2
 record-layer blocks-per-iteration 8 ferrox-core-chacha::backend
 record-layer fused-head-blocks 1 ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted
-record-layer backends-a-differential-test-cannot-lie-to 4 ferrox-bench-gate-1
+record-layer backends-a-differential-test-cannot-lie-to 5 ferrox-bench-gate-1
 
 # --- Shadowsocks AEAD -------------------------------------------------------
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -66,13 +66,13 @@ xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_t
 xtls-vision tls-buffers-inspected-before-the-switch 8 ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget
 xtls-vision user-space-copies-per-byte-while-framed 2 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
 xtls-vision user-space-copies-per-byte-after-the-switch 0 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
-xtls-vision staging-allocations-per-padded-buffer 0 ferrox-bench-gate-2
+xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
 
 # --- Mux.Cool ---------------------------------------------------------------
 mux-cool ops-retired-instructions UNBLESSED scripts/count-ops.sh
 mux-cool maximum-frame-payload-bytes 8192 ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame
-mux-cool user-space-copies-per-byte-written 0 ferrox-bench-gate-6
-mux-cool user-space-copies-per-byte-read 1 ferrox-bench-gate-6
+mux-cool relay-copies-per-byte-written 0 ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer
+mux-cool codec-copies-per-byte-written 1 ferrox-core-mux::tests::a_header_plus_a_patched_length_is_the_whole_frame
 mux-cool mux-frame-allocations 0 ferrox-bench-gate-6
 mux-cool live-session-cap 8 ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used
 mux-cool xudp-frame-layout-matches-upstream 1 ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout
@@ -101,6 +101,10 @@ carrier-grpc user-space-copies-per-byte-read 1 ferrox-app-grpc::tests::tunnel_ca
 
 carrier-xhttp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
+carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp read-syscalls-per-16KiB-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -120,6 +124,11 @@ kcp command-only-segment-bytes 16 ferrox-core-kcp::tests::the_command_only_layou
 kcp oracle-runs-against-the-pinned-go 1 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
 kcp rto-cap-seconds 10 ferrox-core-kcp::tests::rto_is_capped_at_ten_seconds_and_widened
 kcp app-rows-serving-over-kcp 4 ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback
+kcp send-payload-buffers-per-window 1 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp send-payload-reallocations-per-window 0 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp receive-payload-reallocations-per-window 0 ferrox-core-kcp::connection::tests::the_receive_pool_serves_every_segment_without_growing
+kcp receive-parse-allocations-per-segment 0 ferrox-core-kcp::segment::tests::a_data_segment_is_parsed_into_the_lent_buffer
+kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
 kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
 kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
 trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven

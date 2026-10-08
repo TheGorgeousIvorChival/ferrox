@@ -43,6 +43,11 @@ graph TD
 | oracle-runs-against-the-pinned-go | 1 | ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go |
 | rto-cap-seconds | 10 | ferrox-core-kcp::tests::rto_is_capped_at_ten_seconds_and_widened |
 | app-rows-serving-over-kcp | 4 | ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback |
+| send-payload-buffers-per-window | 1 | ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing |
+| send-payload-reallocations-per-window | 0 | ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing |
+| receive-payload-reallocations-per-window | 0 | ferrox-core-kcp::connection::tests::the_receive_pool_serves_every_segment_without_growing |
+| receive-parse-allocations-per-segment | 0 | ferrox-core-kcp::segment::tests::a_data_segment_is_parsed_into_the_lent_buffer |
+| segment-header-staging-copies-per-segment | 0 | ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one |
 
 | segment-list-vectors-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
 
@@ -170,6 +175,56 @@ named runner, so no throughput figure is quoted. The oracle proves the wire
 format; nothing in CI yet proves the loss behaviour under a real packet layer.
 
 
+- **A `malloc` and a `free` for every 1 332 bytes sent.** `Connection::write`
+  took `b[offset..offset + n].to_vec()` and `SendingWindow` held
+  `VecDeque<DataSegment>`, so each MSS-sized chunk owned a heap buffer for as
+  long as it was unacknowledged. At the default `mtu - 18` = 1 332 that is
+  about **9 400 allocation pairs a second per direction** at 100 Mbps. The
+  window now keeps one `arena: Vec<u8>` and each cache entry holds a half-open
+  range into it, so a segment is two integers rather than an allocation, and
+  `serialize_data` writes a borrowed payload slice straight into the output
+  buffer. That is `send-payload-buffers-per-window 1` and
+  `send-payload-reallocations-per-window 0`, gated by arena **capacity** — a
+  per-segment `Vec` cannot hold its capacity steady, so the witness is the
+  quantity itself.
+
+  Read against the pinned references: Xray's `transport/internet/kcp/connection.go:406`
+  takes `b = buf.New()` per chunk, and `common/buf/buffer.go:41` shows that is a
+  `pool.Get()` — so it is a pool round-trip, not a `malloc`, but it is also an
+  8 KiB `make([]byte, Size)` whenever the pool is cold, for a 1 332-byte
+  payload. ZeroNet does not carry KCP at all; `zero-protocol`'s lanes are
+  TCP-based and its `run_carrier_writer` coalesces under `WRITE_COALESCE_LIMIT`
+  (`mux.rs:431`), which is the batching idea this tree already applies to VMess
+  via `FRAMES_PER_WRITE`. So the references were ahead on pooling and behind on
+  sizing; this is now ahead on both.
+
+  **The gate found a leak in the first version of this.** `trim()` returned
+  early when `base == 0`, which is the state of a window that has been
+  acknowledged down to empty between bursts — so the "reclaim everything" case
+  was unreachable and the arena grew to 681 984 bytes for 8 live segments of
+  1 332. The empty-cache check has to come first.
+  `the_arena_serves_every_segment_without_growing` is the gate and it fails
+  loudly when `trim` stops working.
+
+  Two more shapes of the same risk are gated rather than argued:
+  `trimming_never_moves_a_live_payload` pushes 32 segments, acknowledges a
+  different prefix at seven different offsets and requires every emitted payload
+  to still be its own — a wrong range adjustment would send one segment's bytes
+  inside another's header. `the_arena_does_not_confuse_wrapped_segment_numbers`
+  does the same across the `u32::MAX` wrap. And
+  `a_borrowed_payload_serialises_identically_to_an_owned_one` sweeps 84 cases of
+  the borrowed writer against the owned one, because the pinned-Go oracle and
+  every segment test go through the owned path while the sender goes through the
+  borrowed one — the oracle now writes through `serialize_data` so the pinned
+  bytes are pinned against the code that actually goes on the wire.
+- **The 18-byte header staging array, per segment.** `serialize` built the
+  header in a `[u8; 18]` on the stack and copied it into the output buffer, then
+  copied the payload after it: two memcpys per segment where one `reserve` and a
+  run of stores is one pass. That is `segment-header-staging-copies-per-segment 0`.
+- **Three per-segment stores.** `SendingWorker::flush` set `conv`, `sending_next`
+  and `option` on every segment inside the flush loop. All three are the same for
+  every segment in a given flush, so they are computed once and captured.
+
 What is **not** removed, and is named rather than claimed:
 
 - **One `sendto` per 1 332-byte segment.** `Ctx::emit` is called once per
@@ -180,15 +235,33 @@ What is **not** removed, and is named rather than claimed:
   That is a wire change, not an optimisation, so it is named here rather than
   done.
 - **A `Vec<u32>` per received ACK.** `AckSegment::parse` collects the ACK numbers
-  into a fresh `Vec<u32>` — one `malloc` per ACK segment, up to 255 numbers. The
-  fix is the same scratch-vector mechanism as the receive side, but it means
-  threading a second buffer through `read_segment` for a gain of roughly one
-  allocation per round trip. Open.
-- **A `Vec` per 1 332-byte send chunk.** `SendingWindow` has to own each
-  outbound payload for retransmission, so the payload cannot be a borrow of the
-  caller's read buffer. An arena with front-trimming would remove the
-  allocation, and it is a real refactor of `window.rs` with real aliasing
-  hazards. Open.
+  into a fresh `Vec<u32>` — one `malloc` per ACK segment, up to 255 numbers.
+  Measured against the send path this is noise: roughly one allocation per round
+  trip, about 50 a second at a 20 ms RTT, where the send path was doing 9 400.
+  Removing it means `AckSegment` borrowing the caller's buffer, which puts a
+  lifetime on a public segment type for 50 allocations a second. That is more
+  code for less, so it stays.
+- **A `Vec<u8>` per received data segment — the same 9 400/s the send path had.**
+  `DataSegment::parse` did `buf.get(..)?.to_vec()`, so receiving allocated and
+  freed once per segment. The buffers now come from a pool owned by
+  `ReceivingWorker`: the socket thread lends one per segment through
+  `Connection::take_payload`, parsing fills it, and `read` returns it when
+  drained. That is `receive-payload-reallocations-per-window 0`, gated by spare
+  **capacity** steady over 64 rounds of eight 1 332-byte segments, and
+  `receive-parse-allocations-per-segment 0`, gated by the parsed payload's base
+  address *being* the lent buffer's at five lengths — a byte test passes with
+  the copy either way, so pointer identity is the witness. Against the pins
+  this is the same sizing win as the send arena: Xray's pool hands out 8 KiB
+  for a 1 332-byte payload, while these buffers settle at the payloads they
+  carry times the deepest the window ever held.
+
+  Two orderings matter and both are pinned. The accept loop reads the
+  conversation from the first four bytes *before* it has a session to lend
+  from, so an unparsable datagram from a new source still creates no session —
+  creating one would spawn its update thread for garbage. And lending goes
+  through the connection the segments are fed to, never a thread-local, because
+  the reader that returns the buffers is a different thread from the socket
+  that fills them.
 
 ## Pins
 

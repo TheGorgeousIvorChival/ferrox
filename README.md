@@ -75,11 +75,11 @@ claim with no checker is not made.
 | HTTPUpgrade | [carrier-httpupgrade](docs/function/carrier-httpupgrade.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
 | HTTP masquerade | [carrier-httpheader](docs/function/carrier-httpheader.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
 | gRPC | [carrier-grpc](docs/function/carrier-grpc.md) | 1 write per message | 1 written, 1 read | `UNBLESSED` | not measured |
-| xHTTP | [carrier-xhttp](docs/function/carrier-xhttp.md) | 1 write per chunk | 1 written | `UNBLESSED` | not measured |
+| xHTTP | [carrier-xhttp](docs/function/carrier-xhttp.md) | 1 write per chunk, **2 reads per 16 KiB chunk** | 1 written | `UNBLESSED` | not measured |
 | QUIC | [carrier-quic](docs/function/carrier-quic.md) | 1 handshake per server | quiche's | `UNBLESSED` | not measured |
 | Hysteria v2 | [carrier-hysteria](docs/function/carrier-hysteria.md) | 1 handshake per flow | 1 backlog plus the relay's own | `UNBLESSED` | not measured |
 | REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake, rustls | per handshake, rustls | `UNBLESSED` | not measured |
-| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place | `UNBLESSED` | not measured |
+| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, **1 send buffer for the whole window, pooled receive buffers** (was one per 1 332 B each way) | `UNBLESSED` | not measured |
 
 Two columns read "not measured" on every row, and that is the honest state
 rather than a gap in the table:
@@ -115,6 +115,15 @@ a number, so only the first table below appears in `scripts/method-counts.txt`.
 | [shadowsocks](docs/function/shadowsocks.md) | a 16-byte tag copy per chunk, and a second 16 KiB buffer alive for the connection's whole life | argued |
 | [kcp](docs/function/kcp.md) | a `Vec<Vec<u8>>` per `read`, and a second deadline lock per wait | argued |
 | [carrier-websocket](docs/function/carrier-websocket.md) | an unbounded `realloc` chain in the read-ahead buffer | argued |
+| [carrier-xhttp](docs/function/carrier-xhttp.md) | a framing read syscall per chunk, and a second one that moved two bytes | `read-syscalls-per-16KiB-chunk 2`, by the reader's own read counter; **measured 33 reads for 16 chunks against 49** |
+| [mux-cool](docs/function/mux-cool.md) | a `memcpy` of every relayed byte on the uplink, plus a full header rebuild per read | `relay-copies-per-byte-written 0`, by the `writev` part's base address being the read buffer |
+| [mux-cool](docs/function/mux-cool.md) | the same `memcpy` on the server relay's TCP task and UDP reader | same row, same gate — both paths now share the header-plus-`writev` helper, and the `CHUNK_MAX` bound moved with the encoder |
+| [mux-cool](docs/function/mux-cool.md) | nothing removed — two copy rows *corrected*, one of which named a gate that counts allocations | `codec-copies-per-byte-written 1` replaces a `0` that was never observed |
+| [kcp](docs/function/kcp.md) | a `malloc`/`free` per 1 332 bytes sent — about **9 400 pairs a second per direction** at 100 Mbps | `send-payload-buffers-per-window 1` and `send-payload-reallocations-per-window 0`, by arena capacity over 64 rounds |
+| [kcp](docs/function/kcp.md) | a `malloc`/`free` per 1 332 bytes received — the same **9 400 pairs a second** | `receive-payload-reallocations-per-window 0`, by spare capacity over 64 rounds, and `receive-parse-allocations-per-segment 0`, by the parsed payload's base address being the lent buffer's |
+| [kcp](docs/function/kcp.md) | an 18-byte header staging array and three per-segment stores, per segment | `segment-header-staging-copies-per-segment 0` |
+| [vmess](docs/function/vmess.md) | a silent truncation of any relay read wider than one batch | argued; `stage_frames` now refuses, and nothing reaches the wire when it does |
+| [xtls-vision](docs/function/xtls-vision.md) | nothing removed — a row *renamed* because its gate did not cover the page's subject | `seal-open-staging-allocations 0` now names `vless::VisionSeal`, not `vision::Link` |
 
 Three of those need their limits stated, because a page that lists only wins is
 not evidence:
@@ -137,6 +146,30 @@ not evidence:
   `window_size` ahead of `next_number` — at the default 776-segment window a
   sender legitimately in flight starts having segments dropped. Both passed the
   test suite. Neither is here.
+- **A copy claim needs pointer identity, because a byte test cannot see it.**
+  The mux uplink used to `memcpy` every relayed byte into the frame buffer. The
+  framing test passes with the copy and without it — the bytes are identical —
+  so the only test that can witness the removal is one that asserts the `writev`
+  part's base address *is* the read buffer. Two of this repository's copy rows
+  named `ferrox-bench-gate-6`, which counts allocations and zero-fills, not
+  copies, and one of them claimed `0` where the value is `1`; both are corrected.
+- **Three rows on this list were previously claims with no checker behind them,
+  and the honest fix was the gate, not the number.** `vmess
+  frames-per-write-syscall 4` and `write-syscalls-per-32KiB-relay-read 1` were
+  swept by a test whose longest payload produced *three* frames, writing into a
+  `Vec` that cannot count syscalls. `xtls-vision staging-allocations-per-padded-buffer
+  0` named `ferrox-bench-gate-2`, which drives the stateless `vless::VisionSeal`
+  pair, not the `vision::Link` this page documents — so it is renamed
+  `seal-open-staging-allocations` and the page says plainly that `Link` is under
+  no allocation gate. `carrier-xhttp` had no read-syscall row at all, which is
+  why the 3→2 change could not be claimed; `Reader` is now generic over `Read`
+  and counts its own reads, and the row exists.
+- **The send arena's own gate found a leak, which is the argument for having
+  one.** `trim()` returned early when `base == 0` — the state of a window
+  acknowledged down to empty between bursts — so the reclaim-everything branch
+  was unreachable and the arena reached 681 984 bytes for 8 live 1 332-byte
+  segments. Capacity is the witness for "one buffer, reused", and it is the same
+  witness that caught the leak.
 - **NOT removed:** KCP still sends one datagram per 1 332-byte segment, because
   batching would change the bytes on the wire. The mux uplink still copies every
   payload byte once, because removing that copy means splitting

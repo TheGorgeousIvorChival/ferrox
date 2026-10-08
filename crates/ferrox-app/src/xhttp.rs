@@ -36,7 +36,7 @@ fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
     width + 2
 }
 
-fn read_line_into<R: Read>(reader: &mut XhttpReader<R>, out: &mut [u8; 130]) -> Option<usize> {
+fn read_line_into(reader: &mut Reader<impl Read>, out: &mut [u8; 130]) -> Option<usize> {
     loop {
         if let Some(end) = reader.prefix[reader.at..]
             .windows(2)
@@ -60,7 +60,7 @@ fn read_line_into<R: Read>(reader: &mut XhttpReader<R>, out: &mut [u8; 130]) -> 
             reader.at = 0;
         }
         let mut tmp = [0u8; 128];
-        match reader.read.read(&mut tmp) {
+        match reader.take(&mut tmp) {
             Ok(n) if n > 0 => reader.prefix.extend_from_slice(&tmp[..n]),
             _ => return None,
         }
@@ -76,16 +76,38 @@ fn chunk_size(line: &[u8]) -> Option<usize> {
     usize::from_str_radix(size, 16).ok()
 }
 
+/// Generic over the underlying `Read` so a test can drive it from an in-memory
+/// stream and count the reads, the way `WsReader` counts its own. `reads` is
+/// that counter: the read-syscall row is measured from it.
 #[derive(Debug)]
-pub(crate) struct XhttpReader<R: Read = TcpStream> {
+pub(crate) struct Reader<R> {
     read: R,
     prefix: Vec<u8>,
     at: usize,
     left: usize,
     ended: bool,
+    reads: usize,
 }
 
-impl<R: Read> XhttpReader<R> {
+pub(crate) type XhttpReader = Reader<TcpStream>;
+
+impl<R: Read> Reader<R> {
+    /// Every read that reaches the stream, counted where it happens.
+    fn take(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        self.read.read(buf)
+    }
+
+    /// The syscall counter, read by `a_chunk_costs_two_reads_not_three` and
+    /// `a_real_socket_drains_the_same_bytes`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "only the gate reads it"))]
+    #[must_use]
+    pub(crate) fn reads(&self) -> usize {
+        self.reads
+    }
+}
+
+impl<R: Read> Reader<R> {
     fn body(&mut self, buf: &mut [u8]) -> Option<usize> {
         if self.at < self.prefix.len() {
             let n = (self.prefix.len() - self.at).min(buf.len());
@@ -93,7 +115,7 @@ impl<R: Read> XhttpReader<R> {
             self.at += n;
             return Some(n);
         }
-        match self.read.read(buf) {
+        match self.take(buf) {
             Ok(n) if n > 0 => Some(n),
             _ => None,
         }
@@ -118,7 +140,7 @@ impl std::fmt::Debug for Shared {
     }
 }
 
-impl<R: Read> Read for XhttpReader<R> {
+impl<R: Read> Read for Reader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -142,8 +164,27 @@ impl<R: Read> Read for XhttpReader<R> {
                         crlf.copy_from_slice(&self.prefix[self.at..self.at + 2]);
                         self.at += 2;
                     } else {
-                        crate::proxy::read_exact(&mut self.read, &mut crlf)
-                            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+                        // One window instead of a two-byte read: the bytes past
+                        // the CRLF are the next size line, which `read_line_into`
+                        // then finds without asking the socket again.
+                        // Loop until two bytes are buffered: a peer that
+                        // segments the CRLF across reads still gets through,
+                        // which a single read would have refused.
+                        self.prefix.clear();
+                        let mut got = 0usize;
+                        while got < 2 {
+                            let mut tmp = [0u8; 128];
+                            let n = self.take(&mut tmp).map_err(|_| {
+                                std::io::Error::from(std::io::ErrorKind::InvalidData)
+                            })?;
+                            if n == 0 {
+                                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                            }
+                            self.prefix.extend_from_slice(&tmp[..n]);
+                            got += n;
+                        }
+                        crlf.copy_from_slice(&self.prefix[..2]);
+                        self.at = 2;
                     }
                     if crlf != *b"\r\n" {
                         return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
@@ -230,13 +271,14 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     read: R,
     write: W,
     prefix: Vec<u8>,
-) -> (XhttpReader<R>, XhttpWriter) {
-    let reader = XhttpReader {
+) -> (Reader<R>, XhttpWriter) {
+    let reader = Reader {
         read,
         prefix,
         at: 0,
         left: 0,
         ended: false,
+        reads: 0,
     };
     let writer = XhttpWriter {
         shared: Arc::new(Shared {
@@ -284,7 +326,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
     path: &str,
-) -> Option<(XhttpReader<R>, XhttpWriter)> {
+) -> Option<(Reader<R>, XhttpWriter)> {
     let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
     check_request(&head, path)?;
     write.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n").ok()?;
@@ -323,7 +365,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut write: W,
     host: &str,
     path: &str,
-) -> Option<(XhttpReader<R>, XhttpWriter)> {
+) -> Option<(Reader<R>, XhttpWriter)> {
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n"
     );
@@ -349,6 +391,50 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    /// The same drain over a real socket. This asserts the *bytes* and nothing
+    /// else: a real socket may segment, so its read count moves with the
+    /// scheduler and cannot gate a number. The count claim belongs to
+    /// `a_chunk_costs_two_reads_not_three`, which drives an in-memory stream
+    /// that always answers the whole buffer. Measured here off a loopback
+    /// socket, idle: 33 reads for 16 chunks against 49 for the old shape.
+    #[test]
+    fn a_real_socket_drains_the_same_bytes() {
+        let count = 16usize;
+        let mut wire = Vec::new();
+        for _ in 0..count {
+            wire.extend_from_slice(format!("{CHUNK:X}\r\n").as_bytes());
+            wire.extend(std::iter::repeat_n(0x5Au8, CHUNK));
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let h = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 4096];
+            let n = sock.read(&mut head).expect("reads the request");
+            assert!(n > 0);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .expect("replies");
+            sock.write_all(&wire).expect("sends");
+            sock.shutdown(std::net::Shutdown::Write).ok();
+        });
+        let sock = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let (mut reader, _w) = connect(sock, "h", "/share").expect("dials");
+        let mut buf = vec![0u8; CHUNK];
+        let mut got = 0usize;
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        h.join().expect("joins");
+        assert_eq!(got, CHUNK * count, "the payload must be byte-identical");
+        assert!(reader.reads() <= count * 3 + 1, "a bound, not the claim");
+    }
 
     #[test]
     fn size_lines_match_format_without_allocating() {
@@ -406,6 +492,95 @@ mod tests {
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
+    }
+
+    /// Reads are driven with a fixed CHUNK buffer, the way `relay_ordered`
+    /// drives them, so the count is the reader's and not `read_to_end`'s buffer
+    /// growth. `reads` is the counter that says so, exactly as `WsReader::pull`
+    /// has one.
+    #[test]
+    fn a_chunk_costs_two_reads_not_three() {
+        fn framed(chunks: &[usize]) -> Vec<u8> {
+            let mut wire = Vec::new();
+            for &n in chunks {
+                wire.extend_from_slice(format!("{n:X}\r\n").as_bytes());
+                wire.extend(std::iter::repeat_n(0x5Au8, n));
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire.extend_from_slice(b"0\r\n\r\n");
+            wire
+        }
+
+        for count in [1usize, 2, 4, 8, 16] {
+            let chunks: Vec<usize> = std::iter::repeat_n(CHUNK, count).collect();
+            let payload: Vec<u8> = vec![0x5Au8; CHUNK * count];
+            let mut reader = Reader {
+                read: std::io::Cursor::new(framed(&chunks)),
+                prefix: Vec::new(),
+                at: 0,
+                left: 0,
+                ended: false,
+                reads: 0,
+            };
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                let n = reader.read(&mut buf).expect("reads");
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, payload, "{count} chunks: the bytes must be unchanged");
+            // Two reads per chunk amortised -- one framing window, one body --
+            // plus the terminating size line. The old shape read the size line
+            // and the two-byte CRLF separately, so it cost three per chunk.
+            assert_eq!(
+                reader.reads(),
+                count * 2 + 1,
+                "{count} chunks: framing reads must amortise to one per chunk"
+            );
+        }
+    }
+
+    /// The counter must see the *short* reads too: a stream that hands over one
+    /// byte at a time is the worst case, and it is what makes a bounded window
+    /// better than an unbounded one.
+    #[test]
+    fn a_trickling_stream_still_drains_whole() {
+        struct Trickle {
+            inner: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let take = buf.len().min(1);
+                self.inner.read(&mut buf[..take])
+            }
+        }
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"40\r\n");
+        wire.extend(std::iter::repeat_n(0x11u8, 64));
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(b"0\r\n\r\n");
+        let mut reader = Reader {
+            read: Trickle {
+                inner: std::io::Cursor::new(wire),
+            },
+            prefix: Vec::new(),
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+        };
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("drains");
+        assert_eq!(got, vec![0x11u8; 64]);
+        assert!(
+            reader.reads() > 64,
+            "one byte per read cannot be fewer reads than bytes, got {}",
+            reader.reads()
+        );
     }
 
     #[test]

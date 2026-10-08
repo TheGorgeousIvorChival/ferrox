@@ -789,6 +789,13 @@ fn stage_frames(
                 break;
             }
         }
+        // A read wider than FRAMES_PER_WRITE frames reaches here with bytes
+        // left. Writing them would be a truncated frame stream on the wire, so
+        // refuse instead; `pump_relay` clamps to READ_PLAIN so nothing reaches
+        // it today, and a caller that did would rather close than corrupt.
+        if !rest.is_empty() {
+            return false;
+        }
     }
     if staging.is_empty() {
         return true;
@@ -1684,6 +1691,26 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
 
+    /// Counts `write` calls and keeps the bytes, so a syscall row is observed
+    /// rather than inferred: a `Vec` sink cannot tell one write from four.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_batch_on_the_wire_is_the_frames_written_one_at_a_time() {
         let options = OPT_STREAM | OPT_MASK | OPT_PAD;
@@ -1698,6 +1725,10 @@ mod tests {
             MAX_PLAIN,
             MAX_PLAIN + 1,
             3 * MAX_PLAIN,
+            4 * MAX_PLAIN - 1,
+            4 * MAX_PLAIN,
+            4 * MAX_PLAIN + 1,
+            READ_PLAIN,
         ] {
             let body: Vec<u8> = (0..run_len)
                 .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
@@ -1717,17 +1748,27 @@ mod tests {
             let mut batched = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
             let mut whole = Vec::new();
             let mut batch_pad = PadSource::fresh().expect("entropy");
-            assert!(stage_frames(
-                &mut Vec::new(),
-                &mut batched,
-                &body,
-                &mut whole,
-                &mut batch_pad,
-            ));
+            let mut sink = CountingWriter::default();
+            let staged = stage_frames(&mut sink, &mut batched, &body, &mut whole, &mut batch_pad);
+            if run_len > READ_PLAIN {
+                assert!(!staged, "run of {run_len} is over the batch bound");
+                assert_eq!(sink.writes, 0, "run of {run_len}: nothing reached the wire");
+                continue;
+            }
+            assert!(staged, "run of {run_len} is inside the bound");
+            let frames = chunks.len();
+            assert_eq!(
+                sink.writes,
+                usize::from(frames > 0),
+                "run of {run_len}: {frames} frames must cost exactly one write"
+            );
 
             let mut mask = Shake::fresh(&iv, true);
             let (mut a, mut b) = (0usize, 0usize);
             for (frame, chunk) in chunks.iter().enumerate() {
+                if run_len > READ_PLAIN {
+                    break;
+                }
                 let padding = usize::from(mask.pad_len());
                 let wire = u16::from_be_bytes([apart[a], apart[a + 1]]);
                 assert_eq!(
@@ -1756,6 +1797,51 @@ mod tests {
                 "the one-at-a-time run is exactly its frames"
             );
             assert_eq!(b, whole.len(), "the batch is exactly the same frames");
+        }
+    }
+
+    /// `stage_frames` stages at most `FRAMES_PER_WRITE` frames. A wider read used
+    /// to exit the loop with bytes left and return true, which put a truncated
+    /// frame sequence on the wire; it must refuse instead, and refuse *before*
+    /// any of the batch reaches the stream.
+    #[test]
+    fn a_read_wider_than_one_batch_is_refused_not_truncated() {
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let key = [0x3cu8; 16];
+        let iv: [u8; 16] = std::array::from_fn(|i| 0x10u8.wrapping_add(i as u8));
+        for extra in [1usize, MAX_PLAIN] {
+            let plain: Vec<u8> = (0..(READ_PLAIN + extra))
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+            let mut staging = Vec::new();
+            let mut pad = PadSource::fresh().expect("entropy");
+            let mut sink = CountingWriter::default();
+            assert!(
+                !stage_frames(&mut sink, &mut send, &plain, &mut staging, &mut pad),
+                "a read of {} bytes must be refused, not truncated",
+                plain.len()
+            );
+            assert_eq!(
+                sink.writes, 0,
+                "nothing of a refused batch may reach the wire"
+            );
+        }
+
+        // and one byte under the bound still works, or the refusal is not a bound
+        for len in [READ_PLAIN - 1, READ_PLAIN] {
+            let plain: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+            let mut staging = Vec::new();
+            let mut pad = PadSource::fresh().expect("entropy");
+            let mut sink = CountingWriter::default();
+            assert!(
+                stage_frames(&mut sink, &mut send, &plain, &mut staging, &mut pad),
+                "{len} bytes is exactly the bound and must stage"
+            );
+            assert_eq!(sink.writes, 1, "{len} bytes is one write");
         }
     }
 

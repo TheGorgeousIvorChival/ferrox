@@ -207,13 +207,9 @@ fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     }
 }
 
-// The rung a dial starts at: the ladder's, never above the configured one.
-fn ladder_start(ladder: &Ladder, carrier: &Carrier) -> Rung {
-    let start = ladder.start_rung();
-    match rung_of(carrier) {
-        Some(configured) if start > configured => configured,
-        _ => start,
-    }
+// The rung a dial starts at: the carrier this server was configured for, or Raw when it is off the ladder.
+fn ladder_start(carrier: &Carrier) -> Rung {
+    rung_of(carrier).unwrap_or(Rung::Raw)
 }
 
 static FATAL_DIALS: AtomicU64 = AtomicU64::new(0);
@@ -691,12 +687,34 @@ fn write_mux_frame(
     frame: ferrox_core::mux::Outgoing<'_>,
     data: Option<&[u8]>,
 ) -> bool {
-    let len = data.map_or(0, <[u8]>::len);
-    resize_scratch(staging, frame.frame_len(len));
-    let written = frame.encode_into(data, staging);
-    staging.truncate(written);
+    // A mux payload is framed, not sealed, so it goes to the socket from
+    // where it was read: one writev, and no copy of the relayed byte.
+    if let Some(payload) = data {
+        assert!(
+            payload.len() <= ferrox_core::mux::CHUNK_MAX,
+            "mux chunk longer than a length field"
+        );
+        let at = frame.encode_header_into(staging);
+        frame.patch_payload_len(staging, at, payload.len());
+        write_mux_two(shared, staging, payload)
+    } else {
+        resize_scratch(staging, frame.frame_len(0));
+        let written = frame.encode_into(None, staging);
+        staging.truncate(written);
+        match shared.lock() {
+            Ok(mut stream) => stream.write_all(staging).is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// One `writev` of a frame header and the read buffer behind a shared uplink.
+/// That is what makes both mux relay directions cost zero copies of the
+/// payload, and `a_two_part_write_hands_the_payload_over_by_pointer` is the
+/// gate — a byte-level test cannot see it either way.
+fn write_mux_two(shared: &Arc<Mutex<TcpStream>>, first: &[u8], second: &[u8]) -> bool {
     match shared.lock() {
-        Ok(mut stream) => stream.write_all(staging).is_ok(),
+        Ok(mut stream) => write_all_two(&mut stream, first, second),
         Err(_) => false,
     }
 }
@@ -1694,7 +1712,7 @@ fn dial_vless(
             return;
         }
     }
-    let start = ladder_start(ladder, &vless.carrier);
+    let start = ladder_start(&vless.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -2536,33 +2554,36 @@ fn mux_dial_downlink(mut down: TcpStream, mut up: TcpStream, id: u16) {
 
 fn mux_dial_uplink(client: &TcpStream, uplink: &mut TcpStream, id: u16) {
     let mut chunk = [0u8; 8192];
-    let mut scratch = Vec::with_capacity(8192);
     let Ok(mut plain) = client.try_clone() else {
         return;
     };
+    let keep = ferrox_core::mux::Outgoing {
+        id,
+        status: ferrox_core::mux::Status::Keep,
+        options: ferrox_core::mux::DATA,
+        target: None,
+        global_id: None,
+    };
+    // Every frame on this uplink carries the same metadata, so the header is
+    // built once and only its two-byte payload length is rewritten per read. A
+    // mux payload is framed, not sealed, so its bytes can go to the socket where
+    // they were read from: one writev, and no copy of the relayed byte.
+    let mut header = Vec::with_capacity(64);
+    let at = keep.encode_header_into(&mut header);
     loop {
         match plain.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let keep = ferrox_core::mux::Outgoing {
-                    id,
-                    status: ferrox_core::mux::Status::Keep,
-                    options: ferrox_core::mux::DATA,
-                    target: None,
-                    global_id: None,
-                };
-                resize_scratch(&mut scratch, keep.frame_len(n));
-                let written = keep.encode_into(Some(&chunk[..n]), &mut scratch);
-                if uplink.write_all(&scratch[..written]).is_err() {
+                keep.patch_payload_len(&mut header, at, n);
+                if !write_all_two(uplink, &header, &chunk[..n]) {
                     break;
                 }
             }
         }
     }
     let end = ferrox_core::mux::Outgoing::bare(id, ferrox_core::mux::Status::End, 0);
-    resize_scratch(&mut scratch, end.frame_len(0));
-    let written = end.encode_into(None, &mut scratch);
-    let _ = uplink.write_all(&scratch[..written]);
+    let _ = end.encode_header_into(&mut header);
+    let _ = uplink.write_all(&header);
     let _ = uplink.shutdown(Shutdown::Both);
 }
 
@@ -2746,7 +2767,7 @@ fn dial_vmess(
             return;
         }
     }
-    let start = ladder_start(ladder, &vmess.carrier);
+    let start = ladder_start(&vmess.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -2909,7 +2930,7 @@ fn dial_trojan(
             return;
         }
     }
-    let start = ladder_start(ladder, &trojan.carrier);
+    let start = ladder_start(&trojan.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -3153,7 +3174,7 @@ fn tls_xhttp(
     host: &str,
     path: &str,
 ) -> Option<(
-    crate::xhttp::XhttpReader<ClientHalf>,
+    crate::xhttp::Reader<ClientHalf>,
     crate::xhttp::XhttpWriter,
 )> {
     let (reader, writer, _) = tls_halves(session)?;
@@ -3593,7 +3614,7 @@ fn dial_shadowsocks(
             return;
         }
     }
-    let start = ladder_start(ladder, &ss.carrier);
+    let start = ladder_start(&ss.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
         let attempt = if *rung == Rung::Raw {
@@ -5435,20 +5456,29 @@ pub(crate) fn parse_addr_body(buf: &[u8], kind: AddrKind) -> Option<(AddrBody<'_
     }
 }
 
+/// The two `writev` parts for a frame: a header, and a payload handed to the
+/// kernel **by pointer**. That is what makes the mux uplink's copy count zero,
+/// and `a_two_part_write_hands_the_payload_over_by_pointer` is the gate — a
+/// byte-level test cannot see it, because the bytes are identical either way.
+#[cfg(unix)]
+pub(crate) fn two_iovecs(first: &[u8], second: &[u8]) -> [libc::iovec; 2] {
+    [
+        libc::iovec {
+            iov_base: first.as_ptr() as *mut libc::c_void,
+            iov_len: first.len(),
+        },
+        libc::iovec {
+            iov_base: second.as_ptr() as *mut libc::c_void,
+            iov_len: second.len(),
+        },
+    ]
+}
+
 pub(crate) fn write_all_two(stream: &mut TcpStream, first: &[u8], second: &[u8]) -> bool {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
-        let mut parts = [
-            libc::iovec {
-                iov_base: first.as_ptr() as *mut libc::c_void,
-                iov_len: first.len(),
-            },
-            libc::iovec {
-                iov_base: second.as_ptr() as *mut libc::c_void,
-                iov_len: second.len(),
-            },
-        ];
+        let mut parts = two_iovecs(first, second);
         writev_loop(stream.as_raw_fd(), &mut parts, first.len() + second.len())
     }
     #[cfg(not(unix))]
@@ -10065,6 +10095,117 @@ mod tests {
         mux_test_expect_close(&mut stream);
     }
 
+    /// Pointer identity: the second `writev` part must point at the buffer the
+    /// payload was read into. A relay that staged the payload anywhere first
+    /// would still deliver the same bytes, so this is the only kind of test that
+    /// can see the copy at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_two_part_write_hands_the_payload_over_by_pointer() {
+        let header = [0xAAu8; 12];
+        let payload: Vec<u8> = (0..1400).map(|i| (i as u8) ^ 0x3C).collect();
+        let parts = two_iovecs(&header, &payload);
+        assert_eq!(parts[0].iov_base, header.as_ptr() as *mut libc::c_void);
+        assert_eq!(
+            parts[1].iov_base,
+            payload.as_ptr() as *mut libc::c_void,
+            "the payload must be the writev part itself, not a copy of it"
+        );
+        assert_eq!(parts[1].iov_len, 1400);
+    }
+
+    /// The relay refuses a payload the frame format cannot carry, the way the
+    /// single-buffer encoder always did: patching the two-byte length must
+    /// never truncate, so oversize is a panic and not a wrap.
+    #[test]
+    #[should_panic(expected = "mux chunk longer than a length field")]
+    fn a_relay_payload_longer_than_a_frame_is_refused_not_truncated() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("dials");
+        let shared = Arc::new(Mutex::new(stream));
+        let keep = ferrox_core::mux::Outgoing {
+            id: 1,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: None,
+            global_id: None,
+        };
+        let mut staging = Vec::new();
+        let big = vec![0u8; ferrox_core::mux::CHUNK_MAX + 1];
+        let _ = write_mux_frame(&shared, &mut staging, keep, Some(&big));
+    }
+
+    /// The uplink writes a header it built once and a payload it never copied,
+    /// so the gate is what lands on the wire: the same frames the single-buffer
+    /// encoder produced, decoded back to the exact bytes that were read.
+    #[test]
+    fn the_mux_uplink_frames_every_relay_read_the_same_way() {
+        for total in [1usize, 15, 16, 1400, 8192, 8193, 20_000] {
+            let payload: Vec<u8> = (0..total).map(|i| (i as u8).wrapping_mul(7)).collect();
+
+            let upstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let upstream_port = upstream.local_addr().expect("addr").port();
+            let server = thread::spawn(move || {
+                let (mut sock, _) = upstream.accept().expect("accepts");
+                let mut seen = Vec::new();
+                let mut buf = vec![0u8; 32 * 1024];
+                while let Ok(n) = sock.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                }
+                seen
+            });
+
+            let mut uplink = TcpStream::connect(("127.0.0.1", upstream_port)).expect("dials");
+            let client = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let client_port = client.local_addr().expect("addr").port();
+            let sent = payload.clone();
+            let writer = thread::spawn(move || {
+                let mut sock = TcpStream::connect(("127.0.0.1", client_port)).expect("connects");
+                sock.write_all(&sent).expect("writes");
+                sock.shutdown(Shutdown::Write).ok();
+            });
+            let (plain, _peer) = client.accept().expect("accepts");
+
+            let id = 7u16;
+            mux_dial_uplink(&plain, &mut uplink, id);
+
+            let wire = server.join().expect("joins");
+            writer.join().expect("joins");
+
+            let mut out = Vec::new();
+            let mut frames = 0usize;
+            let mut at = 0usize;
+            while at < wire.len() {
+                let (frame, used) =
+                    ferrox_core::mux::decode(&wire[at..], ferrox_core::mux::NewTail::Forward)
+                        .expect("a frame decodes");
+                at += used;
+                assert_eq!(frame.id, id, "total {total}");
+                let Some(data) = frame.data else {
+                    assert_eq!(
+                        frame.status,
+                        ferrox_core::mux::Status::End,
+                        "total {total}: only the End frame carries no payload"
+                    );
+                    break;
+                };
+                assert_eq!(
+                    frame.status,
+                    ferrox_core::mux::Status::Keep,
+                    "total {total}"
+                );
+                out.extend_from_slice(data);
+                frames += 1;
+            }
+            assert_eq!(out, payload, "total {total}: the relayed bytes differ");
+            assert!(frames >= 1, "total {total}: no frames");
+        }
+    }
+
     #[test]
     fn socks_dials_vless_mux_to_echo() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -10777,7 +10918,63 @@ mod tests {
     }
 
     #[test]
-    fn the_ladder_climbs_from_raw_to_ws_and_relays() {
+    fn the_configured_carrier_owns_the_first_rung() {
+        let ladder = Ladder::new();
+        let unreachable = Failure::new(Stage::SocketConnected, Kind::Unreachable);
+        for rung in [
+            Rung::Raw,
+            Rung::Ws,
+            Rung::Xhttp,
+            Rung::Grpc,
+            Rung::HttpUpgrade,
+        ] {
+            assert_eq!(ladder.record_failure(rung, &unreachable), rung.next());
+        }
+        assert_eq!(ladder.current(), Rung::HttpUpgrade);
+        for (carrier, want) in [
+            (Carrier::Raw, Rung::Raw),
+            (
+                Carrier::Ws {
+                    path: "/t".to_owned(),
+                    ed: 0,
+                },
+                Rung::Ws,
+            ),
+            (
+                Carrier::Xhttp {
+                    path: "/t".to_owned(),
+                },
+                Rung::Xhttp,
+            ),
+            (
+                Carrier::Grpc {
+                    path: "/t".to_owned(),
+                },
+                Rung::Grpc,
+            ),
+            (
+                Carrier::HttpUpgrade {
+                    path: "/t".to_owned(),
+                },
+                Rung::HttpUpgrade,
+            ),
+            (
+                Carrier::HttpHeader {
+                    path: "/t".to_owned(),
+                },
+                Rung::Raw,
+            ),
+        ] {
+            assert_eq!(
+                ladder_start(&carrier),
+                want,
+                "{carrier:?} lost the first rung to the ladder"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ladder_climbs_past_the_configured_rung_and_relays() {
         let server = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
@@ -10786,18 +10983,18 @@ mod tests {
                 let Ok(stream) = stream else { continue };
                 thread::spawn(move || {
                     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-                    let mut head = [0u8; 4];
+                    let mut head = [0u8; 5];
                     loop {
                         match stream.peek(&mut head) {
-                            Ok(4) => break,
+                            Ok(5) => break,
                             Ok(_) => thread::sleep(Duration::from_millis(1)),
                             Err(_) => return,
                         }
                     }
-                    if head != *b"GET " {
+                    if head != *b"POST " {
                         return;
                     }
-                    let Some((mut reader, writer)) = crate::ws::accept(stream, "/ladder") else {
+                    let Some((mut reader, writer)) = crate::xhttp::accept(stream, "/ladder") else {
                         return;
                     };
                     let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
@@ -10852,11 +11049,12 @@ mod tests {
         let mut back = [0u8; 12];
         client.read_exact(&mut back).expect("reads");
         assert_eq!(&back, b"hello-ladder");
-        assert_eq!(ladder.current(), Rung::Ws);
+        assert_eq!(ladder.current(), Rung::Xhttp);
         assert_eq!(ladder.climbs(), 1);
-        assert_eq!(ladder.attempts(Rung::Raw), 1);
         assert_eq!(ladder.attempts(Rung::Ws), 1);
-        assert_eq!(ladder.useful(Rung::Ws), 1);
+        assert_eq!(ladder.attempts(Rung::Xhttp), 1);
+        assert_eq!(ladder.useful(Rung::Xhttp), 1);
+        assert_eq!(ladder.useful(Rung::Ws), 0);
     }
 
     const QUIC_TEST_TIMEOUT: Duration = Duration::from_secs(120);

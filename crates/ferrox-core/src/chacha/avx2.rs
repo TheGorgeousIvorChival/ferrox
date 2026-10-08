@@ -1,3 +1,18 @@
+//! Eight blocks in one pass: a state word per register, the blocks in the lanes.
+//!
+//! The lane's own layout gives two blocks to four registers and rotates the row
+//! registers with `vpshufd` six times a double round per state, which is ten
+//! shuffle ops per two blocks — a quarter of the pass's work on a port that
+//! issues once a cycle. Giving a register one *word* of eight blocks instead
+//! makes a diagonal round a rename of the row registers, which costs nothing,
+//! and the four registers of a row transpose once at the store. The pass then
+//! spends two shuffles per eight blocks a double round — the two byte-level
+//! rotations of each quarter round — against the ladder's twenty-four.
+//!
+//! Sixteen registers is the whole of the register file, so eight blocks is the
+//! most the pass can hold; the ladder keeps the lengths below a pass and the
+//! remainder of every longer one.
+
 use super::{as_i32_bits, Lanes};
 #[allow(clippy::wildcard_imports)]
 use core::arch::x86_64::*;
@@ -132,13 +147,336 @@ impl Lanes for A8 {
     }
 }
 
+/// Blocks one pass covers: sixteen registers, one state word in each.
+const PASS_BLOCKS: u32 = 8;
+
+/// Bytes one pass covers.
+const PASS_BYTES: usize = PASS_BLOCKS as usize * 64;
+
+/// The lane increments: the pass's block `b` counts from `ctr + b`.
+static LANES: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+#[inline(always)]
+fn rot16(x: __m256i, table: __m256i) -> __m256i {
+    unsafe { _mm256_shuffle_epi8(x, table) }
+}
+
+#[inline(always)]
+fn rot12(x: __m256i) -> __m256i {
+    unsafe { _mm256_or_si256(_mm256_slli_epi32::<12>(x), _mm256_srli_epi32::<20>(x)) }
+}
+
+#[inline(always)]
+fn rot8(x: __m256i, table: __m256i) -> __m256i {
+    unsafe { _mm256_shuffle_epi8(x, table) }
+}
+
+#[inline(always)]
+fn rot7(x: __m256i) -> __m256i {
+    unsafe { _mm256_or_si256(_mm256_slli_epi32::<7>(x), _mm256_srli_epi32::<25>(x)) }
+}
+
+/// One quarter round over the four registers the caller names. Which registers
+/// those are *is* the diagonal round: the state word each register holds is the
+/// column the register answers to, so the diagonal is a rename of them.
+macro_rules! quarter {
+    ($a:ident, $b:ident, $c:ident, $d:ident, $t16:ident, $t8:ident) => {
+        $a = unsafe { _mm256_add_epi32($a, $b) };
+        $d = rot16(unsafe { _mm256_xor_si256($d, $a) }, $t16);
+        $c = unsafe { _mm256_add_epi32($c, $d) };
+        $b = rot12(unsafe { _mm256_xor_si256($b, $c) });
+        $a = unsafe { _mm256_add_epi32($a, $b) };
+        $d = rot8(unsafe { _mm256_xor_si256($d, $a) }, $t8);
+        $c = unsafe { _mm256_add_epi32($c, $d) };
+        $b = rot7(unsafe { _mm256_xor_si256($b, $c) });
+    };
+}
+
+/// One double round over the pass's sixteen registers: the four columns, then
+/// the four diagonals, and the diagonals are the same registers under a
+/// different name.
+macro_rules! double_round {
+    (
+        $v0:ident, $v1:ident, $v2:ident, $v3:ident, $v4:ident, $v5:ident, $v6:ident, $v7:ident,
+        $v8:ident, $v9:ident, $v10:ident, $v11:ident, $v12:ident, $v13:ident, $v14:ident,
+        $v15:ident, $t16:ident, $t8:ident
+    ) => {
+        quarter!($v0, $v4, $v8, $v12, $t16, $t8);
+        quarter!($v1, $v5, $v9, $v13, $t16, $t8);
+        quarter!($v2, $v6, $v10, $v14, $t16, $t8);
+        quarter!($v3, $v7, $v11, $v15, $t16, $t8);
+        quarter!($v0, $v5, $v10, $v15, $t16, $t8);
+        quarter!($v1, $v6, $v11, $v12, $t16, $t8);
+        quarter!($v2, $v7, $v8, $v13, $t16, $t8);
+        quarter!($v3, $v4, $v9, $v14, $t16, $t8);
+    };
+}
+
+/// The two 128-bit halves of `a` and `b` joined: `lo` puts the low halves first,
+/// which is what puts two rows of one block next to each other.
+#[inline(always)]
+fn join_lo(a: __m256i, b: __m256i) -> __m256i {
+    unsafe { _mm256_permute2x128_si256::<0x20>(a, b) }
+}
+
+#[inline(always)]
+fn join_hi(a: __m256i, b: __m256i) -> __m256i {
+    unsafe { _mm256_permute2x128_si256::<0x31>(a, b) }
+}
+
+/// Four registers transposed: element `b` of a result is lane `b` of all four,
+/// which is the sixteen bytes one block's row had across the registers, pairs of
+/// blocks sharing a register's halves.
+#[inline(always)]
+fn transpose(w0: __m256i, w1: __m256i, w2: __m256i, w3: __m256i) -> [__m256i; 4] {
+    unsafe {
+        let t0 = _mm256_unpacklo_epi32(w0, w1);
+        let t1 = _mm256_unpackhi_epi32(w0, w1);
+        let t2 = _mm256_unpacklo_epi32(w2, w3);
+        let t3 = _mm256_unpackhi_epi32(w2, w3);
+        let u0 = _mm256_unpacklo_epi64(t0, t2);
+        let u1 = _mm256_unpackhi_epi64(t0, t2);
+        let u2 = _mm256_unpacklo_epi64(t1, t3);
+        let u3 = _mm256_unpackhi_epi64(t1, t3);
+        [
+            join_lo(u0, u1),
+            join_lo(u2, u3),
+            join_hi(u0, u1),
+            join_hi(u2, u3),
+        ]
+    }
+}
+
+/// Xor thirty-two bytes of keystream into thirty-two output bytes.
+#[inline(always)]
+fn xor_y(dst: &mut [u8], v: __m256i) {
+    debug_assert_eq!(dst.len(), 32, "a ymm row is two sixteen-byte rows");
+    unsafe {
+        let p = dst.as_mut_ptr();
+        _mm256_storeu_si256(p.cast(), _mm256_xor_si256(_mm256_loadu_si256(p.cast()), v));
+    }
+}
+
+/// One eight-block pass, the message xored in place.
+///
+/// `out` is `PASS_BYTES` long, or sixty-four bytes less with a `head`: the pass's
+/// first block is then the one-time key, whose first thirty-two bytes the head
+/// takes and whose tail is dropped, exactly as the ladder drops the block the
+/// head is read from. `state` is the nonce's state with a zero counter.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the round's sixteen quarter rounds are written out because their register names are the diagonal, and the store follows those same names"
+)]
+#[inline(always)]
+fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]) {
+    debug_assert_eq!(state[12], 0, "the counter register is only a base at zero");
+    debug_assert_eq!(
+        out.len(),
+        if head.is_some() {
+            PASS_BYTES - 64
+        } else {
+            PASS_BYTES
+        },
+        "a pass writes eight blocks, or seven beside a head"
+    );
+
+    // black-boxed for the same reason the lane does it: a constant mask here is
+    // read back as two lane swaps
+    let masked = core::hint::black_box(ROTL16.as_ptr().cast::<i8>());
+    let t16 = unsafe { _mm256_loadu_si256(masked.cast()) };
+    let t8 = unsafe { _mm256_loadu_si256(ROTL8.as_ptr().cast()) };
+    let lanes = unsafe { _mm256_loadu_si256(LANES.as_ptr().cast()) };
+
+    // Every register starts from the same broadcast state: only the counters
+    // differ, and the counter is the whole of what makes one block another.
+    let mut v0 = unsafe { _mm256_set1_epi32(as_i32_bits(state[0])) };
+    let mut v1 = unsafe { _mm256_set1_epi32(as_i32_bits(state[1])) };
+    let mut v2 = unsafe { _mm256_set1_epi32(as_i32_bits(state[2])) };
+    let mut v3 = unsafe { _mm256_set1_epi32(as_i32_bits(state[3])) };
+    let mut v4 = unsafe { _mm256_set1_epi32(as_i32_bits(state[4])) };
+    let mut v5 = unsafe { _mm256_set1_epi32(as_i32_bits(state[5])) };
+    let mut v6 = unsafe { _mm256_set1_epi32(as_i32_bits(state[6])) };
+    let mut v7 = unsafe { _mm256_set1_epi32(as_i32_bits(state[7])) };
+    let mut v8 = unsafe { _mm256_set1_epi32(as_i32_bits(state[8])) };
+    let mut v9 = unsafe { _mm256_set1_epi32(as_i32_bits(state[9])) };
+    let mut v10 = unsafe { _mm256_set1_epi32(as_i32_bits(state[10])) };
+    let mut v11 = unsafe { _mm256_set1_epi32(as_i32_bits(state[11])) };
+    let mut v12 = unsafe { _mm256_add_epi32(_mm256_set1_epi32(as_i32_bits(ctr)), lanes) };
+    let mut v13 = unsafe { _mm256_set1_epi32(as_i32_bits(state[13])) };
+    let mut v14 = unsafe { _mm256_set1_epi32(as_i32_bits(state[14])) };
+    let mut v15 = unsafe { _mm256_set1_epi32(as_i32_bits(state[15])) };
+
+    for _ in 0..10 {
+        double_round!(
+            v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, t16, t8
+        );
+    }
+
+    // The initial state comes back out of memory rather than staying in sixteen
+    // more registers: they are not there to be had, and a broadcast load is a
+    // cycle.
+    v0 = unsafe { _mm256_add_epi32(v0, _mm256_set1_epi32(as_i32_bits(state[0]))) };
+    v1 = unsafe { _mm256_add_epi32(v1, _mm256_set1_epi32(as_i32_bits(state[1]))) };
+    v2 = unsafe { _mm256_add_epi32(v2, _mm256_set1_epi32(as_i32_bits(state[2]))) };
+    v3 = unsafe { _mm256_add_epi32(v3, _mm256_set1_epi32(as_i32_bits(state[3]))) };
+    v4 = unsafe { _mm256_add_epi32(v4, _mm256_set1_epi32(as_i32_bits(state[4]))) };
+    v5 = unsafe { _mm256_add_epi32(v5, _mm256_set1_epi32(as_i32_bits(state[5]))) };
+    v6 = unsafe { _mm256_add_epi32(v6, _mm256_set1_epi32(as_i32_bits(state[6]))) };
+    v7 = unsafe { _mm256_add_epi32(v7, _mm256_set1_epi32(as_i32_bits(state[7]))) };
+    v8 = unsafe { _mm256_add_epi32(v8, _mm256_set1_epi32(as_i32_bits(state[8]))) };
+    v9 = unsafe { _mm256_add_epi32(v9, _mm256_set1_epi32(as_i32_bits(state[9]))) };
+    v10 = unsafe { _mm256_add_epi32(v10, _mm256_set1_epi32(as_i32_bits(state[10]))) };
+    v11 = unsafe { _mm256_add_epi32(v11, _mm256_set1_epi32(as_i32_bits(state[11]))) };
+    v12 = unsafe {
+        _mm256_add_epi32(
+            v12,
+            _mm256_add_epi32(_mm256_set1_epi32(as_i32_bits(ctr)), lanes),
+        )
+    };
+    v13 = unsafe { _mm256_add_epi32(v13, _mm256_set1_epi32(as_i32_bits(state[13]))) };
+    v14 = unsafe { _mm256_add_epi32(v14, _mm256_set1_epi32(as_i32_bits(state[14]))) };
+    v15 = unsafe { _mm256_add_epi32(v15, _mm256_set1_epi32(as_i32_bits(state[15]))) };
+
+    let rows = [
+        transpose(v0, v1, v2, v3),
+        transpose(v4, v5, v6, v7),
+        transpose(v8, v9, v10, v11),
+        transpose(v12, v13, v14, v15),
+    ];
+
+    // the pass's first block is block zero: its first two rows are the one-time
+    // key, its last two are dropped, and the buffer starts at the second block
+    let mut skip = false;
+    if let Some(one_time) = head {
+        xor_y(&mut one_time[..], join_lo(rows[0][0], rows[1][0]));
+        skip = true;
+    }
+    let mut at = 0usize;
+    for block in 0..PASS_BLOCKS as usize {
+        if skip && block == 0 {
+            continue;
+        }
+        // block `b` shares register `b / 2` with its pair: an even block is the
+        // low halves of the transposes, an odd block the high ones
+        let pair = block / 2;
+        let (lo, hi) = if block % 2 == 0 {
+            (
+                join_lo(rows[0][pair], rows[1][pair]),
+                join_lo(rows[2][pair], rows[3][pair]),
+            )
+        } else {
+            (
+                join_hi(rows[0][pair], rows[1][pair]),
+                join_hi(rows[2][pair], rows[3][pair]),
+            )
+        };
+        xor_y(&mut out[at..at + 32], lo);
+        xor_y(&mut out[at + 32..at + 64], hi);
+        at += 64;
+    }
+}
+
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn xor_blocks(
     key: &[u8; 32],
     nonce: &[u8; 12],
     start: u32,
-    head: Option<&mut [u8; 32]>,
-    out: &mut [u8],
+    mut head: Option<&mut [u8; 32]>,
+    buf: &mut [u8],
 ) -> u32 {
-    super::xor_ladder::<A8>(key, nonce, start, head, out)
+    let state = super::base_state(key, nonce);
+    let mut ctr = start;
+    let mut rest = buf;
+    let mut blocks = 0u32;
+
+    loop {
+        // a head is one of the pass's blocks: it is consumed and only
+        // thirty-two of its bytes are output, so a headed pass writes seven
+        let take = if head.is_some() {
+            PASS_BYTES - 64
+        } else {
+            PASS_BYTES
+        };
+        if rest.len() < take {
+            break;
+        }
+        let (chunk, tail) = rest.split_at_mut(take);
+        pass(&state, ctr, head.take(), chunk);
+        blocks += PASS_BLOCKS;
+        ctr = ctr.wrapping_add(PASS_BLOCKS);
+        rest = tail;
+    }
+
+    blocks + super::xor_ladder::<A8>(key, nonce, ctr, head, rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{xor_blocks, A8, PASS_BYTES};
+    use crate::chacha::xor_ladder;
+
+    /// The pass against the ladder it replaced, byte for byte, at every length
+    /// around its own boundaries and across the counter's ends.
+    #[test]
+    fn the_eight_block_pass_is_the_ladder_at_every_length() {
+        let key = [0x5bu8; 32];
+        let nonce = [0xa7u8; 12];
+        let mut lengths: Vec<usize> = (0..=(2 * PASS_BYTES + 8)).collect();
+        lengths.extend([1023, 1024, 1025, 4095, 4096, 4097, 16_384]);
+
+        for &len in &lengths {
+            for start in [0u32, 1, 7, u32::MAX - 9] {
+                let plain: Vec<u8> = (0..len)
+                    .map(|i| (i as u8).wrapping_mul(251).wrapping_add(11))
+                    .collect();
+                let mut ours = plain.clone();
+                let mut theirs = plain.clone();
+                let mut our_key = [0u8; 32];
+                let mut their_key = [0u8; 32];
+
+                let our_blocks =
+                    unsafe { xor_blocks(&key, &nonce, start, Some(&mut our_key), &mut ours) };
+                let their_blocks =
+                    xor_ladder::<A8>(&key, &nonce, start, Some(&mut their_key), &mut theirs);
+
+                assert_eq!(ours, theirs, "ciphertext at {len} bytes from {start}");
+                assert_eq!(
+                    our_key, their_key,
+                    "one-time key at {len} bytes from {start}"
+                );
+                assert_eq!(
+                    our_blocks, their_blocks,
+                    "blocks at {len} bytes from {start}"
+                );
+            }
+        }
+    }
+
+    /// Without a head, and over the lengths where a pass does not divide.
+    #[test]
+    fn the_pass_matches_the_ladder_without_a_head() {
+        let key = [0x11u8; 32];
+        let nonce = [0x22u8; 12];
+        for len in [
+            0,
+            1,
+            63,
+            64,
+            65,
+            PASS_BYTES - 1,
+            PASS_BYTES,
+            PASS_BYTES + 1,
+            2 * PASS_BYTES,
+            2 * PASS_BYTES + 63,
+            3 * PASS_BYTES - 1,
+        ] {
+            let plain: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut ours = plain.clone();
+            let mut theirs = plain;
+            let our_blocks = unsafe { xor_blocks(&key, &nonce, 0, None, &mut ours) };
+            let their_blocks = xor_ladder::<A8>(&key, &nonce, 0, None, &mut theirs);
+            assert_eq!(ours, theirs, "ciphertext at {len} bytes");
+            assert_eq!(our_blocks, their_blocks, "blocks at {len} bytes");
+        }
+    }
 }

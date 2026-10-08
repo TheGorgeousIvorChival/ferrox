@@ -35,6 +35,13 @@ impl Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentOption(pub u8);
 
+/// Hands out the buffer for the next inbound data-segment payload. The
+/// socket thread supplies one; `ReceivingWorker::read` returns spent buffers to
+/// the same place. A datagram's payloads then cost no allocation once the
+/// window has been full once, which at the default 1 332-byte MSS is about
+/// 9 400 malloc/free pairs a second per direction at 100 Mbps.
+pub type TakePayload<'a> = dyn Fn() -> Vec<u8> + 'a;
+
 impl SegmentOption {
     pub const NONE: Self = Self(0);
     pub const CLOSE: Self = Self(1);
@@ -67,11 +74,20 @@ impl DataSegment {
         &self.payload
     }
 
-    fn parse(conv: u16, option: SegmentOption, buf: &[u8]) -> Option<(Self, &[u8])> {
+    fn parse<'a>(
+        conv: u16,
+        option: SegmentOption,
+        buf: &'a [u8],
+        take: &TakePayload<'_>,
+    ) -> Option<(Self, &'a [u8])> {
         if buf.len() < 15 {
             return None;
         }
         let data_len = usize::from(be16(buf, 12));
+        let body = buf.get(14..14 + data_len)?;
+        let mut payload = take();
+        payload.clear();
+        payload.extend_from_slice(body);
         Some((
             Self {
                 conv,
@@ -79,7 +95,7 @@ impl DataSegment {
                 timestamp: be32(buf, 0),
                 number: be32(buf, 4),
                 sending_next: be32(buf, 8),
-                payload: buf.get(14..14 + data_len)?.to_vec(),
+                payload,
                 timeout: 0,
                 transmit: 0,
             },
@@ -92,17 +108,46 @@ impl DataSegment {
     }
 
     pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
-        let mut header = [0u8; DATA_SEGMENT_OVERHEAD as usize];
-        header[0..2].copy_from_slice(&self.conv.to_be_bytes());
-        header[2] = Command::Data.to_byte();
-        header[3] = self.option.to_byte();
-        header[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
-        header[8..12].copy_from_slice(&self.number.to_be_bytes());
-        header[12..16].copy_from_slice(&self.sending_next.to_be_bytes());
-        header[16..18].copy_from_slice(&(self.payload.len() as u16).to_be_bytes());
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&self.payload);
+        serialize_data(
+            OutgoingHeader {
+                conv: self.conv,
+                option: self.option,
+                timestamp: self.timestamp,
+                number: self.number,
+                sending_next: self.sending_next,
+            },
+            &self.payload,
+            out,
+        );
     }
+}
+
+/// The five fields a data segment's wire header carries. Split out so the
+/// sender can hand the header over by value while the payload stays a borrowed
+/// slice of whatever buffer holds it — the sender's payload is a range into an
+/// arena, not an owned `Vec` per segment.
+#[derive(Debug, Clone, Copy)]
+pub struct OutgoingHeader {
+    pub conv: u16,
+    pub option: SegmentOption,
+    pub timestamp: u32,
+    pub number: u32,
+    pub sending_next: u32,
+}
+
+/// Writes the 18 header bytes and then the payload, straight into `out`. The
+/// header used to be staged in a stack array and copied; at 18 bytes per 1 332
+/// that is one memcpy per segment the arena made unnecessary.
+pub(crate) fn serialize_data(header: OutgoingHeader, payload: &[u8], out: &mut Vec<u8>) {
+    out.reserve(DATA_SEGMENT_OVERHEAD as usize + payload.len());
+    out.extend_from_slice(&header.conv.to_be_bytes());
+    out.push(Command::Data.to_byte());
+    out.push(header.option.to_byte());
+    out.extend_from_slice(&header.timestamp.to_be_bytes());
+    out.extend_from_slice(&header.number.to_be_bytes());
+    out.extend_from_slice(&header.sending_next.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,7 +369,7 @@ impl Segment {
 }
 
 #[must_use]
-pub fn read_segment(buf: &[u8]) -> Option<(Segment, &[u8])> {
+pub fn read_segment<'a>(buf: &'a [u8], take: &TakePayload<'_>) -> Option<(Segment, &'a [u8])> {
     if buf.len() < 4 {
         return None;
     }
@@ -338,7 +383,7 @@ pub fn read_segment(buf: &[u8]) -> Option<(Segment, &[u8])> {
             Some((Segment::Ack(seg), tail))
         }
         1 => {
-            let (seg, tail) = DataSegment::parse(conv, opt, rest)?;
+            let (seg, tail) = DataSegment::parse(conv, opt, rest, take)?;
             Some((Segment::Data(seg), tail))
         }
         _ => {
@@ -351,6 +396,49 @@ pub fn read_segment(buf: &[u8]) -> Option<(Segment, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `parse` fills the buffer it is lent instead of allocating: the payload's
+    /// pointer is the lent buffer's and its capacity survives the fill, so a
+    /// byte-level test passing either way cannot stand in for this one.
+    #[test]
+    fn a_data_segment_is_parsed_into_the_lent_buffer() {
+        for len in [1usize, 100, 1332, 1400, 2048] {
+            let seg = DataSegment {
+                conv: 1,
+                option: SegmentOption::NONE,
+                timestamp: 3,
+                number: 4,
+                sending_next: 5,
+                payload: vec![0x5Au8; len],
+                timeout: 0,
+                transmit: 0,
+            };
+            let mut buf = Vec::new();
+            Segment::Data(seg).serialize(&mut buf);
+            let slot = std::cell::RefCell::new(Some(Vec::with_capacity(2048)));
+            let lent = slot.borrow().as_ref().expect("a lent buffer").as_ptr();
+            let (got, rest) = read_segment(&buf, &|| {
+                slot.borrow_mut().take().expect("one data segment")
+            })
+            .unwrap();
+            assert_eq!(rest.len(), 0, "len {len}");
+            let Segment::Data(got) = got else {
+                panic!("len {len}: a data segment parses as data");
+            };
+            assert_eq!(
+                got.payload.as_ptr(),
+                lent,
+                "len {len}: parse allocated instead of filling"
+            );
+            assert_eq!(
+                got.payload.capacity(),
+                2048,
+                "len {len}: the fill grew the lent buffer"
+            );
+            assert_eq!(got.payload.len(), len, "len {len}");
+            assert!(got.payload.iter().all(|&b| b == 0x5A), "len {len}");
+        }
+    }
 
     #[test]
     fn a_data_segment_round_trips() {
@@ -367,7 +455,7 @@ mod tests {
         let mut buf = Vec::new();
         Segment::Data(seg.clone()).serialize(&mut buf);
         assert_eq!(buf.len(), DATA_SEGMENT_OVERHEAD as usize + 4);
-        let (got, rest) = read_segment(&buf).unwrap();
+        let (got, rest) = read_segment(&buf, &|| Vec::new()).unwrap();
         assert_eq!(rest.len(), 0);
         assert_eq!(got, Segment::Data(seg));
     }
@@ -383,7 +471,7 @@ mod tests {
         seg.put_number(2);
         let mut buf = Vec::new();
         Segment::Ack(seg.clone()).serialize(&mut buf);
-        let (got, _) = read_segment(&buf).unwrap();
+        let (got, _) = read_segment(&buf, &|| Vec::new()).unwrap();
         match got {
             Segment::Ack(a) => {
                 assert_eq!(a.numbers, vec![1, 2]);
@@ -393,6 +481,60 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The sender writes a data segment from a borrowed payload slice while the
+    /// oracle and every segment test write it from an owned one. Both must put
+    /// the same bytes on the wire at every length and offset, so the refactor
+    /// that removed the per-segment allocation cannot have changed the framing.
+    #[test]
+    fn a_borrowed_payload_serialises_identically_to_an_owned_one() {
+        let mut checked = 0usize;
+        for len in [
+            0usize, 1, 2, 15, 16, 17, 63, 64, 65, 127, 128, 1400, 8171, 8192,
+        ] {
+            for option in [SegmentOption::NONE, SegmentOption::CLOSE] {
+                for (number, timestamp, sending_next) in
+                    [(0u32, 0u32, 0u32), (1, 2, 3), (u32::MAX, 7, 11)]
+                {
+                    let payload: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x5A).collect();
+                    let owned = DataSegment {
+                        conv: 0xbeef,
+                        option,
+                        timestamp,
+                        number,
+                        sending_next,
+                        payload: payload.clone(),
+                        ..Default::default()
+                    };
+                    let mut from_owned = Vec::new();
+                    Segment::Data(owned.clone()).serialize(&mut from_owned);
+                    let mut from_slice = Vec::new();
+                    serialize_data(
+                        OutgoingHeader {
+                            conv: owned.conv,
+                            option: owned.option,
+                            timestamp: owned.timestamp,
+                            number: owned.number,
+                            sending_next: owned.sending_next,
+                        },
+                        &owned.payload,
+                        &mut from_slice,
+                    );
+                    assert_eq!(from_owned, from_slice, "len {len} {option:?}");
+                    assert_eq!(
+                        from_owned.len(),
+                        DATA_SEGMENT_OVERHEAD as usize + len,
+                        "len {len}: the header is still {DATA_SEGMENT_OVERHEAD} bytes"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= 84,
+            "the sweep should be dense, not a sample: {checked}"
+        );
     }
 
     #[test]
@@ -414,7 +556,7 @@ mod tests {
         raw.extend_from_slice(&1u32.to_be_bytes());
         raw.extend_from_slice(&2u32.to_be_bytes());
         raw.extend_from_slice(&3u32.to_be_bytes());
-        let (seg, _) = read_segment(&raw).unwrap();
+        let (seg, _) = read_segment(&raw, &|| Vec::new()).unwrap();
         match seg {
             Segment::CmdOnly(c) => assert_eq!(c.cmd, 250),
             _ => panic!("wrong variant"),
@@ -454,7 +596,7 @@ mod tests {
                 Segment::Data(seg.clone()).serialize(&mut buf);
                 buf.extend_from_slice(&trailer);
                 assert_eq!(buf.len(), DATA_SEGMENT_OVERHEAD as usize + len + tail_len);
-                let (got, rest) = read_segment(&buf).expect("parses");
+                let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("parses");
                 assert_eq!(got, Segment::Data(seg));
                 assert_eq!(rest, trailer);
             }
@@ -469,7 +611,7 @@ mod tests {
         raw.extend_from_slice(&3u32.to_be_bytes());
         raw.extend_from_slice(&9u16.to_be_bytes());
         raw.extend_from_slice(b"short");
-        assert!(read_segment(&raw).is_none());
+        assert!(read_segment(&raw, &|| Vec::new()).is_none());
     }
 
     #[test]
@@ -496,9 +638,9 @@ mod tests {
         Segment::Data(first.clone()).serialize(&mut buf);
         Segment::CmdOnly(second).serialize(&mut buf);
         assert_eq!(buf.len(), 23 + CMD_HEADER);
-        let (got, rest) = read_segment(&buf).expect("first parses");
+        let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("first parses");
         assert_eq!(got, Segment::Data(first));
-        let (got, rest) = read_segment(rest).expect("second parses");
+        let (got, rest) = read_segment(rest, &|| Vec::new()).expect("second parses");
         assert!(matches!(got, Segment::CmdOnly(_)));
         assert_eq!(rest.len(), 0);
     }
@@ -517,7 +659,7 @@ mod tests {
             let mut buf = Vec::new();
             Segment::CmdOnly(seg).serialize(&mut buf);
             assert_eq!(buf.len(), CMD_HEADER);
-            let (got, rest) = read_segment(&buf).expect("parses");
+            let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("parses");
             assert_eq!(got, Segment::CmdOnly(seg));
             assert_eq!(rest.len(), 0);
         }
@@ -528,7 +670,7 @@ mod tests {
         for cmd in [0u8, 1u8] {
             let mut buf = vec![0xbe, 0xef, cmd, 0xa5];
             buf.extend_from_slice(&[0u8; CMD_HEADER]);
-            let (got, _) = read_segment(&buf).expect("parses");
+            let (got, _) = read_segment(&buf, &|| Vec::new()).expect("parses");
             match (cmd, got) {
                 (0, Segment::Ack(a)) => assert_eq!((a.conv, a.option.0), (0xbeef, 0xa5)),
                 (1, Segment::Data(d)) => assert_eq!((d.conv, d.option.0), (0xbeef, 0xa5)),
@@ -551,7 +693,7 @@ mod tests {
             let mut buf = Vec::new();
             Segment::Ack(seg.clone()).serialize(&mut buf);
             assert_eq!(buf.len(), ACK_HEADER + count * 4);
-            let (got, rest) = read_segment(&buf).expect("parses");
+            let (got, rest) = read_segment(&buf, &|| Vec::new()).expect("parses");
             assert_eq!(got, Segment::Ack(seg));
             assert_eq!(rest.len(), 0);
         }
@@ -564,6 +706,6 @@ mod tests {
         raw.extend_from_slice(&4u32.to_be_bytes());
         raw.extend_from_slice(&5u32.to_be_bytes());
         raw.extend_from_slice(&0u16.to_be_bytes());
-        assert!(read_segment(&raw).is_none());
+        assert!(read_segment(&raw, &|| Vec::new()).is_none());
     }
 }

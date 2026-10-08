@@ -43,18 +43,26 @@ fn measure() -> bool {
     let mut lanes_time = f64::MAX;
     let mut scalar_time = f64::MAX;
     for _ in 0..REPS {
+        // The path this decides is one block with nothing beside it to issue, so
+        // each call counts from the word the one before it wrote: the loop is a
+        // dependent chain, where a loop of independent blocks would time the
+        // throughput this path is never asked for.
+        let mut ctr = 0u32;
         let start = Instant::now();
         for block in 0..BLOCKS {
             let mut out = [0u8; 64];
-            xor_groups::<Wide, 1>(&base::<Wide>(&state), block as u32, &mut out, None);
+            xor_groups::<Wide, 1>(&base::<Wide>(&state), ctr, &mut out, None);
+            ctr = u32::from_le_bytes(out[..4].try_into().expect("four bytes"));
             lanes[block * 64..block * 64 + 64].copy_from_slice(&out);
         }
         lanes_time = lanes_time.min(start.elapsed().as_secs_f64());
 
+        let mut ctr = 0u32;
         let start = Instant::now();
         for block in 0..BLOCKS {
             let mut out = [0u8; 64];
-            portable::xor_block(&state, block as u32, &mut out);
+            portable::xor_block(&state, ctr, &mut out);
+            ctr = u32::from_le_bytes(out[..4].try_into().expect("four bytes"));
             scalar[block * 64..block * 64 + 64].copy_from_slice(&out);
         }
         scalar_time = scalar_time.min(start.elapsed().as_secs_f64());
