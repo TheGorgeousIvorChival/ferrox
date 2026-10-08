@@ -63,6 +63,15 @@ not call the slice complete.
   is what makes `user-space-copies-per-byte-written 1` a claim rather than an
   intention, and it is the gate to copy when a rewrite claims it removed a
   copy, a `memmove` or a per-record allocation.
+- **A byte-level test cannot see a copy, because the bytes are identical either
+  way.** Reverting the mux uplink from a `writev` of header-plus-read-buffer to
+  the old copy-into-a-frame-buffer still passes every framing test. The only
+  witness is pointer identity: assert the `writev` part's base address *is* the
+  buffer that was read into, the way `frames_reuse_the_callers_buffers` asserts a
+  returned slice lives inside the caller's. Three copy rows on `main` named
+  `ferrox-bench-gate-6`, which counts allocations, bytes allocated and zero-fills
+  — and one of them claimed `0` where the codec copies once, so the value was
+  wrong as well as unchecked.
 - **The named checker has to observe the thing in the row.** Pointer identity
   observes copies and reallocations. A differential sweep against a reference
   crate observes *bytes*, not the operation count that produced them: it will

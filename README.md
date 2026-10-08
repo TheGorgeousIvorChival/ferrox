@@ -116,6 +116,8 @@ a number, so only the first table below appears in `scripts/method-counts.txt`.
 | [kcp](docs/function/kcp.md) | a `Vec<Vec<u8>>` per `read`, and a second deadline lock per wait | argued |
 | [carrier-websocket](docs/function/carrier-websocket.md) | an unbounded `realloc` chain in the read-ahead buffer | argued |
 | [carrier-xhttp](docs/function/carrier-xhttp.md) | a framing read syscall per chunk, and a second one that moved two bytes | `read-syscalls-per-16KiB-chunk 2`, by the reader's own read counter; **measured 33 reads for 16 chunks against 49** |
+| [mux-cool](docs/function/mux-cool.md) | a `memcpy` of every relayed byte on the uplink, plus a full header rebuild per read | `relay-copies-per-byte-written 0`, by the `writev` part's base address being the read buffer |
+| [mux-cool](docs/function/mux-cool.md) | nothing removed — two copy rows *corrected*, one of which named a gate that counts allocations | `codec-copies-per-byte-written 1` replaces a `0` that was never observed |
 | [kcp](docs/function/kcp.md) | a `malloc`/`free` per 1 332 bytes sent — about **9 400 pairs a second per direction** at 100 Mbps | `send-payload-buffers-per-window 1` and `send-payload-reallocations-per-window 0`, by arena capacity over 64 rounds |
 | [kcp](docs/function/kcp.md) | an 18-byte header staging array and three per-segment stores, per segment | `segment-header-staging-copies-per-segment 0` |
 | [vmess](docs/function/vmess.md) | a silent truncation of any relay read wider than one batch | argued; `stage_frames` now refuses, and nothing reaches the wire when it does |
@@ -142,6 +144,13 @@ not evidence:
   `window_size` ahead of `next_number` — at the default 776-segment window a
   sender legitimately in flight starts having segments dropped. Both passed the
   test suite. Neither is here.
+- **A copy claim needs pointer identity, because a byte test cannot see it.**
+  The mux uplink used to `memcpy` every relayed byte into the frame buffer. The
+  framing test passes with the copy and without it — the bytes are identical —
+  so the only test that can witness the removal is one that asserts the `writev`
+  part's base address *is* the read buffer. Two of this repository's copy rows
+  named `ferrox-bench-gate-6`, which counts allocations and zero-fills, not
+  copies, and one of them claimed `0` where the value is `1`; both are corrected.
 - **Three rows on this list were previously claims with no checker behind them,
   and the honest fix was the gate, not the number.** `vmess
   frames-per-write-syscall 4` and `write-syscalls-per-32KiB-relay-read 1` were
