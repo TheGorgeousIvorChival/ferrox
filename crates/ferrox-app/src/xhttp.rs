@@ -92,10 +92,15 @@ pub(crate) struct Reader<R> {
 pub(crate) type XhttpReader = Reader<TcpStream>;
 
 impl<R: Read> Reader<R> {
-    /// Every read that reaches the stream, counted where it happens.
+    /// Every read that reaches the stream, counted where it happens; quiet sockets retry.
     fn take(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.reads += 1;
-        self.read.read(buf)
+        loop {
+            self.reads += 1;
+            match self.read.read(buf) {
+                Err(error) if crate::proxy::is_timeout(&error) => {}
+                outcome => return outcome,
+            }
+        }
     }
 
     /// The syscall counter, read by `a_chunk_costs_two_reads_not_three` and

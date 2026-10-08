@@ -169,13 +169,21 @@ impl<R: Read> WsReader<R> {
         unsafe {
             self.have.set_len(base + room);
         }
-        let taken = match self.read.read(&mut self.have[base..]) {
-            Ok(0) | Err(_) => {
-                self.have.truncate(base);
-                self.eof = true;
-                0
+        let taken = loop {
+            match self.read.read(&mut self.have[base..]) {
+                Ok(0) => {
+                    self.have.truncate(base);
+                    self.eof = true;
+                    break 0;
+                }
+                Ok(n) => break n,
+                Err(error) if crate::proxy::is_timeout(&error) => {}
+                Err(_) => {
+                    self.have.truncate(base);
+                    self.eof = true;
+                    break 0;
+                }
             }
-            Ok(n) => n,
         };
         self.reads += 1;
         self.have.truncate(base + taken);

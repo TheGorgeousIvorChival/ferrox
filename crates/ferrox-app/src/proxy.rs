@@ -5198,7 +5198,11 @@ pub(crate) fn read_http_head(stream: &mut TcpStream, limit: usize) -> Option<Vec
         if head.len() >= limit {
             return None;
         }
-        let n = stream.peek(&mut probe).ok()?;
+        let n = match stream.peek(&mut probe) {
+            Ok(n) => n,
+            Err(error) if is_timeout(&error) => continue,
+            Err(_) => return None,
+        };
         if n == 0 {
             return None;
         }
@@ -5304,6 +5308,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                         break;
                     }
                 }
+                Err(error) if is_timeout(&error) => {}
                 _ => break,
             }
         }
@@ -5320,6 +5325,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                     break;
                 }
             }
+            Err(error) if is_timeout(&error) => {}
             _ => break,
         }
     }
@@ -5362,6 +5368,7 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
                         break;
                     }
                 }
+                Err(error) if is_timeout(&error) => {}
                 _ => break,
             }
         }
@@ -5376,6 +5383,7 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
                     break;
                 }
             }
+            Err(error) if is_timeout(&error) => {}
             _ => break,
         }
     }
@@ -5383,11 +5391,13 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
     let _ = done.join();
 }
 
+// A quiet socket is not a dead one: retry the relay's poll grain, fail only a closed stream.
 pub(crate) fn read_exact(stream: &mut dyn Read, mut buf: &mut [u8]) -> std::io::Result<()> {
     while !buf.is_empty() {
         match stream.read(buf) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             Ok(n) => buf = &mut buf[n..],
+            Err(error) if is_timeout(&error) => {}
             Err(error) => return Err(error),
         }
     }
@@ -5666,8 +5676,10 @@ fn trojan_take(
 ) -> bool {
     while *filled < want {
         match stream.read(&mut head[*filled..want]) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) => return false,
             Ok(n) => *filled += n,
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => return false,
         }
     }
     true
