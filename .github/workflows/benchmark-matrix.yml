@@ -195,7 +195,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: matrix-ferrox-${{ matrix.os }}
-          path: target/release
+          path: .
       - uses: actions/download-artifact@v4
         with:
           name: upstream-trees

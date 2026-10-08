@@ -5234,9 +5234,12 @@ pub(crate) fn read_exact_head(stream: &mut dyn Read, limit: usize) -> Option<(Ve
         if head.len() >= limit {
             return None;
         }
+        // A quiet socket is retried, like every other head reader: only a closed or broken one ends the handshake.
         let n = match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return None,
+            Ok(0) => return None,
             Ok(n) => n,
+            Err(error) if is_timeout(&error) => continue,
+            Err(_) => return None,
         };
         head.extend_from_slice(&chunk[..n]);
         if let Some(at) = head.windows(4).position(|w| w == b"\r\n\r\n") {
