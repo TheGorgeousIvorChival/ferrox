@@ -3173,10 +3173,7 @@ fn tls_xhttp(
     session: ferrox_core::tls::RustlsProvider<TcpStream>,
     host: &str,
     path: &str,
-) -> Option<(
-    crate::xhttp::Reader<ClientHalf>,
-    crate::xhttp::XhttpWriter,
-)> {
+) -> Option<(crate::xhttp::Reader<ClientHalf>, crate::xhttp::XhttpWriter)> {
     let (reader, writer, _) = tls_halves(session)?;
     crate::xhttp::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
 }
