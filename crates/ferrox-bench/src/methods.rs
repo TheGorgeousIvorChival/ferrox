@@ -25,7 +25,7 @@ pub fn table() -> String {
     );
     let _ = writeln!(
         s,
-        "| 2 | VLESS TCP TLS (Vision optional) | {} | TLS handshake differential vs Xray-core pin lands with the rung; suite flips when it does |",
+        "| 2 | VLESS TCP TLS (Vision optional) | {} | raw-carrier dial through `tls::connect` with the header and response on the session (`proxy::tests` loopback echoes and outbound parse gates); vision over TLS stays planned |",
         live_support("security=tls&encryption=none&type=tcp", "192.0.2.1")
     );
     let _ = writeln!(
@@ -106,7 +106,7 @@ mod tests {
         ));
         assert!(matches!(
             support_of("security=tls&encryption=none&type=tcp", "192.0.2.1"),
-            Support::Planned { .. }
+            Support::Implemented { .. }
         ));
         assert!(matches!(
             support_of("security=none&encryption=none&type=tcp", "127.0.0.1"),

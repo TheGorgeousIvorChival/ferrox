@@ -9,9 +9,9 @@ the stream is the stream and the relay adds no framing bytes at all.
 
 Two things are deliberately not implemented and are named rather than rounded
 off: there is no `trojan://` share-link parser (the link column in the README is
-empty for this row), and `security` is never read for trojan outbounds, so this
-row is plaintext TCP with a password rather than TLS. Both are capability
-statements, not performance ones.
+empty for this row), and `security: tls` dials only over the raw carrier, so a
+carried, muxed or UDP row that asks for TLS is refused rather than sent plain.
+Both are capability statements, not performance ones.
 
 ## Data path
 
