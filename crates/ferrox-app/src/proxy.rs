@@ -8132,9 +8132,7 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
@@ -8180,9 +8178,7 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
@@ -8242,15 +8238,36 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
     }
 
     type ServerHalf = TlsHalf<ferrox_core::tls::RustlsServerProvider<TcpStream>>;
+
+    /// Reads one echo off a socket the relay also holds: the relay resets
+    /// the shared timeout to its own poll grain, so a quiet socket is
+    /// retried up to the whole budget and only a closed one fails.
+    fn read_echo(sock: &mut TcpStream) -> [u8; 4] {
+        let start = std::time::Instant::now();
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < back.len() {
+            match sock.read(&mut back[at..]) {
+                Ok(0) => panic!("echoes: closed after {:?}", start.elapsed()),
+                Ok(n) => at += n,
+                Err(error) => {
+                    assert!(
+                        is_timeout(&error) && start.elapsed() < Duration::from_secs(30),
+                        "echoes: {error:?} after {:?}",
+                        start.elapsed()
+                    );
+                }
+            }
+        }
+        back
+    }
 
     enum TlsEcho {
         Vless([u8; 16]),
@@ -8343,9 +8360,7 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        sock.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        assert_eq!(&read_echo(&mut sock), b"ping");
     }
 
     fn tls_vless_out(
