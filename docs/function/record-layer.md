@@ -50,9 +50,9 @@ discards nothing.
 ```mermaid
 graph TD
     A["fill_exact_with_head, len bytes"] --> B["base_state: constants,<br/>key, nonce, counter 0"]
-    B --> C{"aarch64, and 512 bytes or more?"}
-    C -- yes --> S["16 broadcasts, two sets of four:<br/>one word per register, eight blocks in the lanes"]
-    S --> T["10 double rounds over both sets,<br/>the diagonal is a register rename"]
+    B -->    C{"a wide target, and 512 bytes or more?"}
+    C -- yes --> S["16 broadcasts, one word per register:<br/>aarch64 keeps two sets of four,<br/>x86_64 one set of eight, the blocks in the lanes"]
+    S --> T["10 double rounds over every set,<br/>the diagonal is a register rename"]
     T --> U["add the base back,<br/>transpose one row of eight blocks"]
     U --> V["xor into the caller's buffer,<br/>eight blocks a pass"]
     V --> W{"a whole pass left?"}
@@ -63,7 +63,7 @@ graph TD
     F --> G{"more than a group left?"}
     G -- yes --> D
     W -- no --> H
-    G -- no --> H["8→4→2→1 tail ladder,<br/>then a scalar last block"]
+    G -- no --> H["one group sized to the blocks left,<br/>the last stored partial,<br/>then the single-block path"]
     H --> I(("buffer, in place, nothing discarded"))
     J["decrypt_in_place, len bytes"] --> K["poly_key: block 0 only,<br/>32 bytes, no body"]
     K --> L["Poly1305 over the ciphertext<br/>pad_to_block per section"]
@@ -151,20 +151,65 @@ the pass against 9041 ns for the ladder, while gate 3 read the pass 1.08x faster
 at the same length. The self-timed row has no reference to cancel a drifting
 runner, so the claim here rests on gate 3.
 
+`c8e19b4` then sized the ladder's last group to every block a buffer has left
+rather than leaving one over for the single-block path, and `701298f` made the
+calibration time the chain that one block pays for. The pair is measured in
+`bench.yml` run `37737912879` against run `37730127644`, which carried the pass
+at `d31ddae`, and the lengths it moves are the ones whose remainder is exactly a
+group: 449 to 511 bytes on `aarch64`, where eight states in one group replace
+seven states and a whole dependent round chain. 32 of the 235 measured lengths
+sit there, and the two ends of the range read:
+
+| bytes | linux aarch64, before | linux aarch64, after | macos aarch64, before | macos aarch64, after |
+| ---: | ---: | ---: | ---: | ---: |
+| 449 | 1.29x (640 ns) | 1.54x (539 ns) | 1.71x (445 ns) | 2.91x (280 ns) |
+
+The x86_64 rows of those two runs are not usable for the comparison: GitHub
+moved those runners between them, from the `avx2` + `vaes` machine the earlier
+rows were read on to one carrying `avx512f`, where the same `x86_64` binary
+reads 0.76x to 0.96x of the reference at 512 bytes and above against 1.20x on
+the machine before it, while the reference's own clock moved 18%. The ladder's
+pass-length loop is untouched by both commits, so that is a property of the
+runner and not of the diff — and it is why the pass this page describes now
+exists on `x86_64` too: the ladder spends forty shuffle ops a double round for
+the eight blocks it holds where the pass spends sixteen, and a machine that
+issues one shuffle a cycle charges for the difference. Its rows are unread on
+this branch until a run carries it, and this page quotes none.
+
 ## What we removed
 
-- **Six lane permutations a double round a block on aarch64.** The row layout
-  diagonalises by rotating the lane order of three of the four row registers,
-  one `vext` each, so a block's twenty rounds spend sixty permutations on
-  rotations alone; the pass spends none, and pays one four-register transpose
-  per row of four blocks instead, which is eight permutations a block against
-  those sixty. Nothing else moves: the quarter round, the ten double rounds and the
-  keystream bytes are the same, and the pass's equality with the ladder is
-  asserted at every length before gate 3 times either side.
-- **What the pass did not remove, on purpose.** Below 512 bytes aarch64 is
-  still `neon::N4` through the same ladder: a pass pays its setup for eight
-  blocks whether eight are wanted or one, and the `8 → 4 → 2 → 1` rungs ask for
-  exactly the blocks the caller asked for. The MAC beside the keystream is untouched by
+- **Six lane permutations a double round a block on `aarch64`, and ten
+  single-cycle shuffles a double round a state on `x86_64`.** Both lane layouts
+  diagonalise by rotating the lane order of the row registers: `neon::N4`
+  spends six `vext` a double round for its one block, so a block's twenty rounds
+  pay sixty permutations, and `avx2::A8` spends six `vpshufd` and four `vpshufb`
+  a double round for its two blocks, forty shuffles a double round for the eight
+  blocks it holds. The pass diagonalises by *naming*: one state word per
+  register and the blocks in the lanes means the four registers of a diagonal
+  quarter round are the four registers of the column one, so the rotation is
+  free and the only shuffles left are the two byte-level rotations of each
+  quarter round — two a block a double round, against five on `x86_64` and six
+  on `aarch64`. What the pass pays instead is one transpose of four registers
+  per row of blocks at the store. Nothing else moves: the quarter round, the ten
+  double rounds and the keystream bytes are the same, and the pass's equality
+  with the ladder is asserted at every length before gate 3 times either side —
+  `soa::tests::the_eight_block_pass_is_the_ladder_at_every_length` on `aarch64`
+  and `avx2::tests::the_eight_block_pass_is_the_ladder_at_every_length` on
+  `x86_64`, both at every length to two passes and six start counters, with the
+  one-time key compared beside the ciphertext.
+- **What the pass did not remove, on purpose.** Below 512 bytes both targets
+  are still their lane ladder: a pass pays its setup for eight blocks whether
+  eight are wanted or one, and a group sized to the blocks that are left asks
+  for exactly the blocks the caller asked for. The single-block path that closes
+  a call — one dependent round chain, which is the whole cost of a short record
+  — is still there for a block or less, and it is the one place the calibration
+  decides: it timed sixty-four *independent* blocks per core, which measures the
+  throughput of a wide register file and not the latency of one block with
+  nothing beside it to issue, and read the lanes as the faster tail on machines
+  where one block does not fill the four-lane core. It now counts each call from
+  the word the one before it wrote, so the loop is the dependent chain the tail
+  actually pays for, and the same verdict test still checks that the two cores
+  agree byte for byte before the verdict is trusted. The MAC beside the keystream is untouched by
   this slice, and the limb extraction it got in the slice before is not a clean
   win: five `TBL4` lookups a group read 4152 ns against the scalar windows' 4421
   ns at 16 KiB on macos aarch64, and 6436 ns against 6222 ns on linux aarch64.
@@ -175,11 +220,18 @@ runner, so the claim here rests on gate 3.
   0..=65 537 sweep and at six start counters, and fails on any excess. The
   `chacha20` crate the reference uses fills a keystream buffer *four blocks at
   a time* on every backend it ships, which is what makes a short call expensive;
-  the ladder here takes an 8 → 4 → 2 → 1 tail and only enters a rung when the
-  remaining blocks meet its width, so nothing is computed for a length the
-  caller did not ask for. `record::blocks_with_head_match` is the same
-  accounting for the fused head: an empty body plus a 32-byte head is one block,
-  not two.
+  the ladder here sizes its last group to the blocks that are left and only
+  rounds up to a state's width — two blocks on `x86_64`, one on `aarch64` — so
+  the blocks a length asks for are the blocks a length pays for, and the count
+  it reports is `ceil(len / 64)` at every length. `record::blocks_with_head_match`
+  is the same accounting for the fused head: an empty body plus a 32-byte head
+  is one block, not two. Two things that are *not* zero, named rather than
+  claimed: a two-block state computes its second block whether or not the
+  buffer carries it on `x86_64`, and a pass of eight blocks carries its lanes
+  whether or not a headed buffer stores all of them. Neither is a *discarded*
+  block in the table's sense — the table's row is the count the ladder reports,
+  which gate 2 sweeps against `ceil(len / 64)` — they are lanes of an
+  instruction that was already being issued.
 - **A per-call allocation and a memset.** Gate 2 runs the fill under a
   `#[global_allocator]` that separates `alloc` from `alloc_zeroed`, and requires
   exactly zero of each at every length. A `Vec<u8>` staging buffer per call, or
