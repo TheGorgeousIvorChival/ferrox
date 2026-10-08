@@ -156,25 +156,62 @@ rather than leaving one over for the single-block path, and `701298f` made the
 calibration time the chain that one block pays for. The pair is measured in
 `bench.yml` run `37737912879` against run `37730127644`, which carried the pass
 at `d31ddae`, and the lengths it moves are the ones whose remainder is exactly a
-group: 449 to 511 bytes on `aarch64`, where eight states in one group replace
-seven states and a whole dependent round chain. 32 of the 235 measured lengths
-sit there, and the two ends of the range read:
+group: on `aarch64` that is any length of the form `k × 512 + 449..511`, where
+eight states in one group replace seven states and a whole dependent round
+chain. Four of the 235 timed lengths sit in that window — 449, 511, 1023 and
+1535 — and all four are most of what separates the two runs on linux aarch64,
+0.08x of ratio being this pair's noise floor there. The macos rows move further
+because its small lengths are the noisier ones, so its four are quoted beside
+them rather than claimed:
 
 | bytes | linux aarch64, before | linux aarch64, after | macos aarch64, before | macos aarch64, after |
 | ---: | ---: | ---: | ---: | ---: |
 | 449 | 1.29x (640 ns) | 1.54x (539 ns) | 1.71x (445 ns) | 2.91x (280 ns) |
+| 511 | 1.30x (646 ns) | 1.53x (545 ns) | 1.84x (415 ns) | 2.91x (282 ns) |
+| 1023 | 1.44x (1 146 ns) | 1.60x (1 042 ns) | 2.33x (655 ns) | 2.97x (549 ns) |
+| 1535 | 1.52x (1 632 ns) | 1.62x (1 528 ns) | 2.55x (893 ns) | 3.01x (810 ns) |
 
-The x86_64 rows of those two runs are not usable for the comparison: GitHub
-moved those runners between them, from the `avx2` + `vaes` machine the earlier
-rows were read on to one carrying `avx512f`, where the same `x86_64` binary
-reads 0.76x to 0.96x of the reference at 512 bytes and above against 1.20x on
-the machine before it, while the reference's own clock moved 18%. The ladder's
-pass-length loop is untouched by both commits, so that is a property of the
-runner and not of the diff — and it is why the pass this page describes now
-exists on `x86_64` too: the ladder spends forty shuffle ops a double round for
-the eight blocks it holds where the pass spends sixteen, and a machine that
-issues one shuffle a cycle charges for the difference. Its rows are unread on
-this branch until a run carries it, and this page quotes none.
+Run `37740838172` repeats those two rows on the same two runners — 449 bytes
+reads 1.53x (543 ns) on linux aarch64 and 2.93x (274 ns) on macos aarch64 — so
+the change is the tail and not the run.
+
+The `x86_64` rows of those two runs are not usable for that comparison, and the
+reason is the one the `x86_64` pass below exists for. GitHub moved those runners
+between the runs: the rows before and after were read on an `avx2` + `vaes`
+machine, and run `37737912879` landed on one carrying `avx512f`, where the same
+`x86_64` binary read 0.76x to 0.96x of the reference at 512 bytes and above
+against 1.20x on the machine before it, while the reference's own clock moved
+18%. The ladder's pass-length loop is untouched by both commits and the same
+binary ran on both machines, so that was a property of the runner: the ladder
+spends forty shuffle ops a double round for the eight blocks it holds, where the
+pass spends sixteen, and a machine that issues one shuffle a cycle charges for
+the difference.
+
+Run `37740838172` carries the pass, against run `37737912879`, which is the same
+ladder on the same runner class — the reference's own clock at 16 KiB reads
+9 316 ns against 9 175 ns on linux `x86_64` and 7 781 ns against 6 974 ns on
+windows `x86_64`, so the windows runner is the slower of the two by about a
+tenth and its absolute column is read with that in mind:
+
+| bytes | linux x86_64, ladder | linux x86_64, pass | windows x86_64, ladder | windows x86_64, pass |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 0.98x (601 ns) | 1.38x (428 ns) | 0.80x (569 ns) | 1.29x (392 ns) |
+| 4 KiB | 3.58x (1 773 ns) | 3.58x (1 743 ns) | 0.79x (2 243 ns, remeasured) | 1.32x (1 483 ns) |
+| 16 KiB | 0.96x (9 521 ns) | 1.36x (6 846 ns) | 0.76x (9 159 ns) | 1.33x (5 863 ns) |
+| 64 KiB | 0.96x (38 329 ns) | 1.36x (27 188 ns) | 0.76x (36 648 ns) | 1.32x (23 561 ns) |
+
+The 4 KiB linux row is the one that does not move, and the reason is in the
+reference rather than in either side of the change: at 4 KiB the reference
+itself takes 6 351 ns against 6 604 ns for 16 KiB, so that ratio is set by the
+reference's own buffer and both sides read 3.58x. Every other row is the pass,
+with the absolute times down 28% on linux `x86_64` and 36% on windows `x86_64`.
+Below 512 bytes on `x86_64` the ladder is what runs in every one of those runs,
+so those rows read the machine and not the pass: 64 to 128 bytes move between
+2.0x and 2.3x across the ladder pair on linux `x86_64` while running the same
+binary, and the only small lengths either commit touches there are the tail's
+own groups — 320 bytes reads 1.47x (185 ns) in the pass's run against 1.48x
+(179 ns) in the run before it, and 448 bytes 1.51x (312 ns) against 1.52x
+(304 ns).
 
 ## What we removed
 
