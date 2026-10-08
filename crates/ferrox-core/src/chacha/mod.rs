@@ -92,8 +92,6 @@ const GROUP_STATES: usize = 8;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const GROUP_STATES: usize = 4;
 
-const TAIL_STATES: usize = if GROUP_STATES < 8 { GROUP_STATES } else { 8 } - 1;
-
 #[inline]
 fn base_state(key: &[u8; 32], nonce: &[u8; 12]) -> [u32; 16] {
     let mut s = [0u32; 16];
@@ -270,6 +268,15 @@ const fn group_bytes<V: Lanes>() -> usize {
     GROUP_STATES * V::CHUNKS * 64
 }
 
+/// The ladder's last stretch: one group sized to the blocks the rest of the
+/// buffer needs, with its final block stored partial.
+///
+/// Sizing the group to *all* the blocks that are left rather than leaving one
+/// over for the single-block path is the whole point: a group of one more state
+/// costs a state's work, while the single-block path costs a whole dependent
+/// round chain of its own. A group that rounds up past the blocks the buffer
+/// carries (`CHUNKS` states cover two blocks on `x86_64`) computes them and the
+/// count reports only what was stored, which is what the caller counts.
 #[inline(always)]
 fn xor_tail<V: Lanes>(
     state: &[u32; 16],
@@ -283,18 +290,20 @@ fn xor_tail<V: Lanes>(
     let mut blocks = 0u32;
     let mut owed = 64 * usize::from(head.is_some());
     while rest.len() + owed > 64 {
-        let states = ((rest.len() + owed).div_ceil(64) / V::CHUNKS).clamp(1, TAIL_STATES);
-        let (chunk, tail) = rest.split_at_mut((states * V::CHUNKS * 64 - owed).min(rest.len()));
+        let needed = (rest.len() + owed).div_ceil(64);
+        let states = needed.div_ceil(V::CHUNKS).clamp(1, GROUP_STATES);
+        let nominal = states * V::CHUNKS;
+        let (chunk, tail) = rest.split_at_mut((nominal * 64 - owed).min(rest.len()));
         macro_rules! pass {
             ($($n:literal),+ $(,)?) => {
                 match states {
                     $($n => xor_groups::<V, $n>(base, ctr, chunk, head.take()),)+
-                    _ => unreachable!("`states` is clamped to TAIL_STATES"),
+                    _ => unreachable!("`states` is clamped to GROUP_STATES"),
                 }
             };
         }
-        blocks += pass!(1, 2, 3, 4, 5, 6, 7);
-        ctr = ctr.wrapping_add((states * V::CHUNKS) as u32);
+        blocks += pass!(1, 2, 3, 4, 5, 6, 7, 8).min(needed as u32);
+        ctr = ctr.wrapping_add(nominal as u32);
         rest = tail;
         owed = 0;
     }
