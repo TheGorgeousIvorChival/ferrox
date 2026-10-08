@@ -167,6 +167,18 @@ impl VlessLink {
                 method: "vless-tcp-tls",
             };
         }
+        if self.security() == Security::Tls && matches!(self.flow(), "" | "none") {
+            let method = match self.transport_kind() {
+                TransportKind::Ws => Some("vless-ws-tls"),
+                TransportKind::Xhttp => Some("vless-xhttp-tls"),
+                TransportKind::Grpc => Some("vless-grpc-tls"),
+                TransportKind::HttpUpgrade => Some("vless-httpupgrade-tls"),
+                _ => None,
+            };
+            if let Some(method) = method {
+                return Support::Implemented { method };
+            }
+        }
         Support::Planned {
             reason: planned_reason(self),
         }
@@ -829,11 +841,37 @@ mod tests {
     #[test]
     fn unknown_transports_parse_but_stay_planned() {
         let l = VlessLink::parse(
-            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@example.com:443?security=tls&type=ws&path=%2Fws#ws",
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@example.com:443?security=reality&type=ws&path=%2Fws#ws",
         )
         .expect("parses");
         assert!(matches!(l.support(), Support::Planned { .. }));
         assert!(!l.is_first_method());
+    }
+
+    #[test]
+    fn carried_tls_without_vision_is_implemented() {
+        for (query, method) in [
+            ("security=tls&type=ws&path=%2Fws", "vless-ws-tls"),
+            ("security=tls&type=xhttp&path=%2Fshare", "vless-xhttp-tls"),
+            ("security=tls&type=grpc&serviceName=svc", "vless-grpc-tls"),
+            (
+                "security=tls&type=httpupgrade&path=%2Fu",
+                "vless-httpupgrade-tls",
+            ),
+        ] {
+            let link =
+                format!("vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:443?{query}#tls");
+            let l = VlessLink::parse(&link).expect("parses");
+            assert_eq!(l.support(), Support::Implemented { method }, "{query}");
+            let vision = VlessLink::parse(&format!(
+                "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?{query}&flow=xtls-rprx-vision#tls-vision"
+            ))
+            .expect("parses");
+            assert!(
+                matches!(vision.support(), Support::Planned { .. }),
+                "{query} with vision"
+            );
+        }
     }
 
     #[test]

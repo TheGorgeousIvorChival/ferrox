@@ -4,12 +4,12 @@ use std::net::TcpStream;
 const HEAD_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug)]
-pub(crate) struct UpReader {
-    read: TcpStream,
+pub(crate) struct UpReader<R: Read = TcpStream> {
+    read: R,
     prefix: Vec<u8>,
 }
 
-impl Read for UpReader {
+impl<R: Read> Read for UpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -31,18 +31,38 @@ fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(UpReader, TcpStream)> {
     let mut read = stream;
     let (head, prefix) = read_head(&mut read)?;
-    if crate::proxy::request_path(&head)? != path {
-        return None;
-    }
-    let upgrade = crate::proxy::header_value(&head, "upgrade").unwrap_or_default();
-    let connection = crate::proxy::header_value(&head, "connection").unwrap_or_default();
-    if !upgrade.eq_ignore_ascii_case("websocket") || !connection.eq_ignore_ascii_case("upgrade") {
-        return None;
-    }
+    check_request(&head, path)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
     let mut write = write;
+    write
+        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+        .ok()?;
+    Some((UpReader { read, prefix }, write))
+}
+
+fn check_request(head: &[u8], path: &str) -> Option<()> {
+    if crate::proxy::request_path(head)? != path {
+        return None;
+    }
+    let upgrade = crate::proxy::header_value(head, "upgrade").unwrap_or_default();
+    let connection = crate::proxy::header_value(head, "connection").unwrap_or_default();
+    if !upgrade.eq_ignore_ascii_case("websocket") || !connection.eq_ignore_ascii_case("upgrade") {
+        return None;
+    }
+    Some(())
+}
+
+// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix.
+#[cfg(test)]
+pub(crate) fn accept_split<R: Read, W: Write>(
+    mut read: R,
+    mut write: W,
+    path: &str,
+) -> Option<(UpReader<R>, W)> {
+    let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    check_request(&head, path)?;
     write
         .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
         .ok()?;
@@ -60,19 +80,39 @@ pub(crate) fn connect(stream: TcpStream, host: &str, path: &str) -> Option<(UpRe
     read.write_all(upgrade_request(host, path).as_bytes())
         .ok()?;
     let (head, prefix) = read_head(&mut read)?;
-    let text = std::str::from_utf8(&head).ok()?;
-    if text.split("\r\n").next()? != "HTTP/1.1 101 Switching Protocols" {
-        return None;
-    }
-    if !crate::proxy::header_value(&head, "connection")?.eq_ignore_ascii_case("upgrade") {
-        return None;
-    }
-    if !crate::proxy::header_value(&head, "upgrade")?.eq_ignore_ascii_case("websocket") {
-        return None;
-    }
+    check_response(&head)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
+    Some((UpReader { read, prefix }, write))
+}
+
+fn check_response(head: &[u8]) -> Option<()> {
+    let text = std::str::from_utf8(head).ok()?;
+    if text.split("\r\n").next()? != "HTTP/1.1 101 Switching Protocols" {
+        return None;
+    }
+    if !crate::proxy::header_value(head, "connection")?.eq_ignore_ascii_case("upgrade") {
+        return None;
+    }
+    if !crate::proxy::header_value(head, "upgrade")?.eq_ignore_ascii_case("websocket") {
+        return None;
+    }
+    Some(())
+}
+
+// The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+pub(crate) fn connect_split<R: Read, W: Write>(
+    mut read: R,
+    mut write: W,
+    host: &str,
+    path: &str,
+) -> Option<(UpReader<R>, W)> {
+    write
+        .write_all(upgrade_request(host, path).as_bytes())
+        .ok()?;
+    let (head, prefix) = crate::proxy::read_exact_head(&mut read, HEAD_LIMIT)?;
+    check_response(&head)?;
     Some((UpReader { read, prefix }, write))
 }
 

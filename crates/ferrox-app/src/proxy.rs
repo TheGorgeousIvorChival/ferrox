@@ -1698,8 +1698,8 @@ fn dial_vless(
     ladder: &Ladder,
 ) {
     let header = vless_header(&vless.id, 1, target);
-    if let Some(cfg) = vless.tls.as_deref() {
-        dial_vless_tls(client, server, cfg, &header);
+    if vless.tls.is_some() {
+        dial_vless_tls(client, server, vless, target);
         return;
     }
     let params = stream_params(&vless.carrier);
@@ -2753,8 +2753,8 @@ fn dial_vmess(
     target: &SocketAddr,
     ladder: &Ladder,
 ) {
-    if let Some(cfg) = vmess.tls.as_deref() {
-        dial_vmess_tls(client, server, cfg, &vmess.id, vmess.cipher, target);
+    if vmess.tls.is_some() {
+        dial_vmess_tls(client, server, vmess, target);
         return;
     }
     let params = stream_params(&vmess.carrier);
@@ -2916,8 +2916,8 @@ fn dial_trojan(
     ladder: &Ladder,
 ) {
     let header = trojan_header(&trojan.key, 1, target);
-    if let Some(cfg) = trojan.tls.as_deref() {
-        dial_trojan_tls(client, server, cfg, &header);
+    if trojan.tls.is_some() {
+        dial_trojan_tls(client, server, trojan, &header);
         return;
     }
     let params = stream_params(&trojan.carrier);
@@ -3100,13 +3100,101 @@ fn dial_tls_session(
     Some(session)
 }
 
-// One session, two owners: the pump takes a reader and a writer, and a TLS session cannot split.
-#[derive(Clone)]
-struct TlsHalf {
-    session: Arc<Mutex<ferrox_core::tls::RustlsProvider<TcpStream>>>,
+// Splits one established session into halves the carrier cores accept, plus the raw socket their teardown needs.
+fn tls_halves(
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+) -> Option<(ClientHalf, ClientHalf, Arc<TcpStream>)> {
+    let raw = Arc::new(session.get_ref().try_clone().ok()?);
+    let shared = Arc::new(Mutex::new(session));
+    let reader = TlsHalf {
+        session: Arc::clone(&shared),
+    };
+    let writer = TlsHalf { session: shared };
+    Some((reader, writer, raw))
 }
 
-impl Read for TlsHalf {
+fn tls_ws(
+    server: &SocketAddr,
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    host: &str,
+    path: &str,
+    ed: u32,
+    first: &[u8],
+) -> Option<(crate::ws::WsReader<ClientHalf>, crate::ws::WsWriter)> {
+    let (reader, writer, _) = tls_halves(session)?;
+    crate::ws::connect_split(reader, writer, host, path, ed, first)
+        .or_else(|| tls_unreachable(server))
+}
+
+fn tls_unreachable<T>(server: &SocketAddr) -> Option<T> {
+    note_dial_failure(
+        server,
+        Failure::new(Stage::SocketConnected, Kind::Unreachable),
+    );
+    None
+}
+
+fn tls_httpupgrade(
+    server: &SocketAddr,
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    host: &str,
+    path: &str,
+) -> Option<(crate::httpupgrade::UpReader<ClientHalf>, TlsSink)> {
+    let (reader, writer, raw) = tls_halves(session)?;
+    let (reader, writer) = crate::httpupgrade::connect_split(reader, writer, host, path)
+        .or_else(|| tls_unreachable(server))?;
+    Some((reader, TlsSink { half: writer, raw }))
+}
+
+fn tls_httpheader(
+    server: &SocketAddr,
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    host: &str,
+    path: &str,
+) -> Option<(crate::httpheader::HeadReader<ClientHalf>, TlsSink)> {
+    let (reader, writer, raw) = tls_halves(session)?;
+    let (reader, writer) = crate::httpheader::connect_split(reader, writer, host, path)
+        .or_else(|| tls_unreachable(server))?;
+    Some((reader, TlsSink { half: writer, raw }))
+}
+
+fn tls_grpc(
+    server: &SocketAddr,
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    host: &str,
+    path: &str,
+) -> Option<(crate::grpc::GrpcReader<ClientHalf>, crate::grpc::GrpcWriter)> {
+    let (reader, writer, _) = tls_halves(session)?;
+    crate::grpc::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
+}
+
+fn tls_xhttp(
+    server: &SocketAddr,
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    host: &str,
+    path: &str,
+) -> Option<(crate::xhttp::Reader<ClientHalf>, crate::xhttp::XhttpWriter)> {
+    let (reader, writer, _) = tls_halves(session)?;
+    crate::xhttp::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
+}
+
+// One session, two owners: the pump takes a reader and a writer, and a TLS session cannot split.
+#[derive(Debug)]
+struct TlsHalf<S> {
+    session: Arc<Mutex<S>>,
+}
+
+impl<S> Clone for TlsHalf<S> {
+    fn clone(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+        }
+    }
+}
+
+type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<TcpStream>>;
+
+impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             return match self.locked_read(buf) {
@@ -3117,8 +3205,11 @@ impl Read for TlsHalf {
     }
 }
 
-impl TlsHalf {
-    fn locked_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<S> TlsHalf<S> {
+    fn locked_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>
+    where
+        S: ferrox_core::tls::TlsProvider,
+    {
         let mut session = self
             .session
             .lock()
@@ -3127,7 +3218,7 @@ impl TlsHalf {
     }
 }
 
-impl Write for TlsHalf {
+impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut session = self
             .session
@@ -3145,67 +3236,222 @@ impl Write for TlsHalf {
     }
 }
 
-fn dial_vless_tls(
-    client: &TcpStream,
-    server: &SocketAddr,
-    cfg: &ferrox_core::tls::TlsConfig,
-    header: &[u8],
-) {
+// The write end relays understand: bytes through the shared session, teardown through the raw socket.
+#[derive(Debug)]
+struct TlsSink {
+    half: ClientHalf,
+    raw: Arc<TcpStream>,
+}
+
+impl Clone for TlsSink {
+    fn clone(&self) -> Self {
+        Self {
+            half: self.half.clone(),
+            raw: Arc::clone(&self.raw),
+        }
+    }
+}
+
+impl Write for TlsSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.half.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.half.flush()
+    }
+}
+
+impl CarrierSink for TlsSink {
+    fn send(&self, bytes: &[u8]) -> bool {
+        let mut half = self.half.clone();
+        half.write_all(bytes).is_ok()
+    }
+
+    fn close(&self) {
+        let _ = self.raw.shutdown(Shutdown::Both);
+    }
+}
+
+fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, target: &SocketAddr) {
+    let Some(cfg) = vless.tls.as_deref() else {
+        return;
+    };
+    let header = vless_header(&vless.id, 1, target);
     let Some(mut session) = dial_tls_session(server, cfg) else {
         return;
     };
-    if session.write_all(header).is_err() {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    match &vless.carrier {
+        Carrier::Raw => {
+            if session.write_all(&header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut session).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let Ok(downstream) = client.try_clone() else {
+                return;
+            };
+            if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                return;
+            }
+            relay_stream(downstream, session);
+        }
+        Carrier::Ws { path, ed } => {
+            let Some((mut reader, writer)) =
+                tls_ws(server, session, &vless.host, path, *ed, &header)
+            else {
+                return;
+            };
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &writer, client, |_| {});
+        }
+        Carrier::HttpUpgrade { path } => {
+            let Some((mut reader, mut sink)) = tls_httpupgrade(server, session, &vless.host, path)
+            else {
+                return;
+            };
+            if sink.write_all(&header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &sink, client, |_| {});
+        }
+        Carrier::Grpc { path } => {
+            let Some((mut reader, writer)) = tls_grpc(server, session, &vless.host, path) else {
+                return;
+            };
+            if !writer.send(&header) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+        }
+        Carrier::Xhttp { path } => {
+            let Some((mut reader, writer)) = tls_xhttp(server, session, &vless.host, path) else {
+                return;
+            };
+            if !writer.send(&header) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink_drained(reader, &writer, client);
+        }
+        Carrier::HttpHeader { path } => {
+            let Some((mut reader, mut sink)) = tls_httpheader(server, session, &vless.host, path)
+            else {
+                return;
+            };
+            if sink.write_all(&header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &sink, client, |_| {});
+        }
+        Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive
+        | Carrier::Http
+        | Carrier::Unknown => {}
     }
-    if read_vless_response(&mut session).is_none() {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-    }
-    let Ok(downstream) = client.try_clone() else {
-        return;
-    };
-    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-        return;
-    }
-    relay_stream(downstream, session);
 }
 
-fn dial_trojan_tls(
-    client: &TcpStream,
-    server: &SocketAddr,
-    cfg: &ferrox_core::tls::TlsConfig,
-    header: &[u8],
-) {
+fn dial_trojan_tls(client: &TcpStream, server: &SocketAddr, trojan: &TrojanOut, header: &[u8]) {
+    let Some(cfg) = trojan.tls.as_deref() else {
+        return;
+    };
     let Some(mut session) = dial_tls_session(server, cfg) else {
         return;
     };
-    let Ok(downstream) = client.try_clone() else {
-        return;
-    };
-    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-        return;
+    match &trojan.carrier {
+        Carrier::Raw => {
+            let Ok(downstream) = client.try_clone() else {
+                return;
+            };
+            if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                return;
+            }
+            if session.write_all(header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_stream(downstream, session);
+        }
+        Carrier::Ws { path, ed } => {
+            let Some((reader, writer)) = tls_ws(server, session, &trojan.host, path, *ed, header)
+            else {
+                return;
+            };
+            relay_sink(reader, &writer, client, |_| {});
+        }
+        Carrier::HttpUpgrade { path } => {
+            let Some((reader, mut sink)) = tls_httpupgrade(server, session, &trojan.host, path)
+            else {
+                return;
+            };
+            if sink.write_all(header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &sink, client, |_| {});
+        }
+        Carrier::Grpc { path } => {
+            let Some((reader, writer)) = tls_grpc(server, session, &trojan.host, path) else {
+                return;
+            };
+            if !writer.send(header) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+        }
+        Carrier::Xhttp { path } => {
+            let Some((reader, writer)) = tls_xhttp(server, session, &trojan.host, path) else {
+                return;
+            };
+            if !writer.send(header) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink_drained(reader, &writer, client);
+        }
+        Carrier::HttpHeader { path } => {
+            let Some((reader, mut sink)) = tls_httpheader(server, session, &trojan.host, path)
+            else {
+                return;
+            };
+            if sink.write_all(header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &sink, client, |_| {});
+        }
+        Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive
+        | Carrier::Http
+        | Carrier::Unknown => {}
     }
-    if session.write_all(header).is_err() {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-    }
-    relay_stream(downstream, session);
 }
 
-fn dial_vmess_tls(
+fn vmess_tls_raw(
     client: &TcpStream,
     server: &SocketAddr,
-    cfg: &ferrox_core::tls::TlsConfig,
-    id: &[u8; 16],
-    cipher: crate::vmess::Cipher,
+    mut session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    vmess: &VmessOut,
     target: &SocketAddr,
 ) {
-    let Some(mut session) = dial_tls_session(server, cfg) else {
-        return;
-    };
-    let Ok(raw) = session.get_ref().try_clone() else {
-        return;
-    };
     let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(id, cipher, target, 1)
+        crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
         return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
     };
@@ -3215,15 +3461,137 @@ fn dial_vmess_tls(
     if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
+    let Ok(raw) = session.get_ref().try_clone() else {
+        return;
+    };
     let shared = Arc::new(Mutex::new(session));
     let reader = TlsHalf {
         session: Arc::clone(&shared),
     };
-    let writer = TlsHalf { session: shared };
-    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        let _ = raw.shutdown(Shutdown::Both);
-    });
+    let writer = TlsSink {
+        half: TlsHalf { session: shared },
+        raw: Arc::new(raw),
+    };
+    let closer = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
     crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
+}
+
+fn vmess_tls_carried(
+    client: &TcpStream,
+    server: &SocketAddr,
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+    };
+    match &vmess.carrier {
+        Carrier::Ws { path, ed } => {
+            let Some((reader, writer)) = tls_ws(server, session, &vmess.host, path, *ed, &request)
+            else {
+                return;
+            };
+            let mut reader = reader;
+            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                crate::vmess::WsSink::carried(writer),
+                &close,
+                send,
+                recv,
+            );
+        }
+        Carrier::HttpUpgrade { path } => {
+            let Some((reader, sink)) = tls_httpupgrade(server, session, &vmess.host, path) else {
+                return;
+            };
+            let (mut reader, mut sink) = (reader, sink);
+            if sink.write_all(&request).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            crate::vmess::pump_relay_carried(client, reader, sink, &close, send, recv);
+        }
+        Carrier::Grpc { path } => {
+            let Some((reader, writer)) = tls_grpc(server, session, &vmess.host, path) else {
+                return;
+            };
+            let mut reader = reader;
+            if !writer.send(&request) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
+        }
+        Carrier::Xhttp { path } => {
+            let Some((reader, writer)) = tls_xhttp(server, session, &vmess.host, path) else {
+                return;
+            };
+            if !writer.send(&request) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let mut reader = std::io::BufReader::with_capacity(32 * 1024, reader);
+            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv);
+        }
+        Carrier::HttpHeader { path } => {
+            let Some((reader, sink)) = tls_httpheader(server, session, &vmess.host, path) else {
+                return;
+            };
+            let (mut reader, mut sink) = (reader, sink);
+            if sink.write_all(&request).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            crate::vmess::pump_relay_carried(client, reader, sink, &close, send, recv);
+        }
+        Carrier::Raw
+        | Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive
+        | Carrier::Http
+        | Carrier::Unknown => {}
+    }
+}
+
+fn dial_vmess_tls(client: &TcpStream, server: &SocketAddr, vmess: &VmessOut, target: &SocketAddr) {
+    let Some(cfg) = vmess.tls.as_deref() else {
+        return;
+    };
+    let Some(session) = dial_tls_session(server, cfg) else {
+        return;
+    };
+    match &vmess.carrier {
+        Carrier::Raw => vmess_tls_raw(client, server, session, vmess, target),
+        _ => vmess_tls_carried(client, server, session, vmess, target),
+    }
 }
 
 fn dial_shadowsocks(
@@ -4848,9 +5216,50 @@ pub(crate) fn read_http_head(stream: &mut TcpStream, limit: usize) -> Option<Vec
     }
 }
 
+// Head reader for streams without a file descriptor: peek is meaningless over records, so the tail comes back as a prefix.
+pub(crate) fn read_exact_head(stream: &mut dyn Read, limit: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut head = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    loop {
+        if head.len() >= limit {
+            return None;
+        }
+        let n = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => n,
+        };
+        head.extend_from_slice(&chunk[..n]);
+        if let Some(at) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            let prefix = head.split_off(at + 4);
+            return Some((head, prefix));
+        }
+    }
+}
+
 pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn send(&self, bytes: &[u8]) -> bool;
     fn close(&self);
+}
+
+// Vectored write with and without a file descriptor: the socket packs into one writev, the session feeds its record batcher.
+pub(crate) trait FrameWrite: Write + Send {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool;
+}
+
+impl FrameWrite for TcpStream {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        match parts {
+            [first, second] => write_all_two(self, first, second),
+            [first, second, third] => write_all_three(self, first, second, third),
+            _ => parts.iter().all(|part| self.write_all(part).is_ok()),
+        }
+    }
+}
+
+impl<S: ferrox_core::tls::TlsProvider + Send> FrameWrite for TlsHalf<S> {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        parts.iter().all(|part| self.write_all(part).is_ok())
+    }
 }
 
 pub(crate) fn relay_sink<R, W, F>(reader: R, writer: &W, peer: &TcpStream, on_reader_done: F)
@@ -5888,12 +6297,12 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
         let port = server.get("port").and_then(Json::as_port)?;
         let password = server.get("password").and_then(Json::as_str)?;
         let key = trojan_key(password);
-        if let Some((host, tls)) = raw_tls_parts(outbound, &address) {
+        if let Some((carrier, host, tls)) = tls_parts(outbound, &address) {
             return Some(TrojanOut {
                 address,
                 port,
                 key,
-                carrier: Carrier::Raw,
+                carrier,
                 host,
                 tls: Some(tls),
             });
@@ -5989,14 +6398,14 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
         );
         // Mux frames ride above the session, so mux over TLS needs its own dial and stays refused.
         if security == "tls" && !quic_tls && !mux {
-            let Some((host, tls)) = raw_tls_parts(outbound, &address) else {
+            let Some((carrier, host, tls)) = tls_parts(outbound, &address) else {
                 continue;
             };
             return Some(VlessOut {
                 address,
                 port,
                 id,
-                carrier: Carrier::Raw,
+                carrier,
                 host,
                 mux,
                 quic_roots: None,
@@ -6045,13 +6454,13 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 .and_then(Json::as_str)
                 .unwrap_or("auto"),
         );
-        if let Some((host, tls)) = raw_tls_parts(outbound, &address) {
+        if let Some((carrier, host, tls)) = tls_parts(outbound, &address) {
             return Some(VmessOut {
                 address,
                 port,
                 id,
                 cipher,
-                carrier: Carrier::Raw,
+                carrier,
                 host,
                 tls: Some(tls),
             });
@@ -6148,19 +6557,31 @@ fn outbound_tls(outbound: &Json, address: &str) -> Option<Arc<ferrox_core::tls::
     }))
 }
 
-// Raw over TLS only; carried TLS keeps the wrong layer order (P31), so those rows stay refused.
-fn raw_tls_parts(
+// TLS runs outside the carrier, the order both references use, so every diallable carrier is accepted here.
+fn tls_parts(
     outbound: &Json,
     address: &str,
-) -> Option<(String, Arc<ferrox_core::tls::TlsConfig>)> {
+) -> Option<(Carrier, String, Arc<ferrox_core::tls::TlsConfig>)> {
     if stream_security(outbound) != "tls" {
         return None;
     }
     let (carrier, host) = outbound_carrier(outbound, address);
-    if !matches!(carrier, Carrier::Raw) {
-        return None;
+    match carrier {
+        Carrier::Raw
+        | Carrier::Ws { .. }
+        | Carrier::HttpUpgrade { .. }
+        | Carrier::Grpc { .. }
+        | Carrier::Xhttp { .. }
+        | Carrier::HttpHeader { .. } => {}
+        Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive
+        | Carrier::Http
+        | Carrier::Unknown => return None,
     }
-    outbound_tls(outbound, address).map(|tls| (host, tls))
+    outbound_tls(outbound, address).map(|tls| (carrier, host, tls))
 }
 
 fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
@@ -7485,47 +7906,118 @@ mod tests {
         );
     }
 
-    #[test]
-    fn vless_tls_outbound_parses_raw_and_refuses_the_rest() {
-        let (ca, ca_json) = stage_ca_pem("vless-tls");
-        let tls_tcp = format!(
-            r#""network": "tcp", "security": "tls", "tlsSettings": {{"serverName": "tls.test", "caCertFile": "{ca_json}", "alpn": ["h2"]}}"#
-        );
-        let root = crate::json::parse(&format!(
-            r#"{{"outbounds": [{{"protocol": "vless",
+    fn vnext_tls_root(protocol: &str, stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "{protocol}",
                 "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
                     "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
-                "streamSettings": {{{tls_tcp}}}}}]}}"#
+                "streamSettings": {{{stream}}}}}]}}"#
         ))
-        .expect("parses");
-        let out = find_vless_outbound(&root).expect("finds raw tls");
-        assert!(matches!(out.carrier, Carrier::Raw));
-        let tls = out.tls.expect("carries tls");
+        .expect("parses")
+    }
+
+    fn trojan_tls_root(stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{{stream}}}}}]}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn tls_stream_cases(ca_json: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                "raw".to_owned(),
+                format!(
+                    r#""network": "tcp", "security": "tls", "tlsSettings": {{"serverName": "tls.test", "caCertFile": "{ca_json}", "alpn": ["h2"]}}"#
+                ),
+            ),
+            (
+                "ws".to_owned(),
+                format!(
+                    r#""network": "ws", "security": "tls", "wsSettings": {{"path": "/w"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "grpc".to_owned(),
+                format!(
+                    r#""network": "grpc", "security": "tls", "grpcSettings": {{"serviceName": "svc"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "xhttp".to_owned(),
+                format!(
+                    r#""network": "xhttp", "security": "tls", "xhttpSettings": {{"path": "/share"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "httpupgrade".to_owned(),
+                format!(
+                    r#""network": "httpupgrade", "security": "tls", "httpupgradeSettings": {{"path": "/u"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "httpheader".to_owned(),
+                format!(
+                    r#""network": "tcp", "security": "tls", "tcpSettings": {{"header": {{"type": "http", "request": {{"path": ["/c"]}}}}}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+        ]
+    }
+
+    fn carrier_tag(carrier: &Carrier) -> &'static str {
+        match carrier {
+            Carrier::Raw => "raw",
+            Carrier::Ws { .. } => "ws",
+            Carrier::HttpUpgrade { .. } => "httpupgrade",
+            Carrier::Grpc { .. } => "grpc",
+            Carrier::Xhttp { .. } => "xhttp",
+            Carrier::HttpHeader { .. } => "httpheader",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn vless_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("vless-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = vnext_tls_root("vless", &stream);
+            let out = find_vless_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        let tls = find_vless_outbound(&vnext_tls_root("vless", &tls_stream_cases(&ca_json)[0].1))
+            .expect("finds raw")
+            .tls
+            .expect("carries tls");
         assert_eq!(tls.server_name, "tls.test");
         assert_eq!(tls.alpn, vec![b"h2".to_vec()]);
         assert_eq!(tls.roots.len(), 1);
-        for settings in [
-            format!(
-                r#""network": "ws", "security": "tls", "wsSettings": {{"path": "/w"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
-            ),
-            format!(
-                r#""network": "tcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}", "allowInsecure": true}}"#
-            ),
-        ] {
-            let root = crate::json::parse(&format!(
-                r#"{{"outbounds": [{{"protocol": "vless",
-                    "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
-                        "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
-                    "streamSettings": {{{settings}}}}}]}}"#
-            ))
-            .expect("parses");
-            assert!(find_vless_outbound(&root).is_none(), "{settings}");
+        let insecure = format!(
+            r#""network": "tcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}", "allowInsecure": true}}"#
+        );
+        assert!(find_vless_outbound(&vnext_tls_root("vless", &insecure)).is_none());
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            let root = vnext_tls_root("vless", &stream);
+            if network == "quic" {
+                let out = find_vless_outbound(&root).expect("quic keeps its own dial");
+                assert!(matches!(out.carrier, Carrier::Quic));
+                assert!(out.tls.is_none());
+            } else {
+                assert!(find_vless_outbound(&root).is_none(), "{network}");
+            }
         }
         let muxed = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "vless", "mux": {{"enabled": true}},
                 "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
                     "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
-                "streamSettings": {{{tls_tcp}}}}}]}}"#
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
         ))
         .expect("parses");
         assert!(find_vless_outbound(&muxed).is_none());
@@ -7533,29 +8025,26 @@ mod tests {
     }
 
     #[test]
-    fn trojan_tls_outbound_parses_raw_and_refuses_the_rest() {
+    fn trojan_tls_outbound_parses_diallable_carriers() {
         let (ca, ca_json) = stage_ca_pem("trojan-tls");
-        let root = crate::json::parse(&format!(
-            r#"{{"outbounds": [{{"protocol": "trojan",
-                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
-                    "password": "secret"}}]}},
-                "streamSettings": {{"network": "tcp", "security": "tls",
-                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
-        ))
-        .expect("parses");
-        let out = find_trojan_outbound(&root).expect("finds raw tls");
-        assert!(matches!(out.carrier, Carrier::Raw));
-        let tls = out.tls.expect("carries tls");
-        assert_eq!(tls.server_name, "127.0.0.1");
-        let carried = crate::json::parse(&format!(
-            r#"{{"outbounds": [{{"protocol": "trojan",
-                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
-                    "password": "secret"}}]}},
-                "streamSettings": {{"network": "ws", "security": "tls",
-                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
-        ))
-        .expect("parses");
-        assert!(find_trojan_outbound(&carried).is_none());
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = trojan_tls_root(&stream);
+            let out = find_trojan_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        let out = find_trojan_outbound(&trojan_tls_root(&tls_stream_cases(&ca_json)[0].1))
+            .expect("finds raw");
+        assert_eq!(out.tls.expect("carries tls").server_name, "tls.test");
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            assert!(
+                find_trojan_outbound(&trojan_tls_root(&stream)).is_none(),
+                "{network}"
+            );
+        }
         let plain = crate::json::parse(
             r#"{"outbounds": [{"protocol": "trojan",
                 "settings": {"servers": [{"address": "127.0.0.1", "port": 443,
@@ -7569,28 +8058,23 @@ mod tests {
     }
 
     #[test]
-    fn vmess_tls_outbound_parses_raw_and_refuses_the_rest() {
+    fn vmess_tls_outbound_parses_diallable_carriers() {
         let (ca, ca_json) = stage_ca_pem("vmess-tls");
-        let root = crate::json::parse(&format!(
-            r#"{{"outbounds": [{{"protocol": "vmess",
-                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
-                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "security": "auto"}}]}}]}},
-                "streamSettings": {{"network": "tcp", "security": "tls",
-                    "tlsSettings": {{"serverName": "tls.test", "caCertFile": "{ca_json}"}}}}}}]}}"#
-        ))
-        .expect("parses");
-        let out = find_vmess_outbound(&root).expect("finds raw tls");
-        assert!(matches!(out.carrier, Carrier::Raw));
-        assert!(out.tls.is_some());
-        let carried = crate::json::parse(&format!(
-            r#"{{"outbounds": [{{"protocol": "vmess",
-                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
-                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
-                "streamSettings": {{"network": "ws", "security": "tls",
-                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
-        ))
-        .expect("parses");
-        assert!(find_vmess_outbound(&carried).is_none());
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = vnext_tls_root("vmess", &stream);
+            let out = find_vmess_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            assert!(
+                find_vmess_outbound(&vnext_tls_root("vmess", &stream)).is_none(),
+                "{network}"
+            );
+        }
         let plain = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vmess",
                 "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
@@ -7764,6 +8248,499 @@ mod tests {
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
+    }
+
+    type ServerHalf = TlsHalf<ferrox_core::tls::RustlsServerProvider<TcpStream>>;
+
+    enum TlsEcho {
+        Vless([u8; 16]),
+        Trojan([u8; 56]),
+        Vmess([u8; 16]),
+    }
+
+    fn tls_carried_echo(
+        kind: TlsEcho,
+        out: impl FnOnce(u16) -> Outbound + Send + 'static,
+        accept: impl FnOnce(ServerHalf, ServerHalf) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
+            + Send
+            + 'static,
+    ) {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, _) = carried_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(&server_config, stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let shared = Arc::new(Mutex::new(tls));
+            let (mut reader, mut writer) = accept(
+                TlsHalf {
+                    session: Arc::clone(&shared),
+                },
+                TlsHalf { session: shared },
+            )
+            .expect("accepts carrier");
+            match kind {
+                TlsEcho::Vless(id) => {
+                    let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                        panic!("reads a vless header");
+                    };
+                    assert_eq!(got, id);
+                    assert_eq!(cmd, 1);
+                    writer.write_all(&[0, 0]).expect("answers");
+                    let mut buf = [0u8; 4];
+                    reader.read_exact(&mut buf).expect("reads");
+                    writer.write_all(&buf).expect("echoes");
+                }
+                TlsEcho::Trojan(key) => {
+                    let Some((cmd, _target)) = decode_trojan_request(&mut reader, &key) else {
+                        panic!("reads a trojan header");
+                    };
+                    assert_eq!(cmd, 1);
+                    let mut buf = [0u8; 4];
+                    reader.read_exact(&mut buf).expect("reads");
+                    writer.write_all(&buf).expect("echoes");
+                }
+                TlsEcho::Vmess(id) => {
+                    let Some((_target, mut send, mut recv, prefix, cmd)) =
+                        crate::vmess::accept_request(&mut reader, &id)
+                    else {
+                        panic!("reads a vmess header");
+                    };
+                    assert_eq!(cmd, 1);
+                    writer.write_all(&prefix).expect("answers");
+                    let mut scratch = Vec::with_capacity(16 * 1024);
+                    let chunk = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
+                        .expect("reads a frame")
+                        .to_vec();
+                    let mut staging = Vec::with_capacity(16 * 1024);
+                    let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
+                    assert!(crate::vmess::write_frame(
+                        &mut writer,
+                        &mut send,
+                        &chunk,
+                        &mut staging,
+                        &mut pad
+                    ));
+                }
+            }
+            // Exit only after the client closed: closing with its frames unread resets the echo with it.
+            let mut rest = [0u8; 1024];
+            while reader.read(&mut rest).unwrap_or(0) != 0 {}
+        });
+        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            dial_socks_outbound(&client, &out(port), &server, &target);
+        });
+        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        sock.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    fn tls_vless_out(
+        port: u16,
+        id: [u8; 16],
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(tls)),
+        })
+    }
+
+    fn tls_vmess_out(
+        port: u16,
+        id: [u8; 16],
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Vmess(VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            cipher: crate::vmess::Cipher::Auto,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            tls: Some(Arc::new(tls)),
+        })
+    }
+
+    fn tls_trojan_out(
+        port: u16,
+        key: [u8; 56],
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Trojan(TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            tls: Some(Arc::new(tls)),
+        })
+    }
+
+    fn tls_ws_accept(
+        read: ServerHalf,
+        write: ServerHalf,
+    ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+        let (reader, writer) = crate::ws::accept_split(read, write, "/w")?;
+        Some((Box::new(reader), Box::new(writer)))
+    }
+
+    fn tls_httpupgrade_accept(
+        read: ServerHalf,
+        write: ServerHalf,
+    ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+        let (reader, writer) = crate::httpupgrade::accept_split(read, write, "/u")?;
+        Some((Box::new(reader), Box::new(writer)))
+    }
+
+    fn tls_grpc_accept(
+        read: ServerHalf,
+        write: ServerHalf,
+    ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+        let (reader, writer) = crate::grpc::accept_split(read, write, "/Tun")?;
+        Some((Box::new(reader), Box::new(writer)))
+    }
+
+    fn tls_xhttp_accept(
+        read: ServerHalf,
+        write: ServerHalf,
+    ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+        let (reader, writer) = crate::xhttp::accept_split(read, write, "/share")?;
+        Some((Box::new(reader), Box::new(writer)))
+    }
+
+    fn tls_httpheader_accept(
+        read: ServerHalf,
+        write: ServerHalf,
+    ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+        let (reader, writer) = crate::httpheader::accept_split(read, write, "/c")?;
+        Some((Box::new(reader), Box::new(writer)))
+    }
+
+    #[test]
+    fn vless_over_tls_ws_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x44u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vless(id),
+            move |port| {
+                tls_vless_out(
+                    port,
+                    id,
+                    Carrier::Ws {
+                        path: "/w".to_owned(),
+                        ed: 0,
+                    },
+                    client_config,
+                )
+            },
+            tls_ws_accept,
+        );
+    }
+
+    #[test]
+    fn vless_over_tls_httpupgrade_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x45u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vless(id),
+            move |port| {
+                tls_vless_out(
+                    port,
+                    id,
+                    Carrier::HttpUpgrade {
+                        path: "/u".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_httpupgrade_accept,
+        );
+    }
+
+    #[test]
+    fn vless_over_tls_grpc_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x46u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vless(id),
+            move |port| {
+                tls_vless_out(
+                    port,
+                    id,
+                    Carrier::Grpc {
+                        path: "/Tun".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_grpc_accept,
+        );
+    }
+
+    #[test]
+    fn vless_over_tls_xhttp_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x47u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vless(id),
+            move |port| {
+                tls_vless_out(
+                    port,
+                    id,
+                    Carrier::Xhttp {
+                        path: "/share".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_xhttp_accept,
+        );
+    }
+
+    #[test]
+    fn vless_over_tls_httpheader_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x48u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vless(id),
+            move |port| {
+                tls_vless_out(
+                    port,
+                    id,
+                    Carrier::HttpHeader {
+                        path: "/c".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_httpheader_accept,
+        );
+    }
+
+    #[test]
+    fn vmess_over_tls_ws_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x34u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vmess(id),
+            move |port| {
+                tls_vmess_out(
+                    port,
+                    id,
+                    Carrier::Ws {
+                        path: "/w".to_owned(),
+                        ed: 0,
+                    },
+                    client_config,
+                )
+            },
+            tls_ws_accept,
+        );
+    }
+
+    #[test]
+    fn vmess_over_tls_grpc_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x35u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vmess(id),
+            move |port| {
+                tls_vmess_out(
+                    port,
+                    id,
+                    Carrier::Grpc {
+                        path: "/Tun".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_grpc_accept,
+        );
+    }
+
+    #[test]
+    fn vmess_over_tls_httpupgrade_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x36u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vmess(id),
+            move |port| {
+                tls_vmess_out(
+                    port,
+                    id,
+                    Carrier::HttpUpgrade {
+                        path: "/u".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_httpupgrade_accept,
+        );
+    }
+
+    #[test]
+    fn vmess_over_tls_xhttp_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x37u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vmess(id),
+            move |port| {
+                tls_vmess_out(
+                    port,
+                    id,
+                    Carrier::Xhttp {
+                        path: "/share".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_xhttp_accept,
+        );
+    }
+
+    #[test]
+    fn vmess_over_tls_httpheader_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let id = [0x38u8; 16];
+        tls_carried_echo(
+            TlsEcho::Vmess(id),
+            move |port| {
+                tls_vmess_out(
+                    port,
+                    id,
+                    Carrier::HttpHeader {
+                        path: "/c".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_httpheader_accept,
+        );
+    }
+
+    #[test]
+    fn trojan_over_tls_ws_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let key = trojan_key("an-example-shared-password");
+        tls_carried_echo(
+            TlsEcho::Trojan(key),
+            move |port| {
+                tls_trojan_out(
+                    port,
+                    key,
+                    Carrier::Ws {
+                        path: "/w".to_owned(),
+                        ed: 0,
+                    },
+                    client_config,
+                )
+            },
+            tls_ws_accept,
+        );
+    }
+
+    #[test]
+    fn trojan_over_tls_grpc_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let key = trojan_key("another-example-password");
+        tls_carried_echo(
+            TlsEcho::Trojan(key),
+            move |port| {
+                tls_trojan_out(
+                    port,
+                    key,
+                    Carrier::Grpc {
+                        path: "/Tun".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_grpc_accept,
+        );
+    }
+
+    #[test]
+    fn trojan_over_tls_httpupgrade_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let key = trojan_key("third-example-password");
+        tls_carried_echo(
+            TlsEcho::Trojan(key),
+            move |port| {
+                tls_trojan_out(
+                    port,
+                    key,
+                    Carrier::HttpUpgrade {
+                        path: "/u".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_httpupgrade_accept,
+        );
+    }
+
+    #[test]
+    fn trojan_over_tls_xhttp_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let key = trojan_key("fourth-example-password");
+        tls_carried_echo(
+            TlsEcho::Trojan(key),
+            move |port| {
+                tls_trojan_out(
+                    port,
+                    key,
+                    Carrier::Xhttp {
+                        path: "/share".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_xhttp_accept,
+        );
+    }
+
+    #[test]
+    fn trojan_over_tls_httpheader_carries_an_echo() {
+        let (_, client_config) = carried_tls_configs();
+        let key = trojan_key("fifth-example-password");
+        tls_carried_echo(
+            TlsEcho::Trojan(key),
+            move |port| {
+                tls_trojan_out(
+                    port,
+                    key,
+                    Carrier::HttpHeader {
+                        path: "/c".to_owned(),
+                    },
+                    client_config,
+                )
+            },
+            tls_httpheader_accept,
+        );
     }
 
     fn stage_ca_pem(name: &str) -> (std::path::PathBuf, String) {
