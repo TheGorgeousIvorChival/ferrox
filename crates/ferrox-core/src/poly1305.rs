@@ -82,6 +82,49 @@ fn from_26(h: [u32; 5]) -> [u64; 3] {
 #[cfg(target_arch = "x86_64")]
 const AVX2_THRESHOLD_BYTES: usize = 4096;
 
+/// A four-byte window at `offset` of each block in the low dword of each 64-bit lane, zeroed above.
+#[cfg(target_arch = "x86_64")]
+const fn window_mask(offset: usize) -> [i8; 32] {
+    let mut mask = [i8::MIN; 32];
+    let mut lane = 0;
+    while lane < 2 {
+        let mut byte = 0;
+        while byte < 4 {
+            mask[lane * 16 + byte] = (offset + byte) as i8;
+            byte += 1;
+        }
+        lane += 1;
+    }
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+static WINDOW_MASKS: [[i8; 32]; 5] = [
+    window_mask(0),
+    window_mask(3),
+    window_mask(6),
+    window_mask(9),
+    window_mask(12),
+];
+
+/// One limb of four consecutive blocks, four lanes wide, the window mask as the shuffle operand.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::wildcard_imports, reason = "flat lane primitives")]
+fn limb_window<const SHIFT: i32, const WINDOW: usize>(
+    lo: core::arch::x86_64::__m256i,
+    hi: core::arch::x86_64::__m256i,
+    mask26: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mask = _mm256_loadu_si256(WINDOW_MASKS[WINDOW].as_ptr().cast());
+        let a = _mm256_srli_epi64::<SHIFT>(_mm256_shuffle_epi8(lo, mask));
+        let b = _mm256_srli_epi64::<SHIFT>(_mm256_shuffle_epi8(hi, mask));
+        _mm256_and_si256(_mm256_unpacklo_epi64(a, b), mask26)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[allow(clippy::wildcard_imports, reason = "flat lane primitives")]
@@ -673,20 +716,19 @@ impl Poly1305 {
             hv[3] = o3;
             hv[4] = o4;
 
-            let wide = std::array::from_fn::<u64, 20, _>(|i| {
-                let (j, lane) = (i / 4, i % 4);
-                let at = lane * 16 + 3 * j;
-                let word = u32::from_le_bytes([g[at], g[at + 1], g[at + 2], g[at + 3]]);
-                u64::from(if j == 4 {
-                    (word >> 8) + HIBIT26
-                } else {
-                    (word >> (2 * j)) & M26_U32
-                })
-            });
-            for (j, hvp) in hv.iter_mut().enumerate() {
-                let limb = unsafe { _mm256_loadu_si256(wide.as_ptr().add(4 * j).cast()) };
-                *hvp = _mm256_add_epi64(*hvp, limb);
-            }
+            let lo = unsafe { _mm256_loadu_si256(g.as_ptr().cast()) };
+            let hi = unsafe { _mm256_loadu_si256(g.as_ptr().add(32).cast()) };
+            hv[0] = _mm256_add_epi64(hv[0], limb_window::<0, 0>(lo, hi, mask26));
+            hv[1] = _mm256_add_epi64(hv[1], limb_window::<2, 1>(lo, hi, mask26));
+            hv[2] = _mm256_add_epi64(hv[2], limb_window::<4, 2>(lo, hi, mask26));
+            hv[3] = _mm256_add_epi64(hv[3], limb_window::<6, 3>(lo, hi, mask26));
+            hv[4] = _mm256_add_epi64(
+                hv[4],
+                _mm256_add_epi64(
+                    limb_window::<8, 4>(lo, hi, mask26),
+                    _mm256_set1_epi64x(HIBIT26.cast_signed().into()),
+                ),
+            );
 
             groups = &groups[64..];
         }
@@ -695,9 +737,10 @@ impl Poly1305 {
         for (j, lane) in hv.iter().enumerate() {
             let mut arr = [0u64; 4];
             unsafe { _mm256_storeu_si256(arr.as_mut_ptr().cast(), *lane) };
+            // the unpack interleaves as blocks 0, 2, 1, 3; undo it once here
             lanes[0][j] = arr[0] as u32;
-            lanes[1][j] = arr[1] as u32;
-            lanes[2][j] = arr[2] as u32;
+            lanes[1][j] = arr[2] as u32;
+            lanes[2][j] = arr[1] as u32;
             lanes[3][j] = arr[3] as u32;
         }
 
