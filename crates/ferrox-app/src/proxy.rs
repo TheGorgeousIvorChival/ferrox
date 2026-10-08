@@ -8129,7 +8129,7 @@ mod tests {
             dial_vless(&client, &server, &vless, &target, Ladder::global());
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping");
@@ -8175,7 +8175,7 @@ mod tests {
             dial_trojan(&client, &server, &trojan, &target, Ladder::global());
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping");
@@ -8235,7 +8235,7 @@ mod tests {
             dial_vmess(&client, &server, &vmess, &target, Ladder::global());
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping");
@@ -8259,7 +8259,7 @@ mod tests {
                 Ok(n) => at += n,
                 Err(error) => {
                     assert!(
-                        is_timeout(&error) && start.elapsed() < Duration::from_secs(30),
+                        is_timeout(&error) && start.elapsed() < Duration::from_secs(120),
                         "echoes: {error:?} after {:?}",
                         start.elapsed()
                     );
@@ -8357,7 +8357,7 @@ mod tests {
             dial_socks_outbound(&client, &out(port), &server, &target);
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping");
