@@ -535,7 +535,7 @@ What is left is the same shape in the two loopback relay tests that still `expec
 ## P24 · Find the 8 KiB block that lands inside a counting window
 
 **When to use:** When a gate says "zero allocations" and the count is not zero. Gate 8 hit it on its first run and had to lower its bar to match what it can decide.
-**Status:** todo
+**Status:** doing
 **Leverage:** 4
 **Effort:** medium
 **Gates:** `cargo test --workspace`; CI: `bench.yml` gate 8 reporting `0` for this side on all four runners
@@ -547,7 +547,9 @@ What is left is the same shape in the two loopback relay tests that still `expec
 
 8192 is `std::io`'s default buffer and `io::copy`'s, and `std::thread`'s spawn path sizes a stack with `mmap` rather than the allocator, so the obvious suspects are std's I/O and not std's threads. Find it, then either fix it or make `count` narrow enough to exclude it — a per-thread flag, or counting only the thread that opened the window.
 
-Until then gate 8 holds this side under one allocation per encode and the reference at two or more, both printed, and `docs/claims.md` says the bar is not zero and why. `muxframe.rs` hit this first and declined to assert on it too; two gates is a pattern and a pattern is a slice.
+**The second of those landed, and the 8 KiB block was not found.** `count::measure` now sets a thread-local flag instead of a process-wide one, so a window counts the thread that opened it and nothing else, and the atomic counters stay process-wide only because the allocator is. **The block is still unidentified**, and it no longer matters to any row: with the window narrowed, every allocation window in the harness reads **exactly zero** on this machine — gate 8's four encoders, gate 9's fifteen cipher rows, gate 10's seven seal+open pairs, gate 6's mux rows and gate 2's lengths, all `0` allocations, `0` bytes and `0` zero-fills. So the two bars that had slack in them for this reason are zero bars: `ciphers.rs` and `aesgcm.rs` assert `(0, 0, 0)` where they asserted `per_iter(..) < 1.0`, beside the `(0, 0, 0)` `muxframe.rs` and gate 2 already asserted. A test beside the counter proves the window is thread-local rather than asserting it in prose: `count::tests::a_window_counts_its_own_thread_and_not_another` holds one thread's 64 KiB out of another thread's window over an atomic handshake, because a `Barrier` allocates 112 bytes of its own while it holds a window open and would have made the test's own number wrong.
+
+**`done` needs the CI gate, and this is `doing` until then**: `bench.yml` has to report gate 8's own side as `0` on all four runners, and one local run on `aarch64-apple-darwin` is one machine and not four. The op-count half of the local check is CI-only on this machine for the reason `AGENTS.md` names — no valgrind and no `aarch64` support in `count-ops.sh` — so `scripts/method-counts.txt` is unchanged and nobody has blessed a number here.
 ```
 
 ## P25 · Bless and extend the exact operation counts

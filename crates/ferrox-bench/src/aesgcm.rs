@@ -211,10 +211,11 @@ fn check_allocs(len: usize, plain: &[u8], ours: &Aes128Gcm, windows: &mut Vec<Wi
             let _ = ours.open_in_place(&nonce, b"", std::hint::black_box(&mut buf), &tag);
         }
     });
-    assert!(
-        counts.per_iter(ALLOC_ITERS) < 1.0,
-        "aes-128-gcm {len}: {} allocations over {ALLOC_ITERS} pairs is not under one per chunk",
-        counts.allocs
+    assert_eq!(
+        (counts.allocs, counts.bytes, counts.zeroed),
+        (0, 0, 0),
+        "aes-128-gcm {len}: the seal and the open are in place in the caller's buffer and must \
+         not allocate"
     );
     windows.push(Window {
         len,
@@ -258,9 +259,9 @@ pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> 
     let _ = writeln!(
         out,
         "\nAllocations per seal+open pair, from the same counting global allocator the\n\
-         other gates use. The bar is **under one per pair**, not zero: `count::measure`\n\
-         raises one process-wide flag, so a window also counts whatever else the process\n\
-         allocates while it is open.\n\
+         other gates use. The bar is **zero**, and the count is exact: the window is open on\n\
+         the thread that opened it and on no other, so an allocation inside it is this\n\
+         code's rather than the process's.\n\
          \n\
          | bytes | pairs | allocations | per pair | bytes allocated |\n\
          | ---: | ---: | ---: | ---: | ---: |"
