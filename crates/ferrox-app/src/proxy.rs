@@ -3206,12 +3206,8 @@ type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<TcpStream>>;
 
 impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            return match self.locked_read(buf) {
-                Err(error) if is_timeout(&error) => continue,
-                outcome => outcome,
-            };
-        }
+        // A quiet socket is the callers' poll grain to retry, not this half's to spin on.
+        self.locked_read(buf)
     }
 }
 

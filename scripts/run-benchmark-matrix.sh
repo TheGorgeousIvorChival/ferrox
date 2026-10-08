@@ -11,6 +11,7 @@ bench_bin="target/release/ferrox-bench"
 only=()
 exclude=()
 probe_only=0
+no_build=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier) tier="$2"; shift 2 ;;
@@ -21,6 +22,7 @@ while [[ $# -gt 0 ]]; do
     --only) only+=("$2"); shift 2 ;;
     --exclude) exclude+=("$2"); shift 2 ;;
     --probe-only) probe_only=1; shift ;;
+    --no-build) no_build=1; shift ;;
     *) echo "::error::unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -51,7 +53,11 @@ if [[ -z "$repeats" ]]; then
 fi
 
 note "building the harness driver"
-cargo build --locked --release -p ferrox-bench -p ferrox-app 2>&1 | tail -2 >&2
+if ((no_build)); then
+  note "skipping the build: binaries are handed over, not rebuilt"
+else
+  cargo build --locked --release -p ferrox-bench -p ferrox-app 2>&1 | tail -2 >&2
+fi
 bench_bin="$(built "$bench_bin")" || fail \
   "no executable at $bench_bin(.exe) after the build above"
 ferrox_bin="$(built target/release/ferrox-app)" || fail \

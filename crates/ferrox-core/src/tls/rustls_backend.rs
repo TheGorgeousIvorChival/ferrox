@@ -166,7 +166,15 @@ impl<S: Stream> Read for RustlsProvider<S> {
             self.drive()?;
             match self.conn.reader().read(buf) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.conn.complete_io(&mut self.io).map_err(recover)?;
+                    if let Err(io_error) = self.conn.complete_io(&mut self.io) {
+                        if matches!(
+                            io_error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) {
+                            return Err(io_error);
+                        }
+                        return Err(recover(io_error).into());
+                    }
                 }
                 outcome => return outcome,
             }
@@ -283,7 +291,15 @@ impl<S: Stream> Read for RustlsServerProvider<S> {
             self.drive()?;
             match self.conn.reader().read(buf) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.conn.complete_io(&mut self.io).map_err(recover)?;
+                    if let Err(io_error) = self.conn.complete_io(&mut self.io) {
+                        if matches!(
+                            io_error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) {
+                            return Err(io_error);
+                        }
+                        return Err(recover(io_error).into());
+                    }
                 }
                 outcome => return outcome,
             }
