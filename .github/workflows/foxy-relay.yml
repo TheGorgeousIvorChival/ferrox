@@ -190,7 +190,8 @@ jobs:
           # answer bytes is the datagram path proven.
           import os
           bait = b'\xc0\xde\xad\xbe\xef\x08' + os.urandom(8) + b'\x08' + os.urandom(8)
-          bait += b'\x00\x44\x00' + bytes(1200 - len(bait))
+          bait += b'\x00\x44\x00'
+          bait += bytes(1200 - len(bait))
           targets = [
               (b'\x00\x00\x00\x03\x13time.cloudflare.com', 123, 'ntp-name', b'\x1b' + b'\x00' * 47, 48),
               (b'\x00\x00\x00\x01\xa2\x9f\xc8\x01', 123, 'ntp-literal', b'\x1b' + b'\x00' * 47, 48),
