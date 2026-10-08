@@ -154,13 +154,30 @@ jobs:
                   at += rdlen
               return out
           tcp = socket.create_connection(('127.0.0.1', 10808), timeout=30)
+          tcp.settimeout(30)
+          def recv_exact(sock, n):
+              out = b''
+              while len(out) < n:
+                  chunk = sock.recv(n - len(out))
+                  if not chunk:
+                      raise RuntimeError('eof in handshake')
+                  out += chunk
+              return out
           tcp.sendall(bytes([5, 1, 0]))
-          assert tcp.recv(2) == b'\x05\x00', 'no method'
+          assert recv_exact(tcp, 2) == b'\x05\x00', 'no method'
           tcp.sendall(bytes([5, 3, 0, 1, 0, 0, 0, 0, 0, 0]))
-          reply = tcp.recv(64)
-          assert reply[:3] == b'\x05\x00\x00', 'associate refused'
-          skip, _ = udp_addr(reply[3:])
-          relay = ('127.0.0.1', struct.unpack('>H', reply[3 + skip:3 + skip + 2])[0])
+          head = recv_exact(tcp, 4)
+          assert head[:3] == b'\x05\x00\x00', 'associate refused'
+          atyp = head[3]
+          if atyp == 1:
+              port = struct.unpack('>H', recv_exact(tcp, 6)[4:6])[0]
+          elif atyp == 4:
+              port = struct.unpack('>H', recv_exact(tcp, 18)[16:18])[0]
+          else:
+              ln = recv_exact(tcp, 1)[0]
+              recv_exact(tcp, ln)
+              port = struct.unpack('>H', recv_exact(tcp, 2))[0]
+          relay = ('127.0.0.1', port)
           udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
           udp.settimeout(20)
           deadline = time.time() + 240
