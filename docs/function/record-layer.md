@@ -55,17 +55,11 @@ graph TD
 | blocks-per-iteration | 8 | ferrox-core-chacha::backend |
 | fused-head-blocks | 1 | ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted |
 | backends-a-differential-test-cannot-lie-to | 4 | ferrox-bench-gate-1 |
-| keystream-blocks-per-decrypt | 1+ceil(len/64) | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
 
-| staging-bytes-per-decrypt | 0 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
 
-| keystream-passes-per-decrypt | 2 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
 
-| padded-sections-through-a-second-update | 0 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
 
-| padded-sections-per-mac | 2 | ferrox-core-aead::tests::every_decrypt_matches_the_crate_it_replaces |
 
-| empty-absorbs-per-record | 0 | ferrox-core-poly1305::tests::byte_at_a_time_matches_one_shot |
 <!-- counts:end -->
 
 ## Ops
@@ -77,6 +71,26 @@ graph TD
 ```
 
 `UNBLESSED`, as above: no measured instruction count is quoted for this rung.
+
+### What is counted here, and what is only argued
+
+The table above is the gated half of this page. Four of the removals just
+described — the staging buffer, the two keystream passes, the second
+`update` per padded section, and the empty absorbs — are **counts with no
+counter behind them**. Nothing in this tree counts ChaCha blocks per open,
+stack bytes staged, `update` calls, or `absorb` invocations, and
+`ferrox-bench`'s counting allocator would not see a stack `[u8; 64]` even if
+it were extended to measure the open: `count::measure` hooks `alloc` and
+`alloc_zeroed`, and the staging buffer is on the stack. So those four are
+argued from the source at the line named beside each one, and what *is* gated
+is that they are bit-identical — `every_decrypt_matches_the_crate_it_replaces`
+opens 6 000+ cases against the pinned `chacha20poly1305` crate and requires the
+same plaintext, and requires a forged tag to leave the buffer encrypted.
+
+A number nobody can produce is not a number, so they are not in the table. If
+they are ever to be gated rather than argued, the honest instrument is a
+block counter on the ladder that `count-ops` reads, not an allocation counter:
+that is the same gap P41 and P25 are named for.
 
 ## Time
 
@@ -129,13 +143,6 @@ branch has been read.
   `Poly1305::pad_to_block` zeroes `buffer` up to a block and absorbs it in one
   call, replacing `update(&[0u8; 16][..slack])`, which cost a call, a `min`, two
   bounds checks and a *dynamically sized* `memcpy` for 1..15 bytes. Padding
-  cannot move into `update` itself — `update` cannot know it is last, and
-  `several_updates_are_one_run` and `byte_at_a_time_matches_one_shot` are what
-  hold that contract — so it is a named method rather than a changed semantic.
-  Upstream pads the same way (Xray's `poly1305.Write` in
-  `common/crypto/poly1305.go` absorbs zeros; Zray's `chacha20poly1305.rs:47-60`
-  does the same), so this is the first place in this file where the gap is
-  ours rather than shared.
 - **The empty `absorb` at both ends of every record.** `Poly1305::update` called
   `absorb(&data[..whole])` and copied `rest` even when `whole` was zero and
   `rest` was empty, which is exactly the shape of every padding call: a dispatch,

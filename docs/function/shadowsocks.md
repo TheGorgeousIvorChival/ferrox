@@ -56,15 +56,13 @@ that file disagree.
 | user-space-copies-per-byte-read | 0 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | zero-filled-bytes-per-chunk | 0 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
-| udp-payload-copies-per-byte | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
+| udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
+| udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
 
 | udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
 
-| udp-payload-passes-through-the-returned-buffer | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
 
-| chunk-tag-copies-per-chunk | 0 | ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag |
 
-| datagram-memmoves-per-payload | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
 <!-- counts:end -->
 
 ## Ops
@@ -144,10 +142,13 @@ Read against the three pinned implementations, all of which are in
   a subslice of the buffer the datagram was opened in. The same holds for
   sealing: `seal_udp_datagram` allocated a fresh `Vec` per datagram, and the
   buffer is now the thread's own.
-  `an_opened_payload_is_the_datagrams_own_bytes` is the gate — it asserts the
-  returned pointer lies inside `opened`, and that `opened` neither moves nor
-  grows over eight rounds, using the same pointer-identity idiom as
-  `frames_reuse_the_callers_buffers`.
+  `an_opened_payload_is_the_datagrams_own_bytes` is the gate: it asserts the
+  returned pointer lies inside `opened` — which is `udp-payload-buffers-per-datagram 1`
+  — and that `opened` neither moves nor grows over eight rounds, which is
+  `udp-datagram-reallocations-after-the-first 0`. Same pointer-identity idiom as
+  `frames_reuse_the_callers_buffers`. The 16-byte tag copy and the `memmove` are
+  named rather than counted: no test observes a copy that does not happen, so
+  they are not in the table.
 - **A 16-byte tag copy per chunk.** `Cipher::open_in_place` split the tag off
   with `split_at_mut` and then built a `[u8; TAG_LEN]` on the stack to pass by
   reference. It now borrows the sixteen bytes that are already there, which is

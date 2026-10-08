@@ -47,9 +47,7 @@ graph TD
 | user-space-copies-per-byte-unmasked-write | 0 | ferrox-app-ws::tests::frames_round_trip_masked_and_plain |
 | user-space-copies-per-byte-masked-write | 1 | ferrox-app-ws::tests::frames_round_trip_masked_and_plain |
 | user-space-copies-per-byte-read | 1 | ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header |
-| mask-bytes-per-vector-iteration | 64 | ferrox-app-ws::tests::mask_chunks_match_the_byte_loop |
 
-| mask-vector-ops-per-64-bytes | 4 | ferrox-app-ws::tests::mask_chunks_match_the_byte_loop |
 <!-- counts:end -->
 
 ## Ops
@@ -72,26 +70,28 @@ branch has been read, so no duration is quoted.
 
 ## What we removed
 
-- **Three quarters of the mask loop's overhead.** `apply_mask` built a 16-byte
-  mask pattern and XORed 16 bytes per iteration, so a masked client frame spent
-  about a quarter of its mask work on the loop counter and the bounds check
-  rather than on the XOR. It now strides 64 bytes — still four vector ops of
-  16 bytes, the same op count, with the same bytes at the same offsets, because
-  64 is a multiple of the 4-byte mask and so `mask[i & 3]` at byte `i` of a
-  chunk is unchanged. Only the client→server direction is ever masked, and that
-  is the direction the 16 MiB frame limit applies to.
-  `mask_chunks_match_the_byte_loop` is the gate, and it is the reason the stride
-  change is safe to make without a benchmark: it compares against the byte loop
-  at 0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192,
-  255, 1 024 and 8 192 — every boundary where a wrong stride shows up. **No
-  duration is claimed**: the argument is that the vector op count is unchanged
-  and the per-byte loop overhead falls fourfold, which is a count, not a clock.
 - **An unbounded `realloc` chain in the read-ahead buffer.** `WsReader::pull`
   asks for `reserve_exact(READ_AHEAD)`, which requests exactly the leftover plus
   32 KiB — one byte more than the previous capacity whenever the leftover grew,
   so a stream that lands mid-frame reallocates and memcpys once per read.
   `reserve` amortises that. In the good case, where a read lands on a frame
   boundary, the branch was already false and this changes nothing.
+- **NOT attempted: widening the mask loop's stride.** `apply_mask` XORs 16 bytes
+  per iteration, so about a quarter of its work on a long masked frame is loop
+  counter and bounds check rather than XOR. Striding 64 bytes was tried — same
+  vector op count, same bytes at the same offsets, since 64 is a multiple of the
+  4-byte mask — and it is a **regression**, and the arithmetic says so without a
+  benchmark: the remainder is taken scalar, so `as_chunks_mut::<64>()` makes the
+  scalar tail up to 63 bytes where `as_chunks_mut::<16>()` kept it under 16. At 63
+  bytes it is 63 scalar XORs against 3 vector ops plus 15. Every length that is
+  not a multiple of 64 is worse, and the lengths that are multiples of 64 are
+  unchanged, so the change only ever helped frames that were already
+  vector-aligned. Reverted. Fixing it properly means an inner loop over four
+  16-byte lanes, which is more code than the win is worth without a
+  measurement. `mask_chunks_match_the_byte_loop` is what pins the stride: it
+  compares against the byte loop at 0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64,
+  65, 127, 128, 129, 191, 192, 255, 1 024 and 8 192 — every boundary where a
+  wrong stride shows up.
 - **Two read syscalls per message, unconditionally, forever.** The old
   `frame_head` called `read_exact` for 2 bytes, then `read_exact` again for the
   extended length and the mask, then `read_exact` for the payload. Comparing the

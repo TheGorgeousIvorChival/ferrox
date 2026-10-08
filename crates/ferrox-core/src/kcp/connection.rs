@@ -745,6 +745,35 @@ mod tests {
         }
     }
 
+    /// `Notifier::gen` is the generation counter `read` snapshots and
+    /// `wait_since` compares, so its delta is the number of wakeups: this is
+    /// the gate for "one wakeup per datagram" rather than a reading of it.
+    #[test]
+    fn a_datagram_wakes_the_reader_once_however_many_segments_it_carries() {
+        for width in [1usize, 2, 3, 8] {
+            let conn = echoing_connection();
+            let mut segs: Vec<Segment> = Vec::new();
+            for number in 0..width {
+                segs.push(data(number as u32, 0, b"payload"));
+            }
+            let before = conn.data_input.gen();
+            conn.input(&mut segs);
+            assert_eq!(
+                conn.data_input.gen() - before,
+                1,
+                "width {width}: a {width}-segment datagram woke the reader more than once"
+            );
+        }
+        let conn = echoing_connection();
+        let before = conn.data_input.gen();
+        conn.input(&mut vec![data(9, 0, b"far away")]);
+        assert_eq!(
+            conn.data_input.gen(),
+            before,
+            "a segment outside the receiving window is not a wakeup"
+        );
+    }
+
     #[test]
     fn every_read_size_delivers_the_same_stream() {
         let stream: Vec<u8> = (0..776).map(|i| (i as u8).wrapping_mul(29)).collect();

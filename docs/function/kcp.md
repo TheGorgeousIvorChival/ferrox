@@ -43,15 +43,12 @@ graph TD
 | oracle-runs-against-the-pinned-go | 1 | ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go |
 | rto-cap-seconds | 10 | ferrox-core-kcp::tests::rto_is_capped_at_ten_seconds_and_widened |
 | app-rows-serving-over-kcp | 4 | ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback |
-| segment-list-reallocations-after-the-first | 0 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
 
-| segment-list-vectors-per-datagram | 0 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
+| segment-list-vectors-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
 
-| receiving-staging-vectors-per-read | 0 | ferrox-core-kcp::connection::tests::every_read_size_delivers_the_same_stream |
 
-| read-deadline-lock-pairs-per-wait | 1 | ferrox-core-kcp::connection::tests::every_read_size_delivers_the_same_stream |
 
-| reader-wakeups-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
+| reader-wakeups-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries |
 <!-- counts:end -->
 
 ## Ops
@@ -89,16 +86,22 @@ it is the one this rung replaces:
   drop here — it decodes into a slice header and a fixed `seg` array — so this
   is a place where the Go reference is structurally cheaper and this tree now
   matches it.
-- **A `Vec<Vec<u8>>` and a `VecDeque` allocated per `read`.** `ReceivingWorker::read`
-  called `read_multi_buffer`, which drained the window into a fresh outer `Vec`
-  only for `read` to move it straight into a `VecDeque`, one entry per segment,
-  and then walk two layers of indirection to reach the payload. Only the
-  *partially drained* segment has to outlive the call, so `left_over` is now the
-  current segment's own `Vec<u8>` plus an offset, and `read_multi_buffer` is
-  gone: `read` pulls one segment out of the receiving window at a time.
-  `every_read_size_delivers_the_same_stream` is the gate — it rebuilds the same
-  776-byte stream at thirteen segment and read widths and requires every one of
-  them to reassemble it identically.
+- **A `Vec<Vec<u8>>` allocated and freed per `read`.** `read_multi_buffer`
+  drained the receiving window into a fresh outer `Vec` only for `read` to move
+  it straight into a `VecDeque`, one entry per segment, and then walk two layers
+  of indirection to reach the payload. The outer `Vec` is gone: `drain_window`
+  pushes straight into `left_over`, which keeps its capacity, so a read that
+  finds the window non-empty allocates nothing.
+
+  **The lazy version of this was measured as a regression and is not here.**
+  Pulling one segment at a time out of the window instead of draining it is
+  cheaper still and passes every test in this file — but it lets `next_number`
+  lag by whatever one `read` did not consume, and `process_segment` refuses
+  anything `window_size` ahead of `next_number`. At the default
+  `receiving_in_flight_size()` of 776 segments, a sender legitimately in flight
+  would start having segments dropped that the eager drain accepts. That is a
+  flow-control change wearing a performance costume, and `drain_window` carries
+  a comment saying so.
 - **Two mutex acquisitions where one decides the same thing.**
   `wait_for_data_input` took the read deadline, tested it, then took it again to
   compute the wait. `Option<Instant>` is `Copy` and nothing else changes it
@@ -110,12 +113,19 @@ it is the one this rung replaces:
   the reader inside the loop, once per data segment that made data available, so
   a datagram carrying *n* segments paid *n* lock-and-broadcast pairs to wake the
   same reader for the same reason. The loop now records whether any segment did
-  and signals once, after it. This is safe because the generation counter is a
-  change-detection token compared only against its own past value — a reader
-  parked on it needs to see it change, not to see it change once per segment.
-  The counter is *not* relaxed to an atomic: `signal` bumps it under the mutex
-  and `wait_since` compares it under the same mutex, which is what closes the
-  lost-wakeup window between `gen()` in `read` and the `wait`.
+  and signals once, after it, which is `reader-wakeups-per-datagram 1`.
+
+  That row is gated by a real counter rather than by reading the code:
+  `a_datagram_wakes_the_reader_once_however_many_segments_it_carries` snapshots
+  `Notifier::gen` — the generation counter `read` takes and `wait_since`
+  compares, so its delta *is* the number of wakeups — and requires the delta to
+  be exactly 1 for datagrams of 1, 2, 3 and 8 segments, and 0 for a segment
+  outside the receiving window. Safe because the counter is a change-detection
+  token compared only against its own past value: a reader parked on it needs to
+  see it change, not to see it change once per segment. It is *not* relaxed to an
+  atomic — `signal` bumps it under the mutex and `wait_since` compares it under
+  the same mutex, which is what closes the lost-wakeup window between `gen()` in
+  `read` and the `wait`.
 
 - **A fresh 8 KiB buffer per outbound segment.** Xray's
   `transport/internet/kcp/connection.go:406` does

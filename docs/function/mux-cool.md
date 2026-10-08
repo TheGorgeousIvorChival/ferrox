@@ -44,9 +44,7 @@ graph TD
 | mux-frame-allocations | 0 | ferrox-bench-gate-6 |
 | live-session-cap | 8 | ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used |
 | xudp-frame-layout-matches-upstream | 1 | ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout |
-| relay-read-copies-through-a-second-buffer | 0 | ferrox-app-proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held |
 
-| relay-read-reallocations | 0 | ferrox-app-proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held |
 <!-- counts:end -->
 
 ## Ops
@@ -82,10 +80,19 @@ No artefact from this branch has been read.
   `a_read_into_the_tail_appends_exactly_what_the_stream_held` is the gate: it
   drains a stream through a five-bytes-at-a-time reader — 3 300-odd short reads
   over 16.5 KiB — and checks after *every* read that the buffer holds exactly the
-  prefix the source held, and that it never grew past the read slice. A second
-  test covers the two ways the `set_len` can be rolled back, the failing reader
-  and the empty one, because a buffer left longer than the bytes read is how
-  this idiom reads uninitialised memory.
+  prefix the source held. A second test covers the two ways the `set_len` can be
+  rolled back, the failing reader and the empty one, because a buffer left longer
+  than the bytes read is how this idiom reads uninitialised memory.
+
+  **Not claimed: the buffer does not reallocate.** `decode` returns `Short` with
+  a partial frame still buffered, and the largest mux frame is
+  `2 + META_MAX + 2 + 8192`, so a read can leave the buffer holding a near-maximal
+  partial frame before `READ_SLICE` is appended. `with_capacity(READ_SLICE)` plus
+  `reserve` reaches that on the second growth and stays there, so the new code
+  reallocates at most twice per connection where the old `Vec::new()` grew
+  geometrically — better, but not zero, and no row claims otherwise. Sizing the
+  buffer to `2 + META_MAX + 2 + 8192 + READ_SLICE` up front would make it zero,
+  and is not worth an over-sized first allocation on the evidence available.
 - **NOT removed: the uplink's one payload copy per byte.** `mux_dial_uplink`
   reads into a stack `chunk` and then `encode_into` copies that payload into the
   framing buffer, so the write side still makes one user-space pass. Removing it
