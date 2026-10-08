@@ -125,6 +125,18 @@ No artefact from this branch has been read.
     are identical either way — reverting to the copying form still passes the
     framing test, and that is the honest shape of this claim.
 
+  The server relay shared the same copy through `write_mux_frame`, which
+  `encode_into`d every Keep payload into a staging buffer on both the TCP
+  relay task and the UDP reader. It now takes the same header-plus-`writev`
+  path for any frame with a payload — the header is rebuilt per frame there
+  rather than hoisted, because the UDP reader's target varies per datagram —
+  and the `CHUNK_MAX` bound `encode_into` enforced moved with it, so an
+  oversize relay payload is still refused rather than truncated into the
+  two-byte length
+  (`a_relay_payload_longer_than_a_frame_is_refused_not_truncated`).
+  `relay-copies-per-byte-written 0` covers both relay directions through the
+  one pointer gate, and the TCP/UDP loopbacks pin the bytes on each path.
+
   **Two rows on this page were wrong and are corrected rather than kept.** Both
   `user-space-copies-per-byte-written 0` and `-read 1` named `ferrox-bench-gate-6`,
   which counts *allocations, bytes allocated and zero-fills* — not copies
