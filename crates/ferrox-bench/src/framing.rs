@@ -394,12 +394,15 @@ pub(crate) fn aead_report(rows: &[Row]) -> String {
          before either is timed. Best of {} rounds per side. The bar is the same {:.2}x as\n\
          gate 3.\n\
          \n\
-         The rows bracket the length at which the fused shape's head stops paying for\n\
-         itself: a head takes a lane of every pass it rides in, so a body that would fill\n\
-         whole passes pays one more of them, while the two-call shape pays a narrow\n\
-         dependent chain once. Both columns are printed at 2 KiB and 8 KiB as well as at\n\
-         the sizes a record has, so a threshold between them is read off four runners\n\
-         rather than guessed.\n",
+         The rows bracket the length at which the fused shape's head could stop paying\n\
+         for itself: a head takes a lane of every pass it rides in, so a body that fills\n\
+         whole passes could pay one more of them, while the two-call shape pays a narrow\n\
+         dependent chain once. Measured on all four runners of run `37763295337`, it does\n\
+         not: from 1 KiB up the two shapes read 0.98x-1.06x of each other on every runner\n\
+         and at every length, and the fused shape's win is where a pass is most of the\n\
+         call — 1.44x-1.75x at 64 bytes and 1.25x-1.54x at 256. The 0.96x at 16 KiB on\n\
+         macos aarch64 in run `37749274086` is one runner's noise and not a crossover, so\n\
+         no length threshold belongs in the seal.\n",
         crate::ROUNDS,
         crate::BAR
     );

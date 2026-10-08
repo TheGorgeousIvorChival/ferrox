@@ -306,6 +306,19 @@ pass plus a tail and the second a whole pass plus a one-block remainder. Gate
 in either run, so those rows — the 1.15x worst the run before this one carried
 at the same 256 bytes included — are the runner and not either change.
 
+Gate 7 measures the seal against the two-call shape it replaced, and for one
+run it carried a length at which the fused shape's head looked like it stopped
+paying for itself: a head takes a lane of every pass it rides in, so a body that
+fills whole passes pays one more of them, and run `37749274086` read 0.96x at
+16 KiB on macos `aarch64` — the one sub-1.00x row of the seal. Rows at 2 KiB and
+8 KiB were added to bracket it, and in run `37763295337` the crossover is not
+there on any runner: from 1 KiB up the two shapes read 0.98x-1.06x of each other
+at every length, on all four, and the fused shape's win is where a pass is most
+of the call — 1.44x-1.75x at 64 bytes, 1.25x-1.54x at 256 — so the 0.96x was
+one runner's noise and no length threshold belongs in the seal. That is a
+negative result the rows were added to be able to state, and the reason no
+dispatch sits in `aead.rs`.
+
 ## What we removed
 
 - **Thirteen stack moves a double round, and four operations a quarter round.**
