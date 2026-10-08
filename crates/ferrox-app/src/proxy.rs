@@ -9797,6 +9797,62 @@ mod tests {
     }
 
     #[test]
+    fn the_configured_carrier_owns_the_first_rung() {
+        let ladder = Ladder::new();
+        let unreachable = Failure::new(Stage::SocketConnected, Kind::Unreachable);
+        for rung in [
+            Rung::Raw,
+            Rung::Ws,
+            Rung::Xhttp,
+            Rung::Grpc,
+            Rung::HttpUpgrade,
+        ] {
+            assert_eq!(ladder.record_failure(rung, &unreachable), rung.next());
+        }
+        assert_eq!(ladder.current(), Rung::HttpUpgrade);
+        for (carrier, want) in [
+            (Carrier::Raw, Rung::Raw),
+            (
+                Carrier::Ws {
+                    path: "/t".to_owned(),
+                    ed: 0,
+                },
+                Rung::Ws,
+            ),
+            (
+                Carrier::Xhttp {
+                    path: "/t".to_owned(),
+                },
+                Rung::Xhttp,
+            ),
+            (
+                Carrier::Grpc {
+                    path: "/t".to_owned(),
+                },
+                Rung::Grpc,
+            ),
+            (
+                Carrier::HttpUpgrade {
+                    path: "/t".to_owned(),
+                },
+                Rung::HttpUpgrade,
+            ),
+            (
+                Carrier::HttpHeader {
+                    path: "/t".to_owned(),
+                },
+                Rung::Raw,
+            ),
+        ] {
+            assert_eq!(
+                ladder_start(&ladder, &carrier),
+                want,
+                "{carrier:?} lost the first rung to the ladder"
+            );
+        }
+    }
+
+    #[test]
     fn the_ladder_climbs_past_the_configured_rung_and_relays() {
         let server = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
