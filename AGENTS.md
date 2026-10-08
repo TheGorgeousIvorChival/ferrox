@@ -77,6 +77,25 @@ not call the slice complete.
   counter `read` snapshots and `wait_since` compares, so its delta *is* the
   wakeup count. Look for the quantity already lying around as state before
   writing a test that reconstructs it.
+- **A blessed count is a claim about a gate, so audit the gate before the code.**
+  Three rows on `main` were numbers nothing was checking: the VMess
+  four-frame batch was swept by a test whose longest input produced three frames,
+  its syscall row wrote into a `Vec` that cannot count syscalls, and the
+  xtls-vision allocation row named a gate that drives a different
+  implementation of the same framing. Before adding an optimisation to a file,
+  read the test the manifest row names and ask what it actually executes — a row
+  that has never been observed is worse than an `UNBLESSED` one, because it reads
+  as a number.
+- **A loopback test cannot gate a syscall count, and a scheduler-dependent count
+  is not a gate at all.** Drive the counter from an in-memory stream that always
+  answers the whole buffer, where the number is exact; assert only the bytes
+  over a real socket. `xhttp` does both, and the first attempt at a hard bound on
+  the real socket failed about one run in three because TCP segmentation moves
+  with the scheduler.
+- **Changing a read's granularity is a count change.** Reading a window instead of
+  a two-byte read removes a syscall *and* changes how many times the caller's
+  `Read::read` returns. Both are counted quantities in this tree, so both belong
+  on the page — see `carrier-xhttp read-syscalls-per-16KiB-chunk`.
 - **A rewrite that passes the test suite can still be a regression, so do the
   arithmetic on the case the tests do not reach.** Two on this branch looked
   like wins and were not, and the arithmetic found both without a benchmark.

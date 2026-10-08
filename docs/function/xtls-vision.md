@@ -45,7 +45,7 @@ graph TD
 | tls-buffers-inspected-before-the-switch | 8 | ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget |
 | user-space-copies-per-byte-while-framed | 2 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
-| staging-allocations-per-padded-buffer | 0 | ferrox-bench-gate-2 |
+| seal-open-staging-allocations | 0 | ferrox-bench-gate-2 |
 <!-- counts:end -->
 
 ## Ops
@@ -65,6 +65,23 @@ graph TD
 any allocation, any allocated byte and any zero-fill; the wall clock for this
 framing is not separately timed and no duration is quoted here. Allocation
 counts are deterministic and are gated; durations are not.
+
+One row on this page names a gate that does not cover it, and it is renamed
+rather than deleted so the claim stays true: `seal-open-staging-allocations 0`
+is `ferrox-bench-gate-2`, and gate 2 drives the **stateless**
+`vless::VisionSeal`/`vless::VisionOpen` pair in `ferrox-core`. That pair is a
+second, independent implementation of this framing. It shares nothing with
+`vision::Link` in `ferrox-app` — no `have`, no `out`, no `hat`/`oat`, no
+`tls.budget` filter, no `read_direct` — and the data path above is `Link`
+throughout.
+
+**`vision::Link` is under no allocation gate at all, and it allocates.** `Link::fill`
+does `self.have.reserve_exact(RELAY_BUFFER)` for 256 KiB and `out` starts at
+`Vec::new()` and grows to hold the decoded content, so a gate that drove `Link`
+would report at least one allocation on the first fill. No number is claimed for
+it here. The two rows beside the renamed one are properly gated: both
+`user-space-copies-per-byte-while-framed` and `-after-the-switch` name
+`the_framing_switch_ends_the_staging`, which really does drive `Link`.
 
 ## What we removed
 

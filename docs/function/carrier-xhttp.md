@@ -36,6 +36,10 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | framing-size-lines-without-an-allocation | 0 | ferrox-app-xhttp::tests::size_lines_match_format_without_allocating |
+| framing-read-syscalls-per-16KiB-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
+| framing-read-syscalls-per-16KiB-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
+| read-syscalls-per-16KiB-chunk | 2 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
+| framing-read-syscalls-per-16KiB-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
 | user-space-copies-per-byte-written | 1 | ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback |
 <!-- counts:end -->
 
@@ -53,6 +57,32 @@ graph TD
 **Not measured on this branch.** xHTTP scenarios run in
 `benchmark-matrix.yml` and `parity.yml`. No artefact from this branch has been
 read.
+
+- **A framing read syscall per chunk, and the second one was two bytes.** The
+  reader spent three reads per 16 KiB chunk: one to fetch the size line, one for
+  the body, and one `read_exact` for the two-byte CRLF that closes the chunk. The
+  CRLF read now fills a 128-byte window instead, and the bytes past the CRLF are
+  the *next* size line, which `read_line_into` then finds without asking the
+  socket again — so the framing reads amortise to one per chunk and the count is
+  `2 * chunks + 1`, measured: **33 reads for 16 chunks against 49** for the old
+  shape over the same loopback socket, with the payload byte-identical.
+
+  Two things this needed to get right, both of which the worst case caught
+  rather than the average:
+
+  - The window must be looped until two bytes are buffered. A first version took
+    one read and refused on `n < 2`, which a peer that segments the CRLF across
+    two packets would have hit. `a_trickling_stream_still_drains_whole` drives a
+    one-byte-per-read stream and is the gate for it.
+  - The exhausted prefix has to be **cleared** before the window lands in it. The
+    first version appended to the drained prefix and took the CRLF from stale
+    bytes, which broke four existing xHTTP tests immediately.
+
+  The count is gated by `a_chunk_costs_two_reads_not_three`, which drives an
+  in-memory stream that always answers the whole buffer — so the count is exact
+  and deterministic. A real socket may segment, so
+  `a_real_socket_drains_the_same_bytes` asserts only the bytes and bounds the
+  count loosely; a scheduler-dependent number is not a gate.
 
 ## What we removed
 

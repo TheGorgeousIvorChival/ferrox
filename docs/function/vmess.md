@@ -71,6 +71,27 @@ Poly1305 rungs it shares — one absorb per padded section, no empty absorb at
 either end of a record, no head recursion into the dispatch on a 64-byte-aligned
 frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
 
+- **Two rows this page claims were not being checked at all.** The gate for
+  `frames-per-write-syscall 4` and `write-syscalls-per-32KiB-relay-read 1` swept
+  payload lengths that topped out at `3 * MAX_PLAIN` — which is **three** frames.
+  The fourth iteration of `stage_frames`' loop was never entered by any test, so
+  the number 4 was unobserved; and the sink was a `Vec`, which cannot tell one
+  `write` from four, so the syscall row had no counter behind it either. The
+  sweep now runs to `4 * MAX_PLAIN - 1`, `4 * MAX_PLAIN` and `READ_PLAIN`, and
+  writes into a `CountingWriter`, so both rows are observed rather than assumed.
+  Nothing about the frames changed; only what the test can see.
+- **A silent truncation that the same gap was hiding.** `stage_frames` staged at
+  most `FRAMES_PER_WRITE` frames and, if the read was wider, exited its loop with
+  bytes left and returned `true` — a truncated frame sequence on the wire, with
+  no assertion anywhere. `pump_relay` clamps to `READ_PLAIN`, which equals the
+  batch bound, so nothing reaches it today; but the two expressions that have to
+  agree were checked by nobody, and raising `FRAMES_PER_WRITE` without raising
+  `READ_PLAIN` would have dropped the tail of every relay read over 32 KiB.
+  `stage_frames` now refuses instead, and
+  `a_read_wider_than_one_batch_is_refused_not_truncated` gates that: it drives
+  `READ_PLAIN + 1` and `READ_PLAIN + MAX_PLAIN`, requires `false`, and requires
+  that **nothing** reached the sink.
+
 ## What we removed
 
 - **A frame buffer per relay write.** `frames_reuse_the_callers_buffers` is the
