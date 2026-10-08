@@ -933,3 +933,19 @@ The TLS dial covers raw and every framed carrier with one attempt on the configu
 
 Each of those is its own proof: a loopback pair in each direction per row, the way the carried rows earned theirs, and each row joins the suite command only with its own passing run. A row that dials because its refusal was deleted is the failure this slice exists to prevent.
 ```
+
+## P45 · Take the unreachable two-lane Poly1305 rung out of the aarch64 ladder
+
+**When to use:** When a rung of `Poly1305::absorb` cannot be entered: `TWO_LANE_THRESHOLD_BYTES` and `NEON4_THRESHOLD_BYTES` are both 1 024 and the four-block rung is tested first, so `absorb_two_lane` runs only where a test calls it by name.
+**Status:** todo
+**Leverage:** 2
+**Effort:** small
+**Gates:** `cargo test --workspace`; CI: `ci.yml` green on all three runners, and `bench.yml` gate 7b's and 7c's `aarch64` rows unmoved
+**Touches:** crates/ferrox-core/src/poly1305.rs, docs/function/record-layer.md
+**Random weight:** 2
+
+```text
+`89f9714` moved `NEON4_THRESHOLD_BYTES` from 4 096 down to 1 024, where `TWO_LANE_THRESHOLD_BYTES` already sat, because the four-block rung's fixed cost is repaid by then. `absorb` tests the four-block rung first, so every slice of 1 024 bytes or more reaches `absorb_neon4`, and `absorb_two_lane` — a whole second four-lane Horner step, its own pair of `q`/`qs` powers and its own tail walk — is reachable only from the test that calls it directly. A rung that cannot run is not a threshold to tune later; it is a second way of doing something the tree keeps a claim about, and the page carried that claim ("the shipping ladders are `{128 stride-2, 1024 two-lane, 4096 NEON-4}`") until the threshold was corrected there.
+
+Decide which rung the window between 1 KiB and 4 KiB wants, and if it is the four-block one, delete `absorb_two_lane`, its threshold, its dispatch arm and the test that calls it by name. The alternative is to move the four-block rung back above 4 096 and re-measure the window, which needs a `bench.yml` comparison to be worth its cost. Either way each architecture is left with the rungs it can enter, and no reader has to decide whether a threshold that cannot fire is a design or a leftover.
+```

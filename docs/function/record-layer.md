@@ -418,11 +418,23 @@ What is **not** removed, and is named rather than claimed:
   harness — but `every_threshold_reaches_the_same_tag_from_both_sides` sweeps it
   as a shipping threshold and `the_neon_halves_are_the_three_limbs_at_every_length_around_the_threshold`
   gates on it. A reader of those two tests believes a shorter aarch64 rung ships.
-  It does not. The shipping ladders are `{128 stride-2, 1024 two-lane, 4096
-  NEON-4}` on aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64, so any page
-  that quotes a threshold has to say which architecture it means — the two do
-  not agree, and the x86 AVX2 rung moved to 1 KiB in `815eeb2` because its
-  fixed setup cost is repaid by then.
+  It does not. The shipping ladders are `{128 stride-2, 1024 NEON-4}` on
+  aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64, so any page that quotes a
+  threshold has to say which architecture it means — the two do not agree, and
+  each four-lane rung moved to 1 KiB where the other's gate sits: the AVX2 one
+  in `815eeb2` because its fixed setup cost is repaid by then, and the NEON-4
+  one in `89f9714` on the same measurement, taken again after the four blocks'
+  limbs came out of one `TBL4` a group.
+
+  **The two-lane rung below the four-lane one is unreachable, and this page
+  said otherwise until the line above was corrected.** `89f9714` moved
+  `NEON4_THRESHOLD_BYTES` down to `TWO_LANE_THRESHOLD_BYTES` at 1 024 and
+  `absorb` tests the four-lane rung first, so on `aarch64` every slice of 1 024
+  bytes or more reaches `absorb_neon4` and `absorb_two_lane` is entered by the
+  test at `poly1305.rs:1553` and by nothing else. The `4096` this page quoted
+  for NEON-4 was the reading that made the ladder look like three rungs on
+  `aarch64`; the code has two, and the dead one is a slice in the roadmap
+  rather than a threshold to tune here.
 
   This also bounds what the ladder-head guards on the four-lane rungs can
   assume: the head is `e = blocks % 4` blocks, so at most 48 bytes, and the
