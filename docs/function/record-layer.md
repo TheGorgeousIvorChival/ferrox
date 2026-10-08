@@ -12,7 +12,10 @@ cannot disagree with another about the algorithm — it can only be slower. The
 portable backend is safe Rust, which is what lets Miri interpret the ladder at
 all; the SIMD backends are five instructions each whose only failure mode is a
 wrong answer, and a wrong answer is caught by a differential test before any
-timing runs.
+timing runs. Above the ladder sit the passes — `chacha::soa` on `aarch64` and
+`chacha::wide` over `chacha::avx512` on `x86_64` — and those are one body over a
+wider trait rather than one body over a wider register, for the reason the
+section below counts out.
 
 Above 512 bytes on aarch64 a fifth implementation takes over, `chacha::soa`: it
 gives a register one *word* of eight blocks instead of one row of one block, so
@@ -37,6 +40,48 @@ byte for byte at every length to 1032 bytes and at four start counters, head and
 headless, and gate 1 asserts the same bytes against the pinned `chacha20` crate
 before gate 3 times anything.
 
+Above 1024 bytes on `x86_64`, when the machine has both `avx512f` and `avx2`,
+one more pass takes over before that one: `chacha::wide`, the sixteen-block pass,
+instantiated over `__m512i` in `chacha::avx512`. It exists for two reasons that
+are counts and not tastes. The first is the register file.
+
+```bash
+CARGO_TARGET_DIR=/tmp/xtarget cargo rustc --release --target x86_64-apple-darwin \
+  -p ferrox-core --lib -- --emit=asm -C debuginfo=0
+# then read the round loop of `ferrox_core6chacha6avx210xor_blocks`
+# and of `ferrox_core6chacha6avx51210xor_blocks`: `decl`/`jne` close each.
+```
+
+The AVX2 pass's round loop body is **143 instructions a double round for eight
+blocks**: 128 operations, thirteen `vmovdqa` to and from the frame, and the
+loop's own two. Sixteen live state words fill a sixteen-register file, so the
+temporaries a rotate by twelve and a rotate by seven need come out of memory;
+`avx512f` has thirty-two registers and `vprold`, which makes all four rotations
+one instruction. Its loop body is **98 instructions for sixteen blocks**: 96
+operations and the loop's two, with no stack operand anywhere inside it. Per byte
+of keystream the rounds cost 2.79 instructions against 0.96, and that is the
+number the pass below 1024 bytes is measured against. The transpose is the other
+half of the trade and it also comes out ahead: sixty-four gathers for sixteen
+blocks, four a block, against the forty-eight the AVX2 pass's four 12-instruction
+transposes spend on eight — six a block for the same permutation, because a
+gather can move a 32-bit element across the whole register where an unpack
+network moves 128-bit lanes twice.
+
+Those instructions are the assembler's and not the clock's, which is why they
+can be counted for a target this machine cannot run. The equality cannot: the
+pass is instantiated a second time over sixteen `u32` in the same module, and
+`chacha::wide::tests::the_portable_pass_is_the_ladder_at_every_length` holds that
+instantiation to `portable::U4` at every length to 2072 bytes, four start
+counters, head and headless — the counter lanes, the diagonal, the index network
+and the head, all of it on the machine reading this. What is left to a machine
+with AVX-512 is the one instruction that applies the index network, and
+`chacha::avx512::tests::the_sixteen_block_pass_is_the_ladder_at_every_length` is
+that check on the two `x86_64` runners of `bench.yml` — both of which report
+`avx512f` in the machine line of every run quoted under `## Time` — and in the
+`x86_64` job of `ci.yml`, which runs the same test. A machine without `avx512f`
+neither reaches the code nor runs the test, and the report says which one it is:
+`ferrox_core::chacha_backend()` names the pass the dispatch found.
+
 `fill_exact_with_head` is the interesting entry point. ChaCha20-Poly1305 needs
 block 0 as the Poly1305 one-time key and blocks 1.. as the payload keystream,
 and a naive seal generates block 0, throws away 32 of its bytes, generates
@@ -50,7 +95,15 @@ discards nothing.
 ```mermaid
 graph TD
     A["fill_exact_with_head, len bytes"] --> B["base_state: constants,<br/>key, nonce, counter 0"]
-    B -->    C{"a wide target, and 512 bytes or more?"}
+    B --> Z0{"x86_64 with avx512f, and 1024 bytes or more?"}
+    Z0 -- yes --> Z["16 broadcasts, one word per register,<br/>the sixteen blocks in the lanes"]
+    Z --> ZT["10 double rounds over all sixteen,<br/>the diagonal is a register rename"]
+    ZT --> ZU["add the base back, then four index stages:<br/>each swaps one bit of the register name<br/>with one bit of the lane"]
+    ZU --> ZV["xor a whole block at a time<br/>into the caller's buffer,<br/>sixteen blocks a pass"]
+    ZV --> ZW{"another whole pass?"}
+    ZW -- yes --> Z
+    ZW -- no --> C{"a wide target, and 512 bytes or more?"}
+    Z0 -- no --> C
     C -- yes --> S["16 broadcasts, one word per register:<br/>aarch64 keeps two sets of four,<br/>x86_64 one set of eight, the blocks in the lanes"]
     S --> T["10 double rounds over every set,<br/>the diagonal is a register rename"]
     T --> U["add the base back,<br/>transpose one row of eight blocks"]
@@ -84,8 +137,9 @@ graph TD
 | zero-filled-bytes-per-fill | 0 | ferrox-bench-gate-2 |
 | blocks-per-byte | 1/64 | ferrox-bench-gate-2 |
 | blocks-per-iteration | 8 | ferrox-core-chacha::backend |
+| blocks-per-iteration-on-avx512 | 16 | ferrox-core-chacha::backend |
 | fused-head-blocks | 1 | ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted |
-| backends-a-differential-test-cannot-lie-to | 5 | ferrox-bench-gate-1 |
+| backends-a-differential-test-cannot-lie-to | 6 | ferrox-bench-gate-1 |
 <!-- counts:end -->
 
 ## Ops
@@ -215,6 +269,15 @@ own groups — 320 bytes reads 1.47x (185 ns) in the pass's run against 1.48x
 
 ## What we removed
 
+- **Thirteen stack moves a double round, and four operations a quarter round.**
+  `vprold` makes all four of a quarter round's rotations one instruction where
+  `avx2` spends a shift, a shift and an or on each of the two that are not byte
+  moves, and the thirty-two-register file holds sixteen live state words with
+  room for the temporaries that a sixteen-register file has to send to the frame:
+  the AVX2 pass's round loop body is 143 instructions for eight blocks, thirteen
+  of them `vmovdqa` against the frame, and the AVX-512 pass's is 98 for sixteen
+  blocks — 96 operations and no stack operand at all. Per byte of keystream,
+  2.79 instructions against 0.96.
 - **Six lane permutations a double round a block on `aarch64`, and ten
   single-cycle shuffles a double round a state on `x86_64`.** Both lane layouts
   diagonalise by rotating the lane order of the row registers: `neon::N4`
@@ -328,6 +391,22 @@ What is **not** removed, and is named rather than claimed:
   guards may call `absorb_one_block_chain` directly instead of going back
   through `absorb` — a 48-byte slice can never reach another rung, so there is
   no dispatch to skip.
+- **The sixteen-block pass is checked by the runners, not here.** Nothing this
+  repository builds on can execute `avx512f` without a machine that has it, so
+  `chacha::avx512::Z16` is not run on the machine reading this — not under an
+  emulator either, since neither Rosetta nor anything else in this tree decodes
+  an `EVEX` prefix. The pass's *shape* is checked everywhere: `chacha::wide`
+  carries the same body over sixteen `u32`, and the differential test beside it
+  holds that instantiation to `portable::U4` at every length to 2072 bytes and
+  four start counters, head and headless. What is left to a machine with
+  AVX-512 is one instruction — the gather whose `idx & 0x10` bit picks the
+  source register — so the honest split is: the index table is proved a
+  transpose here, the pass over it is proved the ladder here, and the one
+  instruction that applies it is proved on the two `x86_64` runners of
+  `bench.yml` and in the `x86_64` job of `ci.yml`. If no runner carried
+  `avx512f`, the test would still return without testing anything, which is why
+  the machine line of each run quoted under `## Time` is quoted beside the
+  number: the claim is a claim about those machines.
 - **`ops-retired-instructions` is still `UNBLESSED` on every page.** One symbol
   in this repository carries a blessed exact count, `der_to_pem`. The removed
   operations named above are counted in the table — copies, allocations, passes,

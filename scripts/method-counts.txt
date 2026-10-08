@@ -20,8 +20,9 @@ record-layer allocations-per-fill 0 ferrox-bench-gate-2
 record-layer zero-filled-bytes-per-fill 0 ferrox-bench-gate-2
 record-layer blocks-per-byte 1/64 ferrox-bench-gate-2
 record-layer blocks-per-iteration 8 ferrox-core-chacha::backend
+record-layer blocks-per-iteration-on-avx512 16 ferrox-core-chacha::backend
 record-layer fused-head-blocks 1 ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted
-record-layer backends-a-differential-test-cannot-lie-to 5 ferrox-bench-gate-1
+record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 
 # --- Shadowsocks AEAD -------------------------------------------------------
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh

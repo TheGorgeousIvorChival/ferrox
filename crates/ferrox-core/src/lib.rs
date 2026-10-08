@@ -28,6 +28,6 @@ pub fn active_backends() -> &'static [&'static str] {
     &["rustls"]
 }
 
-pub const fn chacha_backend() -> &'static str {
+pub fn chacha_backend() -> &'static str {
     crate::chacha::backend()
 }

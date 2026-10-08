@@ -5,6 +5,8 @@
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 #[cfg(not(target_arch = "x86_64"))]
 mod calibrate;
 #[cfg(target_arch = "aarch64")]
@@ -14,6 +16,8 @@ mod portable;
 mod soa;
 #[cfg(target_arch = "x86_64")]
 mod sse2;
+#[cfg(any(target_arch = "x86_64", test))]
+mod wide;
 
 pub(crate) trait Lanes: Copy {
     const LANES: usize;
@@ -345,7 +349,9 @@ pub(crate) fn xor_blocks(
     head: Option<&mut [u8; 32]>,
     buf: &mut [u8],
 ) -> u32 {
-    if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx2") {
+        unsafe { avx512::xor_blocks(key, nonce, start, head, buf) }
+    } else if std::is_x86_feature_detected!("avx2") {
         unsafe { avx2::xor_blocks(key, nonce, start, head, buf) }
     } else {
         xor_ladder::<portable::U4>(key, nonce, start, head, buf)
@@ -403,11 +409,16 @@ type Wide = neon::N4;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 type Wide = portable::U4;
 
-pub const fn backend() -> &'static str {
+pub fn backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        match (GROUP_STATES, GROUP_STATES * <avx2::A8 as Lanes>::CHUNKS) {
-            (4, 8) => {
+        let wide =
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx2");
+        match (GROUP_STATES, GROUP_STATES * <avx2::A8 as Lanes>::CHUNKS, wide) {
+            (4, 8, true) => {
+                "4-lane core: AVX-512, one word per register, 16 blocks a pass, the eight-block pass below a pass, at runtime-detected width"
+            }
+            (4, 8, false) => {
                 "4-lane core: AVX2, 4 states in flight, 8 blocks per iteration, at runtime-detected width"
             }
             _ => "x86_64: a width this build does not have",
