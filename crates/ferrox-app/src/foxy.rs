@@ -679,7 +679,6 @@ impl H3 {
             deadline: Instant::now(),
             quantum: None,
         };
-        lane.control()?;
         let status = lane.request(target, &dial.pass.token)?;
         opened(status)?;
         Ok(lane)
@@ -692,31 +691,24 @@ impl H3 {
         Some(out)
     }
 
-    /// The client's QPACK streams, opened alongside control: a strict peer
-    /// waits for the encoder and the decoder before it answers anything.
-    /// All three streams stay open: closing a critical stream kills the
-    /// connection.
-    const QPACK_ENCODER: u64 = 6;
-    const QPACK_DECODER: u64 = 10;
-
-    /// The control stream carries the stream type plus one complete SETTINGS
-    /// frame: no dynamic table (the QPACK below is literal-only), no blocked
+    /// The HTTP/3 opening one fresh connection carries exactly once: control
+    /// with a complete SETTINGS frame plus the QPACK encoder and decoder
+    /// hellos. No dynamic table (the QPACK below is literal-only), no blocked
     /// streams, classic CONNECT. A truncated SETTINGS is a peer that waits
-    /// forever, which is what the previous shape was.
-    fn control(&mut self) -> Result<(), Failure> {
-        let mut opening = Vec::with_capacity(16);
-        frames::quic_varint(&mut opening, 0x00);
+    /// forever; a second control stream is a connection error. Neither the
+    /// opening nor any of the three streams is ever finished.
+    pub(crate) fn h3_opening() -> [(u64, Vec<u8>); 3] {
+        let mut control = Vec::with_capacity(16);
+        frames::quic_varint(&mut control, 0x00);
         let settings = [0x01u8, 0x00, 0x07, 0x00, 0x08, 0x00];
-        frames::quic_varint(&mut opening, 0x04);
-        frames::quic_varint(&mut opening, settings.len() as u64);
-        opening.extend_from_slice(&settings);
-        self.send(CONTROL_STREAM, &opening, false)?;
-        for (stream, kind) in [(Self::QPACK_ENCODER, 0x02u64), (Self::QPACK_DECODER, 0x03)] {
-            let mut hello = Vec::with_capacity(2);
-            frames::quic_varint(&mut hello, kind);
-            self.send(stream, &hello, false)?;
-        }
-        Ok(())
+        frames::quic_varint(&mut control, 0x04);
+        frames::quic_varint(&mut control, settings.len() as u64);
+        control.extend_from_slice(&settings);
+        let mut encoder = Vec::with_capacity(2);
+        frames::quic_varint(&mut encoder, 0x02);
+        let mut decoder = Vec::with_capacity(2);
+        frames::quic_varint(&mut decoder, 0x03);
+        [(CONTROL_STREAM, control), (6, encoder), (10, decoder)]
     }
 
     fn request(&mut self, target: &str, bearer: &str) -> Result<u16, Failure> {

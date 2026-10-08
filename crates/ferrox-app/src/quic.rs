@@ -301,6 +301,23 @@ pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &UdpSocket) {
     }
 }
 
+/// The HTTP/3 opening one fresh connection carries exactly once, before any
+/// request stream: a second control stream is a connection error, so this
+/// lives at establishment time rather than per flow.
+pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &UdpSocket) -> bool {
+    for (stream, payload) in crate::foxy::H3::h3_opening() {
+        let mut rest = &payload[..];
+        while !rest.is_empty() {
+            match conn.stream_send(stream, rest, false) {
+                Ok(0) | Err(_) => return false,
+                Ok(wrote) => rest = &rest[wrote..],
+            }
+        }
+    }
+    flush_egress(conn, sock);
+    true
+}
+
 pub(crate) fn pump_once(
     conn: &mut quiche::Connection,
     sock: &UdpSocket,
@@ -969,7 +986,9 @@ fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
         let Some(mut conn) = handshake(&sock, peer, local, &dial.host, roots) else {
             continue;
         };
-        flush_egress(&mut conn, &sock);
+        if !send_h3_opening(&mut conn, &sock) {
+            continue;
+        }
         let shared = Arc::new(Mutex::new(conn));
         let table = Arc::new(Mutex::new(PooledState {
             sessions: HashMap::new(),
@@ -1012,7 +1031,9 @@ pub(crate) fn direct_stream(
 ) -> Option<PooledStream> {
     let (sock, peer, local) = udp_to_server(address, port)?;
     let mut conn = handshake(&sock, peer, local, host, roots)?;
-    flush_egress(&mut conn, &sock);
+    if !send_h3_opening(&mut conn, &sock) {
+        return None;
+    }
     Some((
         std::sync::Arc::new(std::sync::Mutex::new(conn)),
         std::sync::Arc::new(sock),
