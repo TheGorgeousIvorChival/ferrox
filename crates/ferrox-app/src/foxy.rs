@@ -133,11 +133,12 @@ fn opened(status: u16) -> Result<(), Failure> {
     }
 }
 
-fn read_exact<S: Read>(io: &mut S, buf: &mut [u8]) -> Result<(), ()> {
+fn read_exact<S: Read>(io: &mut S, buf: &mut [u8]) -> std::io::Result<()> {
     let mut at = 0usize;
     while at < buf.len() {
         match io.read(&mut buf[at..]) {
-            Ok(0) | Err(_) => return Err(()),
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Err(error) => return Err(error),
             Ok(read) => at += read,
         }
     }
@@ -164,7 +165,7 @@ fn head<S: Read>(io: &mut S) -> Result<Vec<u8>, Failure> {
         if head.len() >= MAX_HEAD {
             return Err(Failure::Frame);
         }
-        read_exact(io, &mut byte).map_err(|()| Failure::Stream)?;
+        read_exact(io, &mut byte).map_err(|_| Failure::Stream)?;
         head.push(byte[0]);
     }
     Ok(head)
@@ -248,33 +249,40 @@ pub(crate) struct Tls2 {
 
 /// One frame off the wire: the header, and the payload in the buffer the caller
 /// owns, because a field cannot be borrowed and written in the same match.
+/// A socket timeout keeps its kind so a relay can tell an idle quantum from a
+/// dead peer; anything else is a corrupt frame either way.
 fn read_frame(
     tls: &mut ferrox_core::tls::RustlsProvider<TcpStream>,
     out: &mut Vec<u8>,
     max_frame: usize,
-) -> Result<frames::H2Frame, Failure> {
+) -> std::io::Result<frames::H2Frame> {
     let mut header = [0u8; frames::H2_HEADER];
-    read_exact(tls, &mut header).map_err(|()| Failure::Stream)?;
-    let frame = frames::H2Frame::parse(&header).ok_or(Failure::Frame)?;
+    read_exact(tls, &mut header)?;
+    let frame = frames::H2Frame::parse(&header)
+        .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
     crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
-    read_exact(tls, out).map_err(|()| Failure::Stream)?;
+    read_exact(tls, out)?;
     Ok(frame)
 }
 
 impl Tls2 {
+    pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
+        self.tls.get_ref().set_read_timeout(Some(quantum))
+    }
+
     /// Reads one frame, hands it to `body` with the payload borrowed, and puts
     /// the buffer back: the frame is handled while the lane owns it.
     fn with_frame<R>(
         &mut self,
         body: impl FnOnce(&mut Self, frames::H2Frame, &[u8]) -> R,
-    ) -> Result<R, Failure> {
+    ) -> std::io::Result<R> {
         let mut payload = std::mem::take(&mut self.out);
         let frame = read_frame(&mut self.tls, &mut payload, self.max_frame);
         let out = match frame {
             Ok(frame) => body(self, frame, &payload),
-            Err(failure) => {
+            Err(error) => {
                 self.out = payload;
-                return Err(failure);
+                return Err(error);
             }
         };
         self.out = payload;
@@ -318,34 +326,36 @@ impl Tls2 {
         let deadline = Instant::now() + HEADER_TIMEOUT;
         let mut block = Vec::with_capacity(64);
         while Instant::now() < deadline {
-            let status = self.with_frame(|lane, frame, payload| {
-                match frames::h2_event(frame, payload, 1) {
-                    frames::H2Event::Headers { block: more, .. } => {
-                        block.extend_from_slice(more);
-                        hpack::hpack_status(&block).map(Some).ok_or(Failure::Frame)
-                    }
-                    frames::H2Event::Settings { ack: false, .. } => {
-                        let mut at = 0usize;
-                        while let Some((id, value)) = frames::setting(payload, at) {
-                            match id {
-                                4 => lane.window.reset_stream(value),
-                                5 => lane.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
-                                _ => {}
-                            }
-                            at += 6;
+            let status = self
+                .with_frame(
+                    |lane, frame, payload| match frames::h2_event(frame, payload, 1) {
+                        frames::H2Event::Headers { block: more, .. } => {
+                            block.extend_from_slice(more);
+                            hpack::hpack_status(&block).map(Some).ok_or(Failure::Frame)
                         }
-                        lane.ack(frames::SETTINGS, &[]).map(|()| None)
-                    }
-                    frames::H2Event::Ping { ack: false, .. } => {
-                        lane.ack(frames::PING, payload).map(|()| None)
-                    }
-                    frames::H2Event::Push => lane.refuse_push().map(|()| None),
-                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
-                        Err(Failure::Stream)
-                    }
-                    _ => Ok(None),
-                }
-            })??;
+                        frames::H2Event::Settings { ack: false, .. } => {
+                            let mut at = 0usize;
+                            while let Some((id, value)) = frames::setting(payload, at) {
+                                match id {
+                                    4 => lane.window.reset_stream(value),
+                                    5 => lane.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
+                                    _ => {}
+                                }
+                                at += 6;
+                            }
+                            lane.ack(frames::SETTINGS, &[]).map(|()| None)
+                        }
+                        frames::H2Event::Ping { ack: false, .. } => {
+                            lane.ack(frames::PING, payload).map(|()| None)
+                        }
+                        frames::H2Event::Push => lane.refuse_push().map(|()| None),
+                        frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                            Err(Failure::Stream)
+                        }
+                        _ => Ok(None),
+                    },
+                )
+                .map_err(|_| Failure::Stream)??;
             if let Some(status) = status {
                 return Ok(status);
             }
@@ -424,13 +434,22 @@ impl Read for Tls2 {
                     _ => Ok(()),
                 }
             });
-            read.map_err(io)??;
+            read??;
         }
     }
 }
 
 /// The HTTP/1.1 relay: bytes in, bytes out, once the status has been read.
 pub(crate) struct Tls1(pub(crate) ferrox_core::tls::RustlsProvider<TcpStream>);
+
+/// Bounds one blocking read so a relay holding one lock for both directions
+/// can interleave: the backward read returns `WouldBlock` within the quantum
+/// instead of holding the lock while no bytes arrive.
+impl Tls1 {
+    pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
+        self.0.get_ref().set_read_timeout(Some(quantum))
+    }
+}
 
 impl Write for Tls1 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -477,9 +496,18 @@ pub(crate) struct H3 {
     inbox: Vec<u8>,
     fin: bool,
     deadline: Instant,
+    /// Bounds one blocking `Read::read` the way the socket timeout bounds the
+    /// TCP carriers: unset reads until a DATA payload arrives, set returns
+    /// `WouldBlock` after the quantum with no payload so a relay holding one
+    /// lock for both directions can interleave.
+    quantum: Option<Duration>,
 }
 
 impl H3 {
+    pub(crate) fn set_read_quantum(&mut self, quantum: Duration) {
+        self.quantum = Some(quantum);
+    }
+
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Quic) -> Result<Self, Failure> {
         let (shared, sock, local, stream) = quic;
         let mut lane = Self {
@@ -495,6 +523,7 @@ impl H3 {
             inbox: Vec::new(),
             fin: false,
             deadline: Instant::now(),
+            quantum: None,
         };
         lane.control()?;
         let status = lane.request(target, &dial.pass.token)?;
@@ -674,6 +703,7 @@ impl Read for H3 {
     /// frames, because a frame header read as payload is a tunnel that carries
     /// its own framing into every byte after it.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let started = Instant::now();
         loop {
             if self.at < self.carry.len() {
                 let take = buf.len().min(self.carry.len() - self.at);
@@ -687,6 +717,12 @@ impl Read for H3 {
             }
             if self.fin {
                 return Ok(0);
+            }
+            if self
+                .quantum
+                .is_some_and(|quantum| started.elapsed() >= quantum)
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             self.deadline = Instant::now() + HEADER_TIMEOUT;
             let room = H3_WINDOW - self.head.len();
@@ -785,6 +821,20 @@ impl Tunnel {
             // `auto` is expanded by the caller into the carriers it prefers; an
             // unexpanded one here is a bug, and the answer is not a downgrade.
             (Carrier::Auto, _) => Err(Failure::Frame),
+        }
+    }
+
+    /// Bounds one blocking read on every carrier, so a relay sharing one lane
+    /// between its two directions stops holding its lock while idle: reads past
+    /// the quantum answer `WouldBlock` and the relay retries instead of wedging.
+    pub(crate) fn set_read_quantum(&mut self, quantum: Duration) -> std::io::Result<()> {
+        match self {
+            Self::H1(lane) => lane.set_read_quantum(quantum),
+            Self::H2(lane) => lane.set_read_quantum(quantum),
+            Self::H3(lane) => {
+                lane.set_read_quantum(quantum);
+                Ok(())
+            }
         }
     }
 }
@@ -1127,6 +1177,57 @@ mod loopback {
         hpack::hpack_connect("example.com:443", "the-pass", &mut want);
         assert_eq!(block, want, "the edge reads the same block the lane wrote");
         round_trip(&mut tunnel);
+    }
+
+    #[test]
+    fn the_shared_lane_carries_both_directions_at_once() {
+        const BIG: usize = 256 * 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let _edge = h2_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(50))
+            .expect("bounds one read");
+        let lane = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+        let sent: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let forward = std::sync::Arc::clone(&lane);
+        let chunk = sent.clone();
+        std::thread::spawn(move || {
+            let mut at = 0usize;
+            while at < chunk.len() {
+                match forward.lock().expect("locks").write(&chunk[at..]) {
+                    Ok(0) => std::thread::sleep(Duration::from_millis(5)),
+                    Ok(wrote) => at += wrote,
+                    Err(error) => panic!("the write failed: {error}"),
+                }
+            }
+            done_tx.send(()).expect("reports");
+        });
+        let mut back = vec![0u8; BIG];
+        let mut at = 0usize;
+        while at < BIG {
+            match lane.lock().expect("locks").read(&mut back[at..]) {
+                Ok(0) => panic!("the echo ended early"),
+                Ok(read) => at += read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("the echo failed: {error}"),
+            }
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("both directions flow at once");
+        assert_eq!(back, sent);
     }
 
     #[test]

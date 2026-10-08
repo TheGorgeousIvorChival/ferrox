@@ -1,0 +1,105 @@
+name: Foxy relay (live download check)
+
+# Proves the `foxy` lane carries bytes, not just handshakes: it starts
+# `ferrox-app` with a socks->foxy config on a clean runner, pins the exit
+# country, downloads a real 1 MB file through the tunnel and asserts the exact
+# byte count, plus the exit country off the Cloudflare trace. The loopback
+# tests prove framing against a local edge; only this job proves the relay
+# moves bytes against the real one.
+#
+# Needs repository secrets like foxy-live.yml does: FOXY_EMAIL and FOXY_PASS
+# (or USERNAME and PASSWORD). Without them the job skips cleanly. Quota cost
+# is ~1 MB per run, so this fires on lane changes and on demand, not per push.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/foxy-relay.yml
+      - crates/ferrox-app/**
+      - crates/ferrox-core/src/foxy/**
+  workflow_dispatch:
+    inputs:
+      country:
+        description: country code to pin the dial at
+        required: false
+        default: US
+
+permissions:
+  contents: read
+
+env:
+  NO_PROXY: 127.0.0.1,localhost
+
+jobs:
+  foxy-relay:
+    name: Foxy relay live (exit country + 1 MB download)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check secrets present
+        id: secrets
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+        run: |
+          if [ -z "$FOXY_EMAIL" ] || [ -z "$FOXY_PASS" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::the account secrets are missing; skipping the live relay check."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: foxy-relay
+      - name: Build ferrox-app
+        if: steps.secrets.outputs.present == 'true'
+        run: cargo build --locked -p ferrox-app
+      - name: Start socks->foxy on 127.0.0.1:10808
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+          FOXY_DEBUG: 1
+        run: |
+          python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":10808}],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"country":os.environ["FOXY_COUNTRY"],"carrier":"auto"}}]}, open("foxy-relay.json","w"))'
+          chmod 600 foxy-relay.json
+          echo "country=$FOXY_COUNTRY" >> "$GITHUB_ENV"
+          ./target/debug/ferrox-app run -c foxy-relay.json > ferrox-relay.log 2>&1 &
+          echo "$!" > ferrox-relay.pid
+      - name: Download a real file through the tunnel
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          # The first flow pays for sign-in, catalogue and edge dial, so the
+          # trace is retried; a lane that never answers fails here, loudly.
+          for i in $(seq 1 24); do
+            if curl -sS --max-time 30 --socks5-hostname 127.0.0.1:10808 \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt; then
+              break
+            fi
+            sleep 20
+          done
+          grep -E '^(loc|ip)=' trace.txt
+          grep -qx "loc=${country:?}" trace.txt
+          curl -sS --max-time 300 --socks5-hostname 127.0.0.1:10808 \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o file.bin
+          test "$(wc -c < file.bin)" = 1000000
+          sha256sum file.bin
+      - name: Stop the lane and show its log
+        if: always() && steps.secrets.outputs.present == 'true'
+        run: |
+          kill "$(cat ferrox-relay.pid)" 2>/dev/null || true
+          echo "== ferrox relay log (edges, carriers, relay totals; no secrets) =="
+          tail -n 60 ferrox-relay.log
+      - name: Summarise
+        if: always() && steps.secrets.outputs.present == 'true'
+        run: |
+          {
+            echo "### Foxy relay, live"
+            echo
+            echo "Exit country off the tunnel's Cloudflare trace, plus a real"
+            echo "1 MB download through the tunnel with its exact byte count"
+            echo "and SHA-256 above. The log names the edge, the carrier that"
+            echo "answered, and per-flow relay totals."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -4150,6 +4150,22 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
     });
 }
 
+/// Temporary live-lane tracing behind `FOXY_DEBUG`: edge, carrier and outcome
+/// per dial, so a stall names where it stopped instead of timing out silently.
+fn debug_lane(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier, what: &str) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: {} {:?} {what}", edge.authority(), carrier);
+    }
+}
+
+/// Temporary relay totals behind `FOXY_DEBUG`: which direction ended, after how
+/// many bytes, and on what error kind.
+fn debug_relay(direction: &str, moved: u64, error: Option<std::io::ErrorKind>) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: relay {direction} ended after {moved} B on {error:?}");
+    }
+}
+
 fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
     if foxy
         .unauthenticated
@@ -4207,6 +4223,7 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
             let stream = quic.as_ref().map(|(_, _, _, id)| *id);
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
                 Ok(mut tunnel) => {
+                    debug_lane(&edge, carrier, "opened");
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     if client.write_all(&foxy_socks_reply(0)).is_err() {
@@ -4215,6 +4232,10 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
                     if !foxy_exit_agrees(&mut tunnel, foxy) {
                         return;
                     }
+                    // One lock serves both relay directions, so a blocking
+                    // backward read would hold it while the forward write
+                    // waits: the quantum bounds one read instead.
+                    let _ = tunnel.set_read_quantum(RELAY_QUANTUM);
                     let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
                     relay_tunnel(&client, &tunnel);
                     if let (Some(id), crate::foxy::Carrier::H3) = (stream, carrier) {
@@ -4223,6 +4244,7 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
                     return;
                 }
                 Err(failure) => {
+                    debug_lane(&edge, carrier, &failure.to_string());
                     // A refused pass is the pass, not the edge: every carrier and
                     // every edge would answer the same way, so the loop stops.
                     if let ferrox_core::foxy::Failure::Rejected(status) = failure {
@@ -4661,6 +4683,13 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
 /// The relay a CONNECT lane uses: the same two directions, against a tunnel
 /// that is one stateful session rather than a socket, so both directions take
 /// the same lock and each holds it for one bounded copy.
+/// One backward read never holds the shared lock longer than this: past it the
+/// read answers `WouldBlock`, the lock is released, and the forward write gets
+/// its turn. Without the bound the first idle read wedges every upload.
+const RELAY_QUANTUM: Duration = Duration::from_millis(100);
+/// How long one quiet poll sleeps before retrying: long enough to not spin,
+/// short enough that interactive traffic never feels it.
+const RELAY_IDLE: Duration = Duration::from_millis(10);
 /// The QUIC dial a lane hands the pool: the edge's own name, not the address it
 /// was resolved to, so every flow of one country shares one connection.
 fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate::quic::QuicDial {
@@ -4698,30 +4727,99 @@ fn copy_locked(
     forward: bool,
 ) {
     const CHUNK: usize = 16 * 1024;
+    let direction = if forward { "forward" } else { "backward" };
     let mut buf = [0u8; CHUNK];
+    let mut total = 0u64;
     loop {
         let moved = if forward {
             match socket.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => match tunnel.lock() {
-                    Ok(mut lane) => lane.write(&buf[..read]).unwrap_or(0),
-                    Err(_) => 0,
-                },
+                Ok(0) => {
+                    debug_relay(direction, total, None);
+                    break;
+                }
+                Err(error) => {
+                    debug_relay(direction, total, Some(error.kind()));
+                    break;
+                }
+                // A short write is credit, not completion: the window reopens
+                // as the other direction drains, so the rest is retried rather
+                // than dropped.
+                Ok(read) => write_full(tunnel, &buf[..read]),
             }
         } else {
             let Ok(mut lane) = tunnel.lock() else { break };
             match lane.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    debug_relay(direction, total, None);
+                    break;
+                }
                 Ok(read) => match socket.write_all(&buf[..read]) {
                     Ok(()) => read,
-                    Err(_) => break,
+                    Err(error) => {
+                        debug_relay(direction, total, Some(error.kind()));
+                        break;
+                    }
                 },
+                // The quantum elapsed with no payload: release the lock so the
+                // forward write gets its turn, then poll again.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    drop(lane);
+                    std::thread::sleep(RELAY_IDLE);
+                    continue;
+                }
+                Err(error) => {
+                    debug_relay(direction, total, Some(error.kind()));
+                    break;
+                }
             }
         };
+        total += moved as u64;
         if moved == 0 {
+            debug_relay(direction, total, None);
             break;
         }
     }
+}
+
+/// Writes every byte through the shared lane, holding the lock per call so the
+/// other direction interleaves between frames.
+fn write_full(
+    tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
+    mut buf: &[u8],
+) -> usize {
+    let total = buf.len();
+    while !buf.is_empty() {
+        let Ok(mut lane) = tunnel.lock() else {
+            break;
+        };
+        match lane.write(buf) {
+            Ok(0) => {
+                drop(lane);
+                std::thread::sleep(RELAY_IDLE);
+            }
+            Ok(wrote) => buf = &buf[wrote..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                drop(lane);
+                std::thread::sleep(RELAY_IDLE);
+            }
+            Err(_) => break,
+        }
+    }
+    total - buf.len()
 }
 
 fn relay(client: &TcpStream, target: &TcpStream) {
