@@ -184,7 +184,7 @@ jobs:
           answers = []
           while time.time() < deadline and not answers:
               qid, query = dns_query('one.one.one.one')
-              target = b'\x00\x00\x00\x03\x0eone.one.one.one' + struct.pack('>H', 53)
+              target = b'\x00\x00\x00\x01\x01\x01\x01\x01' + struct.pack('>H', 53)
               udp.sendto(target + query, relay)
               try:
                   packet, _ = udp.recvfrom(65535)
@@ -200,8 +200,17 @@ jobs:
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
           kill "$(cat ferrox-relay.pid)" 2>/dev/null || true
-          echo "== ferrox relay log (edges, carriers, relay totals; no secrets) =="
+          echo "== udp lines =="
+          grep -iE "udp|masque|datagram" ferrox-relay.log | tail -n 100 || true
+          echo "== lane log tail (edges, carriers, relay totals; no secrets) =="
           tail -n 60 ferrox-relay.log
+      - name: Keep the whole lane log
+        if: always() && steps.secrets.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrox-relay-log
+          path: ferrox-relay.log
+          retention-days: 3
       - name: Summarise
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
