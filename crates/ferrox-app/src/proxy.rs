@@ -4000,7 +4000,10 @@ fn serve_trojan_httpheader(stream: TcpStream, key: &[u8; 56], path: &str, freedo
 }
 
 fn serve_socks(mut client: TcpStream, out: &Outbound) {
-    let Some((cmd, asked)) = socks_target(&mut client) else {
+    // The Foxy lane grants after its tunnel opens, so it must not take the
+    // handshake grant every other lane relies on: two grants read as ten bytes
+    // of tunnel data and break everything after them.
+    let Some((cmd, asked)) = socks_target(&mut client, !matches!(out, Outbound::Foxy(_))) else {
         return;
     };
     if cmd == 3 {
@@ -5934,8 +5937,10 @@ fn trojan_key(password: &str) -> [u8; 56] {
 }
 
 /// The same handshake, keeping the name the client sent. A CONNECT lane needs
-/// it: resolving here would hand the edge an address it cannot route.
-fn socks_target(client: &mut TcpStream) -> Option<(u8, SocksTarget)> {
+/// it: resolving here would hand the edge an address it cannot route. The grant
+/// is the caller's: lanes that relay after dialling take it here, and the Foxy
+/// lane grants after its tunnel opens instead.
+fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, SocksTarget)> {
     let mut head = [0u8; 2];
     read_exact(client, &mut head).ok()?;
     if head[0] != 5 {
@@ -5952,7 +5957,7 @@ fn socks_target(client: &mut TcpStream) -> Option<(u8, SocksTarget)> {
         return None;
     }
     let target = read_socks_named(client, req[3])?;
-    if req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
+    if grant && req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
         return None;
     }
     Some((req[1], target))
@@ -7025,6 +7030,40 @@ mod tests {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             Err(std::io::Error::other("no bytes today"))
         }
+    }
+
+    #[test]
+    fn a_connect_lane_grants_only_after_its_tunnel_opens() {
+        fn handshake(grant: bool) -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let accepted = std::thread::spawn(move || listener.accept().expect("accepts").0);
+            let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("times out");
+            client
+                .write_all(&[5, 1, 0, 5, 1, 0, 3, 11])
+                .expect("greets");
+            client.write_all(b"example.com").expect("names");
+            client.write_all(&[0, 80]).expect("ports");
+            let mut server = accepted.join().expect("accepts");
+            let (cmd, target) = socks_target(&mut server, grant).expect("handshakes");
+            assert_eq!(cmd, 1);
+            assert_eq!(target.authority(), "example.com:80");
+            let mut reply = [0u8; 2];
+            client.read_exact(&mut reply).expect("selects a method");
+            assert_eq!(reply, [5, 0]);
+            let mut rest = Vec::new();
+            let _ = client.read_to_end(&mut rest);
+            drop(server);
+            rest
+        }
+        let granted = handshake(true);
+        assert_eq!(granted.len(), 10, "one grant, ten bytes");
+        assert_eq!(&granted[..3], &[5, 0, 0]);
+        let ungranted = handshake(false);
+        assert!(ungranted.is_empty(), "no grant before the tunnel opens");
     }
 
     struct Dribble {
