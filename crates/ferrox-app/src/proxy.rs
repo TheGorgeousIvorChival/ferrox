@@ -5890,11 +5890,17 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     let mut peer_write = peer_write;
     let uplink = writer.clone();
     let done = thread::spawn(move || {
+        if echo_trace_on() {
+            echo_trace("DIAG fwd thread up");
+        }
         let mut buf = vec![0u8; CHUNK];
         let mut first = true;
         loop {
             match peer_read.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    if echo_trace_on() && first {
+                        echo_trace(&format!("DIAG fwd read {n}"));
+                    }
                     let sent = uplink.send(&buf[..n]);
                     if echo_trace_on() && first {
                         echo_trace(if sent {
@@ -5933,6 +5939,9 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     });
     let mut buf = vec![0u8; CHUNK];
     let mut first = true;
+    if echo_trace_on() {
+        echo_trace("DIAG bwd main up");
+    }
     loop {
         match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
@@ -9119,7 +9128,12 @@ mod tests {
                     start.elapsed(),
                     last_dial_failure()
                 ),
-                Ok(n) => at += n,
+                Ok(n) => {
+                    if echo_trace_on() {
+                        echo_trace(&format!("DIAG tst read {n}"));
+                    }
+                    at += n;
+                }
                 Err(error) => {
                     assert!(
                         is_timeout(&error) && start.elapsed() < Duration::from_secs(120),
@@ -9240,6 +9254,7 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
+        echo_trace("DIAG tst ping written");
         assert_eq!(&read_echo(&mut sock), b"ping");
     }
 

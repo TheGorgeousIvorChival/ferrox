@@ -1105,6 +1105,9 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut recv = recv;
     let mut scratch = Vec::with_capacity(MAX_PLAIN + TAG_LEN + 64);
     let mut first = true;
+    if crate::proxy::echo_trace_on() {
+        crate::proxy::echo_trace("DIAG vm bwd main up");
+    }
     while let Some(chunk) = read_frame(&mut reader, &mut recv, &mut scratch) {
         if crate::proxy::echo_trace_on() && first {
             crate::proxy::echo_trace("relay bwd first read");
