@@ -18,9 +18,13 @@ name: Foxy relay (live download check)
 # is ~1 MB per download leg, so this fires on lane changes and on demand, not
 # per push. Sign-in happens once per job (`mint-foxy-pass`): the account plane
 # answers 429 to rapid repeat logins, so legs dial with the minted pass and
-# never print it. Every shell here is `bash` with portable helpers only: no
-# `timeout(1)`, no `/dev/tcp`, no `sha256sum`, no `xxd` — none of those exist
-# on all three runners.
+# never print it. macOS is the known-red leg as of runs 37863369221 and
+# 37860540949: every carrier opens and the trace pins US, but the 1 MB transfer
+# dies fast on TCP and UDP alike while ubuntu and windows pass it — the lane
+# log shows the edge handshake completing and the bulk direction erroring,
+# which reads as the runner's egress rather than the lane. Every shell here is
+# `bash` with portable helpers only: no `timeout(1)`, no `/dev/tcp`, no
+# `sha256sum`, no `xxd` — none of those exist on all three runners.
 on:
   pull_request:
     paths:
