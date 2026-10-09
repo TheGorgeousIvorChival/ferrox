@@ -1545,6 +1545,11 @@ fn as_millis(node: &Json) -> Option<u64> {
 
 pub(crate) const RELAY_POLL: Duration = Duration::from_millis(20);
 
+/// How long one shared-session read waits before it yields the lock: shorter
+/// than the grain on purpose, because the rest of the grain is spent with the
+/// lock released and a relay that writes must not wait out the wait itself.
+const SESSION_POLL: Duration = Duration::from_millis(1);
+
 #[derive(Debug)]
 struct Half<T> {
     inner: Mutex<T>,
@@ -3165,10 +3170,11 @@ fn dial_tls_session(
         note_dial_failure(server, tls_failure(&error));
         return None;
     }
-    // The relay shares the session behind a lock, so reads cycle on the same timeout the server role sets.
+    // The relay shares the session behind a lock, so reads wait one tick at a
+    // time and `TlsHalf::read` spends the rest of the grain with it released.
     if session
         .get_ref()
-        .set_read_timeout(Some(RELAY_POLL))
+        .set_read_timeout(Some(SESSION_POLL))
         .is_err()
     {
         note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
@@ -3274,7 +3280,19 @@ type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<TcpStream>>;
 impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // A quiet socket is the callers' poll grain to retry, not this half's to spin on.
-        self.locked_read(buf)
+        let began = std::time::Instant::now();
+        let out = self.locked_read(buf);
+        if out.as_ref().is_err_and(is_timeout) {
+            // This half shares the session with the relay's write pump, and a
+            // read that waits holds it: one tick of the grain is spent waiting
+            // and the rest of it released, so a quiet edge never holds the
+            // write out for longer than the wait costs.
+            let left = RELAY_POLL.saturating_sub(began.elapsed());
+            if !left.is_zero() {
+                thread::sleep(left);
+            }
+        }
+        out
     }
 }
 
@@ -8659,6 +8677,60 @@ mod tests {
             pins: ferrox_core::foxy::pin::Pins::default(),
         };
         (server, client)
+    }
+
+    /// The relay runs one TLS session with two owners: a backward read pump and
+    /// a forward write pump. A read that waits with the lock held strangles the
+    /// forward pump for as long as the peer is quiet, which is the relay-phase
+    /// silence the linux runner kept losing minutes to. The socket's poll grain
+    /// is what makes the read yield, so the write pump must reach the lock
+    /// inside one grain of it.
+    #[test]
+    fn a_shared_tls_session_yields_the_lock_between_polls() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let (release, hold) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            // Holds the session up without writing, the way an edge does while
+            // it waits for the next frame.
+            let _ = hold.recv_timeout(Duration::from_secs(10));
+        });
+
+        let session = dial_tls_session(&server, &client_config).expect("dialled");
+        let (reader, writer, raw) = tls_halves(session).expect("halves");
+        let reading = thread::spawn(move || {
+            let mut peer = reader;
+            let began = Instant::now();
+            let mut buf = [0u8; 512];
+            while began.elapsed() < Duration::from_secs(4) {
+                let _ = peer.read(&mut buf);
+            }
+        });
+        // Let the read pump settle into its wait before the write pump comes by.
+        thread::sleep(Duration::from_millis(250));
+
+        let mut sink = TlsSink { half: writer, raw };
+        for _ in 0..3 {
+            let began = Instant::now();
+            sink.write_all(b"ping")
+                .expect("writes while the read pump polls");
+            let waited = began.elapsed();
+            assert!(
+                waited < Duration::from_millis(200),
+                "the write pump waited {waited:?} for a session the read pump holds"
+            );
+        }
+        let _ = reading.join();
+        let _ = release.send(());
     }
 
     fn tls_over_carrier(

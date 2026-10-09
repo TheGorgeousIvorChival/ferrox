@@ -193,7 +193,12 @@ impl<S: Stream> Write for RustlsProvider<S> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.drive()?;
         self.conn.writer().flush()?;
-        self.conn.complete_io(&mut self.io).map_err(recover)?;
+        // complete_io reads as well as it writes, and an idle read is not a
+        // failed flush: the record this pushed went out either way.
+        match self.conn.complete_io(&mut self.io) {
+            Err(error) if !idle(&error) => return Err(recover(error).into()),
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -318,9 +323,27 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.drive()?;
         self.conn.writer().flush()?;
-        self.conn.complete_io(&mut self.io).map_err(recover)?;
+        // complete_io reads as well as it writes, and an idle read is not a
+        // failed flush: the record this pushed went out either way.
+        match self.conn.complete_io(&mut self.io) {
+            Err(error) if !idle(&error) => return Err(recover(error).into()),
+            _ => {}
+        }
         Ok(())
     }
+}
+
+/// Whether an error is the socket's poll grain expiring with nothing in it,
+/// which `complete_io` reports because it reads as well as it writes.
+fn idle(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    matches!(error.kind(), TimedOut | WouldBlock)
+        || matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<TlsError>()),
+            Some(TlsError::Timeout)
+        )
 }
 
 fn recover(e: std::io::Error) -> TlsError {
