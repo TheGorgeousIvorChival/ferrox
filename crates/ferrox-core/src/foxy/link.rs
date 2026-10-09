@@ -118,6 +118,13 @@ impl FoxyLink {
         self.first(&["city", "cityCode", "city_code"])
     }
 
+    /// An upstream proxy the edge dial chains through, so a network that only
+    /// permits proxy egress can still start the lane; empty means direct.
+    #[must_use]
+    pub fn upstream_proxy(&self) -> &str {
+        self.first(&["upstreamProxy", "upstream_proxy", "via"])
+    }
+
     /// An edge the link names outright, which is what a link without a catalogue
     /// to read carries; empty when it names none and the catalogue decides.
     #[must_use]
@@ -247,6 +254,28 @@ mod tests {
         assert_eq!(link.host(), "edge.example");
         assert_eq!(link.port(), 8443);
         assert_eq!(link.name, "home");
+    }
+
+    #[test]
+    fn an_upstream_proxy_rides_the_link_under_three_names_or_not_at_all() {
+        assert_eq!(
+            FoxyLink::parse("foxy://username=a@b.c&upstreamProxy=http%3A%2F%2Fp%3A8080")
+                .expect("parses")
+                .upstream_proxy(),
+            "http://p:8080"
+        );
+        assert_eq!(
+            FoxyLink::parse("foxy://username=a@b.c&via=socks5%3A%2F%2Fp%3A1080")
+                .expect("parses")
+                .upstream_proxy(),
+            "socks5://p:1080"
+        );
+        assert_eq!(
+            FoxyLink::parse("foxy://username=a@b.c")
+                .expect("parses")
+                .upstream_proxy(),
+            ""
+        );
     }
 
     #[test]

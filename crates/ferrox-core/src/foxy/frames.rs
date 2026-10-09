@@ -12,6 +12,10 @@ pub const H2_HEADER: usize = 9;
 
 pub const DATA: u8 = 0x0;
 pub const HEADERS: u8 = 0x1;
+pub const CONTINUATION: u8 = 0x9;
+/// A HEADERS or CONTINUATION carrying this flag ends the header block; without
+/// it the block continues on a CONTINUATION and a partial block is not parsed.
+pub const END_HEADERS: u8 = 0x4;
 pub const PUSH_PROMISE: u8 = 0x5;
 pub const RST_STREAM: u8 = 0x3;
 pub const SETTINGS: u8 = 0x4;

@@ -153,7 +153,7 @@ fn huffman_encode(bytes: &[u8], out: &mut Vec<u8>) {
 }
 
 /// An integer in one byte carrying `prefix` low bits, continued in base-128.
-fn integer(out: &mut Vec<u8>, prefix: u8, mask: u8, value: usize) {
+pub(crate) fn integer(out: &mut Vec<u8>, prefix: u8, mask: u8, value: usize) {
     let max = (1usize << prefix) - 1;
     if value < max {
         out.push(mask | value as u8);
@@ -359,9 +359,9 @@ const QPACK_STATIC: [(&[u8], &[u8]); 99] = [
 ];
 
 /// The `:status` entries of a static table, HPACK's from index 8 and QPACK's
-/// from the table above. Every other index is a field this lane never reads,
-/// so an index outside these two tables is refused rather than skipped: a
-/// block carrying one is a block whose dynamic table this lane does not have.
+/// from the table above. Callers skip any other index: an indexed entry is one
+/// integer with nothing following it, so a field this lane never reads costs
+/// nothing to walk past.
 fn static_status(index: usize, h2: bool) -> Option<u16> {
     if h2 {
         const H2: [u16; 7] = [200, 204, 206, 304, 400, 404, 500];
@@ -386,34 +386,45 @@ fn status_of(bytes: &[u8]) -> Option<u16> {
     )
 }
 
-/// Reads the `:status` of an HPACK header block. The top three bits of a
-/// representation say which of the four forms it is, and this lane implements
-/// the two that carry a literal: everything else either needs a table it never
-/// fills — a dynamic size update, an incremental index — or is a field it does
-/// not read, which is skipped.
+/// Reads the `:status` of an HPACK header block. An indexed entry is one
+/// integer and nothing follows, so any index outside the `:status` range is
+/// skipped; a literal is a name plus a value, and only a `:status` name is
+/// read. A dynamic size update carries no entry and is skipped, because this
+/// lane keeps no dynamic table either way.
 pub fn hpack_status(block: &[u8]) -> Option<u16> {
     let mut at = 0usize;
     let mut status = None;
     while at < block.len() {
         let first = block[at];
-        let name_is_status = match first & 0xE0 {
-            0x80 => {
-                let index = read_integer(block, &mut at, 7)?;
-                status = Some(static_status(index, true)?);
-                continue;
+        if first & 0x80 != 0 {
+            let index = read_integer(block, &mut at, 7)?;
+            if let Some(code) = static_status(index, true) {
+                status = Some(code);
             }
-            0x40 => {
-                let index = read_integer(block, &mut at, 6)?;
-                if index != 8 {
-                    return None;
-                }
-                true
-            }
-            0x00 => {
-                at += 1;
+            continue;
+        }
+        if first & 0xC0 == 0x40 {
+            let index = read_integer(block, &mut at, 6)?;
+            let name_is_status = if index == 0 {
                 string_literal(block, &mut at)?.is_status()
+            } else {
+                static_status(index, true).is_some()
+            };
+            let value = string_literal(block, &mut at)?;
+            if name_is_status {
+                status = Some(status_of(value.as_bytes())?);
             }
-            _ => return None,
+            continue;
+        }
+        if first & 0xE0 == 0x20 {
+            read_integer(block, &mut at, 5)?;
+            continue;
+        }
+        let index = read_integer(block, &mut at, 4)?;
+        let name_is_status = if index == 0 {
+            string_literal(block, &mut at)?.is_status()
+        } else {
+            static_status(index, true).is_some()
         };
         let value = string_literal(block, &mut at)?;
         if name_is_status {
@@ -517,29 +528,36 @@ pub fn qpack_fields(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
 }
 
 /// One CONNECT request, three fields, literal names and literal values: the
-/// smallest header block a CONNECT can be written in.
+/// smallest header block a CONNECT can be written in. The authorization carries
+/// the `Bearer` scheme, which is the shape the edge answers: a bare token is
+/// a 400.
 pub fn hpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
-    for (name, value) in [
-        (":method", "CONNECT"),
-        (":authority", target),
-        ("proxy-authorization", bearer),
-    ] {
+    for (name, value) in [(":method", "CONNECT"), (":authority", target)] {
         out.push(0x00);
         integer(out, 7, 0x00, name.len());
         out.extend_from_slice(name.as_bytes());
         integer(out, 7, 0x00, value.len());
         out.extend_from_slice(value.as_bytes());
     }
+    let name = "proxy-authorization";
+    out.push(0x00);
+    integer(out, 7, 0x00, name.len());
+    out.extend_from_slice(name.as_bytes());
+    integer(out, 7, 0x00, "Bearer ".len() + bearer.len());
+    out.extend_from_slice(b"Bearer ");
+    out.extend_from_slice(bearer.as_bytes());
 }
 
 /// The same three fields under QPACK, whose block starts with a required insert
-/// count of zero and names its fields with the `001` literal pattern.
+/// count of zero and names its fields with the `001` literal pattern. The one
+/// allocation joins the scheme the edge answers with; a bare token is a 400.
 pub fn qpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
+    let bearer = format!("Bearer {bearer}");
     qpack_literal_many(
         &[
             (":method", "CONNECT"),
             (":authority", target),
-            ("proxy-authorization", bearer),
+            ("proxy-authorization", bearer.as_str()),
         ],
         out,
     );
@@ -806,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn a_response_naming_a_table_this_lane_never_fills_is_refused() {
+    fn a_block_with_no_status_in_it_yields_none() {
         assert_eq!(hpack_status(&[0x3f, 0xe1, 0x1f]), None, "a size update");
         assert_eq!(
             hpack_status(&[0x0f, 0x61, 0x62, 0x63]),
@@ -839,6 +857,31 @@ mod tests {
             None,
             "a post-base index"
         );
+    }
+
+    #[test]
+    fn an_encoder_beyond_the_minimal_one_still_yields_its_status() {
+        // A size update, an indexed field this lane never reads, a literal
+        // with incremental indexing naming one, and then the indexed status.
+        let mut block = vec![0x3f, 0xe1, 0x1f, 0x80 | 0x21];
+        block.push(0x40);
+        integer_into(&mut block, 6, 33);
+        integer(&mut block, 7, 0x00, 1);
+        block.extend_from_slice(b"x");
+        block.push(0x88);
+        assert_eq!(hpack_status(&block), Some(200));
+        // The same status as a literal under its indexed name, with a literal
+        // date first: the name decides, not the representation.
+        let mut named = vec![0x00];
+        integer(&mut named, 7, 0x00, 4);
+        named.extend_from_slice(b"date");
+        integer(&mut named, 7, 0x00, 1);
+        named.extend_from_slice(b"x");
+        named.push(0x40);
+        integer_into(&mut named, 6, 13);
+        integer(&mut named, 7, 0x00, 3);
+        named.extend_from_slice(b"404");
+        assert_eq!(hpack_status(&named), Some(404));
     }
 
     #[test]
@@ -928,7 +971,7 @@ mod tests {
             &[
                 (":method", "CONNECT"),
                 (":authority", "example.com:443"),
-                ("proxy-authorization", "p"),
+                ("proxy-authorization", "Bearer p"),
             ],
             &mut many,
         );
@@ -947,9 +990,9 @@ mod tests {
         hpack_connect("example.com:443", "p", &mut h2);
         let mut q3 = Vec::new();
         qpack_connect("example.com:443", "p", &mut q3);
-        assert_eq!(h2, hex("00073a6d 6574686f 6407434f 4e4e4543 54000a3a 61757468 6f726974 790f6578 616d706c 652e636f 6d3a3434 33001370 726f7879 2d617574 686f7269 7a617469 6f6e0170"));
-        assert_eq!(q3, hex("00002700 3a6d6574 686f6407 434f4e4e 45435427 033a6175 74686f72 6974790f 6578616d 706c652e 636f6d3a 34343327 0c70726f 78792d61 7574686f 72697a61 74696f6e 0170"));
-        assert_eq!((h2.len(), q3.len()), (68, 70));
+        assert_eq!(h2, hex("00073a6d 6574686f 6407434f 4e4e4543 54000a3a 61757468 6f726974 790f6578 616d706c 652e636f 6d3a3434 33001370 726f7879 2d617574 686f7269 7a617469 6f6e0842 65617265 722070"));
+        assert_eq!(q3, hex("00002700 3a6d6574 686f6407 434f4e4e 45435427 033a6175 74686f72 6974790f 6578616d 706c652e 636f6d3a 34343327 0c70726f 78792d61 7574686f 72697a61 74696f6e 08426561 72657220 70"));
+        assert_eq!((h2.len(), q3.len()), (75, 77));
     }
 
     #[test]

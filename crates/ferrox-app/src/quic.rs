@@ -11,6 +11,10 @@ pub(crate) struct QuicDial {
     pub(crate) host: String,
     pub(crate) address: String,
     pub(crate) port: u16,
+    /// The upstream hop the datagrams ride, when one is configured: a pooled
+    /// connection through a hop is its own connection, and a direct one is
+    /// never reused for it.
+    pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
     pub(crate) roots: Option<Vec<Vec<u8>>>,
 }
 
@@ -19,6 +23,7 @@ struct QuicServer {
     address: String,
     port: u16,
     host: String,
+    upstream: Option<crate::foxy::UpstreamProxy>,
     roots: Option<Vec<Vec<u8>>>,
 }
 
@@ -32,7 +37,7 @@ struct PooledState {
 /// packets come from, and the bidirectional stream id this flow opened.
 pub(crate) type PooledStream = (
     Arc<Mutex<quiche::Connection>>,
-    Arc<UdpSocket>,
+    Arc<Datagram>,
     SocketAddr,
     u64,
 );
@@ -41,7 +46,7 @@ pub(crate) type PooledStream = (
 struct PooledConn {
     conn: Arc<Mutex<quiche::Connection>>,
     table: Arc<Mutex<PooledState>>,
-    sock: Arc<UdpSocket>,
+    sock: Arc<Datagram>,
     key: Arc<QuicServer>,
 }
 
@@ -56,6 +61,7 @@ impl QuicPool {
             address: dial.address.clone(),
             port: dial.port,
             host: dial.host.clone(),
+            upstream: dial.upstream.clone(),
             roots: dial.roots.clone(),
         };
         self.inner.lock().ok()?.get(&key).cloned()
@@ -294,16 +300,33 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
     config
 }
 
-pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &UdpSocket) {
+pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     let mut out = [0u8; MAX_DATAGRAM];
     while let Ok((written, info)) = conn.send(&mut out) {
         let _ = sock.send_to(&out[..written], info.to);
     }
 }
 
+/// The HTTP/3 opening one fresh connection carries exactly once, before any
+/// request stream: a second control stream is a connection error, so this
+/// lives at establishment time rather than per flow.
+pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
+    for (stream, payload) in crate::foxy::H3::h3_opening() {
+        let mut rest = &payload[..];
+        while !rest.is_empty() {
+            match conn.stream_send(stream, rest, false) {
+                Ok(0) | Err(_) => return false,
+                Ok(wrote) => rest = &rest[wrote..],
+            }
+        }
+    }
+    flush_egress(conn, sock);
+    true
+}
+
 pub(crate) fn pump_once(
     conn: &mut quiche::Connection,
-    sock: &UdpSocket,
+    sock: &Datagram,
     local: SocketAddr,
     wait: Duration,
 ) -> bool {
@@ -337,7 +360,7 @@ pub(crate) fn pump_once(
 
 pub(crate) fn drive_handshake(
     conn: &mut quiche::Connection,
-    sock: &UdpSocket,
+    sock: &Datagram,
     local: SocketAddr,
 ) -> Option<()> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
@@ -356,7 +379,7 @@ pub(crate) fn drive_handshake(
 
 pub(crate) fn stream_send_all(
     conn: &mut quiche::Connection,
-    sock: &UdpSocket,
+    sock: &Datagram,
     stream: u64,
     mut buf: &[u8],
     fin: bool,
@@ -394,7 +417,7 @@ pub(crate) fn stream_send_all(
 
 pub(crate) fn stream_recv_exact(
     conn: &mut quiche::Connection,
-    sock: &UdpSocket,
+    sock: &Datagram,
     local: SocketAddr,
     stream: u64,
     want: usize,
@@ -526,6 +549,134 @@ pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
     Ok(sock)
 }
 
+/// One datagram socket, addressed the way every caller already addresses one.
+/// Behind it the packets either reach the edge directly or ride one SOCKS5 UDP
+/// relay, where each carries the address it is for in a header the hop adds on
+/// the way out and takes off on the way back. Above this line a relay changes
+/// no handshake, no frame and no stream, which is why the hop lives here and
+/// nowhere above.
+pub(crate) struct Datagram {
+    sock: UdpSocket,
+    relay: Option<Relay>,
+}
+
+/// Where this socket's datagrams actually go. The association's control
+/// connection is never read — it is held: dropping it is how a UDP association
+/// ends, so every clone of a relayed socket holds one until the last is gone.
+#[derive(Clone)]
+struct Relay {
+    via: SocketAddr,
+    _control: Arc<TcpStream>,
+}
+
+/// The most one datagram costs in headers: two reserved bytes, one unfragmented
+/// byte, the longest address and the port.
+const RELAY_HEADER: usize = 22;
+
+impl Datagram {
+    pub(crate) fn plain(sock: UdpSocket) -> Self {
+        Self { sock, relay: None }
+    }
+
+    pub(crate) fn relayed(sock: UdpSocket, via: SocketAddr, control: Arc<TcpStream>) -> Self {
+        Self {
+            sock,
+            relay: Some(Relay {
+                via,
+                _control: control,
+            }),
+        }
+    }
+
+    pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        let Some(relay) = self.relay.as_ref() else {
+            return self.sock.send_to(buf, to);
+        };
+        // The address the hop forwards to goes in a header, because the socket
+        // itself is addressed to the hop.
+        let mut framed = [0u8; RELAY_HEADER + MAX_DATAGRAM];
+        let Some(into) = framed.get_mut(..RELAY_HEADER + buf.len()) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        let header = match to {
+            SocketAddr::V4(addr) => {
+                into[3] = 1;
+                into[4..8].copy_from_slice(&addr.ip().octets());
+                into[8..10].copy_from_slice(&addr.port().to_be_bytes());
+                10
+            }
+            SocketAddr::V6(addr) => {
+                into[3] = 4;
+                into[4..20].copy_from_slice(&addr.ip().octets());
+                into[20..22].copy_from_slice(&addr.port().to_be_bytes());
+                22
+            }
+        };
+        into[header..header + buf.len()].copy_from_slice(buf);
+        self.sock.send_to(&framed[..header + buf.len()], relay.via)
+    }
+
+    pub(crate) fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let Some(relay) = self.relay.as_ref() else {
+            return self.sock.recv_from(buf);
+        };
+        let (found, from) = self.sock.recv_from(buf)?;
+        if from != relay.via {
+            // A datagram from anywhere but the hop is not for this association.
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        let Some((header, peer)) = relay_inbound(&buf[..found]) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        };
+        buf.copy_within(header..found, 0);
+        Ok((found - header, peer))
+    }
+
+    pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.sock.local_addr()
+    }
+
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            sock: self.sock.try_clone()?,
+            relay: self.relay.clone(),
+        })
+    }
+
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
+/// The header a relayed datagram carries, and the edge it says the packet is
+/// from: two reserved bytes, one unfragmented byte, then the address and port
+/// the hop forwarded to. A fragmented datagram is one this tree does not
+/// reassemble and a named one it cannot address a reply at, so neither reads.
+fn relay_inbound(head: &[u8]) -> Option<(usize, SocketAddr)> {
+    let [_, _, 0, kind] = *head.get(..4)? else {
+        return None;
+    };
+    let (raw, width) = match kind {
+        1 => (head.get(4..8)?, 4),
+        4 => (head.get(4..20)?, 16),
+        _ => return None,
+    };
+    let port = head.get(4 + width..6 + width)?;
+    let ip = if width == 4 {
+        let mut octets = [0u8; 4];
+        octets.copy_from_slice(raw);
+        std::net::IpAddr::from(octets)
+    } else {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(raw);
+        std::net::IpAddr::from(octets)
+    };
+    Some((
+        6 + width,
+        SocketAddr::new(ip, u16::from_be_bytes([port[0], port[1]])),
+    ))
+}
+
 pub(crate) fn udp_to_server(
     address: &str,
     port: u16,
@@ -541,7 +692,7 @@ pub(crate) fn udp_to_server(
 }
 
 pub(crate) fn handshake(
-    sock: &UdpSocket,
+    sock: &Datagram,
     peer: SocketAddr,
     local: SocketAddr,
     server_name: &str,
@@ -559,7 +710,7 @@ pub(crate) fn handshake(
 fn pump(
     shared: &Arc<Mutex<quiche::Connection>>,
     table: &Arc<Mutex<PooledState>>,
-    sock: &UdpSocket,
+    sock: &Datagram,
     local: SocketAddr,
 ) {
     let mut ready: Vec<(u64, TcpStream)> = Vec::new();
@@ -668,7 +819,7 @@ fn pump(
 fn leave_session(
     shared: &Arc<Mutex<quiche::Connection>>,
     table: &Arc<Mutex<PooledState>>,
-    flush_sock: &UdpSocket,
+    flush_sock: &Datagram,
     pool: &'static QuicPool,
     key: &QuicServer,
     id: u64,
@@ -821,6 +972,7 @@ pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAd
         address: dial.address.clone(),
         port: dial.port,
         host: dial.host.clone(),
+        upstream: dial.upstream.clone(),
         roots: dial.roots.clone(),
     };
     let pooled = if let Ok(pool) = pool().inner.lock() {
@@ -940,6 +1092,7 @@ pub(crate) fn release_stream(dial: &QuicDial, id: u64) {
         address: dial.address.clone(),
         port: dial.port,
         host: dial.host.clone(),
+        upstream: dial.upstream.clone(),
         roots: dial.roots.clone(),
     };
     let pooled = pool().stream(dial);
@@ -949,32 +1102,68 @@ pub(crate) fn release_stream(dial: &QuicDial, id: u64) {
 
 fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
-    let (sock, peer, local) = udp_to_server(&dial.address, dial.port)?;
-    let mut conn = handshake(&sock, peer, local, &dial.host, roots)?;
-    flush_egress(&mut conn, &sock);
-    let shared = Arc::new(Mutex::new(conn));
-    let table = Arc::new(Mutex::new(PooledState {
-        sessions: HashMap::new(),
-        opening: HashSet::new(),
-        next_id: 0,
-    }));
-    let task_shared = Arc::clone(&shared);
-    let task_table = Arc::clone(&table);
-    let Ok(pump_sock) = sock.try_clone() else {
-        return None;
+    // One attempt per resolved address, like the reference: the first answer
+    // is not always the reachable one.
+    let peers: Vec<SocketAddr> = format!("{}:{}", dial.address, dial.port)
+        .to_socket_addrs()
+        .ok()?
+        .collect();
+    // The hop a configured upstream asks for, once per connection rather than
+    // per address, because the association is the same one either way. An HTTP
+    // hop carries TCP only, so it is a refusal and not a direct dial: a lane
+    // that bypasses its configured proxy is a leak, not a fallback.
+    let relay = match dial.upstream.as_ref() {
+        Some(proxy) if proxy.http() => return None,
+        Some(proxy) => Some(crate::foxy::associate_udp(proxy)?),
+        None => None,
     };
-    std::thread::spawn(move || pump(&task_shared, &task_table, &pump_sock, local));
-    Some(PooledConn {
-        conn: shared,
-        table,
-        sock: Arc::new(sock),
-        key: Arc::new(QuicServer {
-            address: dial.address.clone(),
-            port: dial.port,
-            host: dial.host.clone(),
-            roots: dial.roots.clone(),
-        }),
-    })
+    for peer in peers {
+        let Ok(sock) = (if peer.is_ipv6() {
+            bind_datagram("[::]:0")
+        } else {
+            bind_datagram("0.0.0.0:0")
+        }) else {
+            continue;
+        };
+        let Ok(local) = sock.local_addr() else {
+            continue;
+        };
+        let sock = match relay.as_ref() {
+            Some((control, via)) => Datagram::relayed(sock, *via, Arc::clone(control)),
+            None => Datagram::plain(sock),
+        };
+        let Some(mut conn) = handshake(&sock, peer, local, &dial.host, roots) else {
+            continue;
+        };
+        if !send_h3_opening(&mut conn, &sock) {
+            continue;
+        }
+        let shared = Arc::new(Mutex::new(conn));
+        let table = Arc::new(Mutex::new(PooledState {
+            sessions: HashMap::new(),
+            opening: HashSet::new(),
+            next_id: 0,
+        }));
+        let task_shared = Arc::clone(&shared);
+        let task_table = Arc::clone(&table);
+        let Ok(pump_sock) = sock.try_clone() else {
+            continue;
+        };
+        std::thread::spawn(move || pump(&task_shared, &task_table, &pump_sock, local));
+        return Some(PooledConn {
+            conn: shared,
+            table,
+            sock: Arc::new(sock),
+            key: Arc::new(QuicServer {
+                address: dial.address.clone(),
+                port: dial.port,
+                host: dial.host.clone(),
+                roots: dial.roots.clone(),
+                upstream: dial.upstream.clone(),
+            }),
+        });
+    }
+    None
 }
 
 /// One connection and one stream on it, with nothing else reading the socket.
@@ -991,8 +1180,23 @@ pub(crate) fn direct_stream(
     roots: &[Vec<u8>],
 ) -> Option<PooledStream> {
     let (sock, peer, local) = udp_to_server(address, port)?;
+    direct_stream_on(Datagram::plain(sock), peer, local, host, roots)
+}
+
+/// The same stream over a socket the caller framed, which is how a loopback
+/// proves a relayed dial: the edge is an ordinary socket behind the relay.
+#[cfg(test)]
+pub(crate) fn direct_stream_on(
+    sock: Datagram,
+    peer: SocketAddr,
+    local: SocketAddr,
+    host: &str,
+    roots: &[Vec<u8>],
+) -> Option<PooledStream> {
     let mut conn = handshake(&sock, peer, local, host, roots)?;
-    flush_egress(&mut conn, &sock);
+    if !send_h3_opening(&mut conn, &sock) {
+        return None;
+    }
     Some((
         std::sync::Arc::new(std::sync::Mutex::new(conn)),
         std::sync::Arc::new(sock),
@@ -1003,7 +1207,7 @@ pub(crate) fn direct_stream(
 
 /// One datagram off a loopback edge's socket, or nothing when none arrived.
 #[cfg(test)]
-pub(crate) fn server_poll(sock: &UdpSocket, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+pub(crate) fn server_poll(sock: &Datagram, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
     sock.set_read_timeout(Some(SERVER_POLL)).ok()?;
     match sock.recv_from(buf) {
         Ok(found) => Some(found),
@@ -1022,7 +1226,7 @@ pub(crate) fn server_poll(sock: &UdpSocket, buf: &mut [u8]) -> Option<(usize, So
 /// Lets a waiting connection run its own timers and answer whatever it queued,
 /// which is the only thing an edge can do between packets.
 #[cfg(test)]
-pub(crate) fn server_idle(conn: &mut quiche::Connection, sock: &UdpSocket, out: &mut [u8]) {
+pub(crate) fn server_idle(conn: &mut quiche::Connection, sock: &Datagram, out: &mut [u8]) {
     conn.on_timeout();
     while let Ok((written, info)) = conn.send(out) {
         let _ = sock.send_to(&out[..written], info.to);
@@ -1033,7 +1237,7 @@ pub(crate) fn server_idle(conn: &mut quiche::Connection, sock: &UdpSocket, out: 
 /// to quiche and the handshake is driven to completion.
 #[cfg(test)]
 pub(crate) fn server_accept(
-    sock: &UdpSocket,
+    sock: &Datagram,
     local: SocketAddr,
     config: &mut quiche::Config,
 ) -> quiche::Connection {

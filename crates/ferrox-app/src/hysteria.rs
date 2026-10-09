@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ pub(crate) struct Dial {
 #[derive(Clone)]
 pub(crate) struct Session {
     shared: Arc<Mutex<quiche::Connection>>,
-    sock: Arc<UdpSocket>,
+    sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
 }
 
@@ -218,6 +218,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
         return None;
     };
+    let sock = crate::quic::Datagram::plain(sock);
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let session = Session {
         shared: Arc::new(Mutex::new(conn)),
@@ -248,7 +249,7 @@ pub(crate) struct Flow {
 impl Flow {
     pub(crate) fn from_parts(
         shared: Arc<Mutex<quiche::Connection>>,
-        sock: Arc<UdpSocket>,
+        sock: Arc<crate::quic::Datagram>,
         local: SocketAddr,
         stream: u64,
         backlog: Vec<u8>,
@@ -499,7 +500,7 @@ fn drain_settings(conn: &mut quiche::Connection) {
 
 fn serve_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
-    sock: &Arc<UdpSocket>,
+    sock: &Arc<crate::quic::Datagram>,
     local: SocketAddr,
     stream: u64,
     serve: &Serve,
@@ -556,7 +557,7 @@ fn serve_stream(
 }
 
 struct Router<'a> {
-    sock: Arc<UdpSocket>,
+    sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
     out: [u8; 1350],
     auths: &'a [String],
@@ -564,14 +565,14 @@ struct Router<'a> {
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
-fn flush(sock: &UdpSocket, conn: &mut quiche::Connection, out: &mut [u8; 1350]) {
+fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8; 1350]) {
     while let Ok((written, info)) = conn.send(out) {
         let _ = sock.send_to(&out[..written], info.to);
     }
 }
 
 fn auth_exchange(
-    sock: &UdpSocket,
+    sock: &crate::quic::Datagram,
     out: &mut [u8; 1350],
     conn: &mut quiche::Connection,
     auths: &[String],
@@ -757,7 +758,7 @@ pub(crate) fn serve_loop(
         return;
     };
     let mut router = Router {
-        sock: Arc::new(sock),
+        sock: Arc::new(crate::quic::Datagram::plain(sock)),
         local,
         out: [0u8; 1350],
         auths,

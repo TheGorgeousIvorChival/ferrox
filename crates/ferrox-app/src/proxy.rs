@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -72,6 +72,22 @@ pub(crate) fn serve_file(path: &str) -> ! {
                         continue;
                     };
                     let role = Role::Socks { out };
+                    thread::spawn(move || accept_loop(&address, &role));
+                    inbounds += 1;
+                }
+                "http" => {
+                    let Some(out) = outbound.clone() else {
+                        continue;
+                    };
+                    let role = Role::Http { out };
+                    thread::spawn(move || accept_loop(&address, &role));
+                    inbounds += 1;
+                }
+                "mixed" => {
+                    let Some(out) = outbound.clone() else {
+                        continue;
+                    };
+                    let role = Role::Mixed { out };
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
                 }
@@ -180,7 +196,16 @@ fn note_dial_failure(target: &SocketAddr, failure: Failure) {
     } else {
         FATAL_DIALS.fetch_add(1, Ordering::Relaxed);
     }
+    if let Ok(mut last) = LAST_DIAL.lock() {
+        *last = Some((*target, failure));
+    }
+    echo_trace(&format!("dial {target} failed: {failure}"));
     eprintln!("dial {target} failed: {failure}");
+}
+
+#[cfg(test)]
+pub(crate) fn last_dial_failure() -> Option<(SocketAddr, Failure)> {
+    LAST_DIAL.lock().ok().and_then(|last| *last)
 }
 
 // The ladder rung a configured carrier answers, if it is on the ladder.
@@ -215,6 +240,31 @@ fn ladder_start(carrier: &Carrier) -> Rung {
 static FATAL_DIALS: AtomicU64 = AtomicU64::new(0);
 
 static RETRYABLE_DIALS: AtomicU64 = AtomicU64::new(0);
+// The last reported dial failure, so a test that outlives its dial names the
+// stage it died at instead of timing out in silence.
+static LAST_DIAL: std::sync::Mutex<Option<(SocketAddr, Failure)>> = std::sync::Mutex::new(None);
+
+// Stage tracing for the loopback echo family, behind one env flag so quiet
+// runs stay quiet: a stalled test's last line names where it stopped. stdout,
+// not stderr, because the harness captures stdout per test and a global
+// interleaving cannot attribute a line to its flow.
+static ECHO_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn echo_trace_on() -> bool {
+    *ECHO_TRACE_ON.get_or_init(|| std::env::var("FERROX_ECHO_TRACE").is_ok())
+}
+
+static ECHO_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub(crate) fn echo_trace(stage: &str) {
+    if echo_trace_on() {
+        let at = ECHO_T0
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis();
+        println!("echo-trace: t={at} {stage}");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DialFailures {
@@ -304,6 +354,12 @@ enum Role {
     Socks {
         out: Outbound,
     },
+    Http {
+        out: Outbound,
+    },
+    Mixed {
+        out: Outbound,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -324,11 +380,20 @@ struct FoxyOut {
     country: String,
     city: String,
     carrier: crate::foxy::Carrier,
+    /// An upstream proxy the edge dial chains through; going direct past a
+    /// configured one would be a leak, so a value that does not parse refuses
+    /// the outbound the way a missing account does.
+    upstream: Option<crate::foxy::UpstreamProxy>,
     candidates: Vec<ferrox_core::foxy::Candidate>,
     stored: Option<ferrox_core::foxy::Candidate>,
     /// Set when the edge refuses the pass, so every later flow is answered
     /// locally instead of paying a round trip to hear the same status again.
     unauthenticated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Consecutive rate-limited flows and the second before which the next one
+    /// may dial: a 429 answers one attempt per flow and the rest wait out the
+    /// refusal curve instead of extending the limit across every edge.
+    limited_strikes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    limited_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
     roots: Vec<Vec<u8>>,
     pins: ferrox_core::foxy::pin::Pins,
     pass: ferrox_core::foxy::Pass,
@@ -496,6 +561,8 @@ fn accept_loop(address: &str, role: &Role) {
                 freedom,
             } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
             Role::Socks { out } => serve_socks(stream, &out),
+            Role::Http { out } => serve_http(stream, &out),
+            Role::Mixed { out } => serve_mixed(stream, &out),
         });
     }
 }
@@ -1604,7 +1671,7 @@ pub(crate) fn read_into_tail(read: &mut impl Read, buf: &mut Vec<u8>) -> std::io
 }
 
 pub(crate) fn refresh_read_timeout(
-    sock: &UdpSocket,
+    sock: &crate::quic::Datagram,
     want: Duration,
     applied: &mut Option<Duration>,
 ) -> bool {
@@ -4000,14 +4067,31 @@ fn serve_trojan_httpheader(stream: TcpStream, key: &[u8; 56], path: &str, freedo
 }
 
 fn serve_socks(mut client: TcpStream, out: &Outbound) {
-    let Some((cmd, asked)) = socks_target(&mut client) else {
+    // The Foxy lane grants after its tunnel opens, so it must not take the
+    // handshake grant every other lane relies on: two grants read as ten bytes
+    // of tunnel data and break everything after them.
+    let Some((cmd, asked)) = socks_target(&mut client, !matches!(out, Outbound::Foxy(_))) else {
         return;
     };
     if cmd == 3 {
         return serve_socks_udp(client, out);
     }
+    serve_connect(client, out, &asked, Front::Socks, &[]);
+}
+
+/// One tunnel request from either byte front: SOCKS CONNECT or HTTP
+/// CONNECT/forward. The grant is already written, except on the Foxy lane,
+/// which grants after its tunnel opens. A non-empty prefix is a plain-HTTP
+/// head the front already consumed, and only a raw uplink can take it.
+fn serve_connect(
+    mut client: TcpStream,
+    out: &Outbound,
+    asked: &SocksTarget,
+    front: Front,
+    prefix: &[u8],
+) {
     if let Outbound::Foxy(foxy) = out {
-        return serve_foxy(client, foxy, &asked);
+        return serve_foxy_front(client, foxy, asked, front, prefix);
     }
     let Some(target) = asked.socket() else {
         return;
@@ -4017,14 +4101,25 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
         Outbound::Vmess(vmess) => (vmess.address.clone(), vmess.port),
         Outbound::Trojan(trojan) => (trojan.address.clone(), trojan.port),
         Outbound::Shadowsocks(shadowsocks) => (shadowsocks.address.clone(), shadowsocks.port),
-        Outbound::Foxy(_) | Outbound::Freedom => {
-            let Some(upstream) = dial_or_report(&target) else {
+        Outbound::Foxy(_) => return,
+        Outbound::Freedom => {
+            let Some(mut upstream) = dial_or_report(&target) else {
                 return;
             };
+            if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+                return;
+            }
             relay(&client, &upstream);
             return;
         }
     };
+    if !prefix.is_empty() {
+        // A protocol outbound handshakes over the client's bytes itself, so a
+        // consumed head has nowhere to go until one buffer carries prefixes;
+        // that buffer is P28's, and until then this is refused by name.
+        let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
+        return;
+    }
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
             if !vless.mux {
@@ -4035,6 +4130,7 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
                         host: vless.host.clone(),
                         address: vless.address.clone(),
                         port: vless.port,
+                        upstream: None,
                         roots: vless.quic_roots.clone(),
                     },
                     &target,
@@ -4150,20 +4246,114 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
     });
 }
 
-fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
+/// Temporary first-bytes dump behind `FOXY_DEBUG`: the opening bytes of each
+/// direction, so a tunnel that answers TLS with plaintext names itself.
+fn debug_bytes(direction: &str, buf: &[u8]) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        let end = buf.len().min(32);
+        eprintln!(
+            "foxy-debug: {direction} first {end} B: {:02x?}",
+            &buf[..end]
+        );
+    }
+}
+
+/// Temporary live-lane tracing behind `FOXY_DEBUG`: edge, carrier and outcome
+/// per dial, so a stall names where it stopped instead of timing out silently.
+fn debug_lane(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier, what: &str) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: {} {:?} {what}", edge.authority(), carrier);
+    }
+}
+
+/// Temporary relay totals behind `FOXY_DEBUG`: which direction ended, after how
+/// many bytes, and on what error kind.
+fn debug_relay(direction: &str, moved: u64, error: Option<std::io::ErrorKind>) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: relay {direction} ended after {moved} B on {error:?}");
+    }
+}
+
+/// Which byte front a tunnel answers: the grant and the refusal render per
+/// front, while the edge and carrier loop is the same tunnel either way.
+#[derive(Debug, Clone, Copy)]
+enum Front {
+    Socks,
+    Http,
+}
+
+impl Front {
+    fn grant_line(self) -> Vec<u8> {
+        match self {
+            Self::Socks => foxy_socks_reply(0).to_vec(),
+            Self::Http => b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+        }
+    }
+    fn direct_grant(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Socks => None,
+            Self::Http => Some(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+        }
+    }
+    fn refusal(self, code: u8) -> Vec<u8> {
+        match self {
+            Self::Socks => foxy_socks_reply(code).to_vec(),
+            Self::Http => b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".to_vec(),
+        }
+    }
+}
+
+/// An opened Foxy route: the tunnel with its H3 stream to release, a direct
+/// dial for split-tunnel targets, a rendered refusal code, or nothing to say.
+enum FoxyOpen {
+    Tunnel(
+        Box<crate::foxy::Tunnel>,
+        Option<(crate::quic::QuicDial, u64)>,
+    ),
+    Direct(SocketAddr),
+    Refused(u8),
+    Silent,
+}
+
+/// Whether a flow may dial yet: inside the refusal curve it is refused
+/// locally, because one more attempt only extends the account's limit.
+fn edge_limited(until: &AtomicU64, now: u64) -> bool {
+    until.load(Ordering::Relaxed) > now
+}
+
+/// Records one rate-limited attempt and returns when the next flow may dial,
+/// climbing the refusal curve instead of hammering every edge and carrier.
+fn note_limited(strikes: &AtomicU32, until: &AtomicU64, now: u64) -> u64 {
+    let wait = ferrox_core::foxy::refusal_backoff(strikes.fetch_add(1, Ordering::Relaxed));
+    let at = now.saturating_add(wait.as_secs());
+    until.store(at, Ordering::Relaxed);
+    at
+}
+
+/// A working tunnel clears the limit: the account answers again, so the curve
+/// restarts rather than punishing later flows for an old limit.
+fn clear_limited(strikes: &AtomicU32, until: &AtomicU64) {
+    strikes.store(0, Ordering::Relaxed);
+    until.store(0, Ordering::Relaxed);
+}
+
+/// The edge and carrier loop both fronts share: first answer wins, a refused
+/// pass stops every carrier and every edge, and the grant stays with the front.
+fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
     if foxy
         .unauthenticated
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        let _ = client.write_all(&foxy_socks_reply(0x01));
-        return;
+        return FoxyOpen::Refused(0x01);
+    }
+    if edge_limited(&foxy.limited_until, now_secs()) {
+        return FoxyOpen::Refused(0x01);
     }
     if foxy_splits(foxy, asked) {
-        let Some(target) = asked.socket() else { return };
-        let Some(upstream) = dial_or_report(&target) else {
-            return;
+        let Some(target) = asked.socket() else {
+            return FoxyOpen::Silent;
         };
-        return relay(&client, &upstream);
+        return FoxyOpen::Direct(target);
     }
     let target = asked.authority();
     let order = ferrox_core::foxy::catalog::tier(
@@ -4175,7 +4365,7 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
     let mut refusals = ferrox_core::foxy::Refusals::new(256);
     let key = target.clone();
     if refusals.blocked(&key, 0) {
-        return;
+        return FoxyOpen::Silent;
     }
     let mut last = None;
     for edge in ferrox_core::foxy::dial_order(
@@ -4194,6 +4384,7 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
                 port: edge.port,
                 address: foxy.edge_address,
                 carrier,
+                upstream: foxy.upstream.clone(),
                 roots: foxy.roots.clone(),
                 pins: foxy.pins.clone(),
                 pass: pass.clone(),
@@ -4204,31 +4395,30 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
                 }
                 _ => None,
             };
-            let stream = quic.as_ref().map(|(_, _, _, id)| *id);
+            let h3 = quic.as_ref().map(|(_, _, _, id)| *id);
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
-                Ok(mut tunnel) => {
+                Ok(tunnel) => {
+                    debug_lane(&edge, carrier, &format!("opened for {target}"));
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    if client.write_all(&foxy_socks_reply(0)).is_err() {
-                        return;
-                    }
-                    if !foxy_exit_agrees(&mut tunnel, foxy) {
-                        return;
-                    }
-                    let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
-                    relay_tunnel(&client, &tunnel);
-                    if let (Some(id), crate::foxy::Carrier::H3) = (stream, carrier) {
-                        crate::quic::release_stream(&foxy_quic_dial(foxy, &edge), id);
-                    }
-                    return;
+                    clear_limited(&foxy.limited_strikes, &foxy.limited_until);
+                    let h3 = h3.map(|id| (foxy_quic_dial(foxy, &edge), id));
+                    return FoxyOpen::Tunnel(Box::new(tunnel), h3);
                 }
                 Err(failure) => {
+                    debug_lane(&edge, carrier, &failure.to_string());
                     // A refused pass is the pass, not the edge: every carrier and
                     // every edge would answer the same way, so the loop stops.
                     if let ferrox_core::foxy::Failure::Rejected(status) = failure {
                         if ferrox_core::foxy::pass_is_rejected(status) {
                             foxy.unauthenticated
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        // A limit is account-wide, so one attempt per flow is
+                        // the whole budget: the rest wait out the curve.
+                        if status == 429 {
+                            note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
                             break;
                         }
                         if ferrox_core::foxy::target_is_unreachable(status) {
@@ -4240,8 +4430,187 @@ fn serve_foxy(mut client: TcpStream, foxy: &FoxyOut, asked: &SocksTarget) {
             }
         }
     }
-    let reply = last.map_or(0x01, crate::foxy::refusal_reply);
-    let _ = client.write_all(&foxy_socks_reply(reply));
+    FoxyOpen::Refused(last.map_or(0x01, crate::foxy::refusal_reply))
+}
+
+/// The Foxy half of either front: CONNECT grants the tunnel, plain HTTP
+/// forwards its head through it, and a split target leaves by direct dial.
+fn serve_foxy_front(
+    mut client: TcpStream,
+    foxy: &FoxyOut,
+    asked: &SocksTarget,
+    front: Front,
+    prefix: &[u8],
+) {
+    match foxy_open(foxy, asked) {
+        FoxyOpen::Tunnel(tunnel, h3) => {
+            let mut tunnel = *tunnel;
+            if prefix.is_empty() && client.write_all(&front.grant_line()).is_err() {
+                return;
+            }
+            if !foxy_exit_agrees(&mut tunnel, foxy) {
+                return;
+            }
+            if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
+                return;
+            }
+            // One lock serves both relay directions, so a blocking
+            // backward read would hold it while the forward write
+            // waits: the quantum bounds one read instead.
+            let _ = tunnel.set_read_quantum(RELAY_QUANTUM);
+            let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+            relay_tunnel(&client, &tunnel);
+            if let Some((dial, id)) = h3 {
+                crate::quic::release_stream(&dial, id);
+            }
+        }
+        FoxyOpen::Direct(target) => {
+            let Some(mut upstream) = dial_or_report(&target) else {
+                return;
+            };
+            if prefix.is_empty() {
+                if let Some(grant) = front.direct_grant() {
+                    if client.write_all(grant).is_err() {
+                        return;
+                    }
+                }
+            }
+            if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+                return;
+            }
+            relay(&client, &upstream);
+        }
+        FoxyOpen::Refused(code) => {
+            let _ = client.write_all(&front.refusal(code));
+        }
+        FoxyOpen::Silent => {}
+    }
+}
+
+const HTTP_HEAD_LIMIT: usize = 8192;
+
+/// An HTTP proxy request: a tunnel to open, or a head to forward to a raw uplink.
+enum ProxyRequest {
+    Connect(SocksTarget),
+    Forward(SocksTarget, Vec<u8>),
+}
+
+/// CONNECT opens a tunnel; absolute- and origin-form forward the head with the
+/// request line rewritten to origin-form, which is what an origin parses.
+fn http_proxy_request(head: &[u8]) -> Option<ProxyRequest> {
+    let line = head.split(|byte| *byte == b'\n').next()?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next().unwrap_or(b"HTTP/1.1");
+    if method.eq_ignore_ascii_case(b"CONNECT") {
+        return authority_target(target).map(ProxyRequest::Connect);
+    }
+    if method.eq_ignore_ascii_case(b"OPTIONS")
+        || method.eq_ignore_ascii_case(b"TRACE")
+        || target.is_empty()
+    {
+        return None;
+    }
+    if let Some(rest) = target.strip_prefix(b"http://") {
+        let (authority, path) = match rest.iter().position(|byte| *byte == b'/') {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, b"/".as_slice()),
+        };
+        let asked = authority_target(authority)?;
+        return Some(ProxyRequest::Forward(
+            asked,
+            origin_head(method, path, version, head),
+        ));
+    }
+    if target.starts_with(b"/") {
+        let host = header_value(head, "host")?;
+        let asked = authority_target(host.as_bytes())?;
+        return Some(ProxyRequest::Forward(
+            asked,
+            origin_head(method, target, version, head),
+        ));
+    }
+    None
+}
+
+/// Rewrites the request line to origin-form, keeping every header byte as sent.
+fn origin_head(method: &[u8], path: &[u8], version: &[u8], head: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len());
+    out.extend_from_slice(method);
+    out.push(b' ');
+    out.extend_from_slice(path);
+    out.push(b' ');
+    out.extend_from_slice(version);
+    out.extend_from_slice(b"\r\n");
+    let rest = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    out.extend_from_slice(&head[rest..]);
+    out
+}
+
+/// An authority as a target: a literal address stays one, a name rides the
+/// tunnel untouched, and a missing port is plain HTTP's 80.
+fn authority_target(authority: &[u8]) -> Option<SocksTarget> {
+    let authority = std::str::from_utf8(authority).ok()?;
+    if let Ok(address) = authority.parse::<SocketAddr>() {
+        return Some(SocksTarget::Address(address));
+    }
+    if let Ok(ip) = authority.parse::<std::net::IpAddr>() {
+        return Some(SocksTarget::Address(SocketAddr::new(ip, 80)));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (authority, 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(SocksTarget::Name(host.to_owned(), port))
+}
+
+/// The `http` front: CONNECT tunnels like SOCKS does, plain HTTP forwards its
+/// head through a raw uplink, and anything unparsable closes quietly.
+fn serve_http(mut client: TcpStream, out: &Outbound) {
+    let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT) else {
+        return;
+    };
+    let Some(request) = http_proxy_request(&head) else {
+        return;
+    };
+    match request {
+        ProxyRequest::Connect(asked) => {
+            if !matches!(out, Outbound::Foxy(_))
+                && client.write_all(&Front::Http.grant_line()).is_err()
+            {
+                return;
+            }
+            serve_connect(client, out, &asked, Front::Http, &[]);
+        }
+        ProxyRequest::Forward(asked, origin) => {
+            serve_connect(client, out, &asked, Front::Http, &origin);
+        }
+    }
+}
+
+/// The `mixed` front sniffs one byte: SOCKS5 greets with 0x05, HTTP with a
+/// method token, and a peek consumes nothing either way.
+fn serve_mixed(client: TcpStream, out: &Outbound) {
+    let mut first = [0u8; 1];
+    let Ok(n) = client.peek(&mut first) else {
+        return;
+    };
+    if n == 0 {
+        return;
+    }
+    if first[0] == 5 {
+        serve_socks(client, out);
+    } else {
+        serve_http(client, out);
+    }
 }
 
 fn now_secs() -> u64 {
@@ -4315,8 +4684,126 @@ fn serve_socks_udp(mut client: TcpStream, out: &Outbound) {
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw) => {
             serve_socks_udp_shadowsocks(&relay, ss);
         }
+        Outbound::Foxy(foxy) => {
+            serve_socks_udp_foxy(&relay, foxy);
+        }
         _ => {}
     }
+}
+
+/// UDP over the Foxy lane: one CONNECT-UDP stream per destination, opened
+/// lazily on the first datagram. UDP rides H2 only — the H1 upgrade form is
+/// unimplemented and no published edge answers QUIC — so the configured
+/// carrier does not apply here.
+fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
+    const POLL: Duration = Duration::from_millis(10);
+    let _ = relay.set_read_timeout(Some(POLL));
+    let mut streams: HashMap<SocketAddr, crate::foxy::Tls2> = HashMap::new();
+    let mut buf = vec![0u8; UDP_BUF];
+    let mut datagram = vec![0u8; UDP_BUF];
+    let mut reply = Vec::with_capacity(UDP_BUF);
+    let mut client = None;
+    loop {
+        match relay.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                client = Some(src);
+                let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                    continue;
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(slot) = streams.entry(dest) {
+                    if let Some(lane) = foxy_udp_dial(foxy, &dest) {
+                        slot.insert(lane);
+                    }
+                }
+                if let Some(lane) = streams.get_mut(&dest) {
+                    if lane.write_datagram(payload).is_err() {
+                        streams.remove(&dest);
+                    }
+                }
+            }
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => break,
+        }
+        let mut dead = Vec::new();
+        for (dest, lane) in &mut streams {
+            match lane.read_datagram(&mut datagram) {
+                Ok(0) => {}
+                Ok(n) => {
+                    if let Some(src) = client {
+                        reply.clear();
+                        reply.extend_from_slice(&[0, 0, 0]);
+                        push_socks_addr(&mut reply, dest);
+                        reply.extend_from_slice(&datagram[..n]);
+                        let _ = relay.send_to(&reply, src);
+                    }
+                }
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => dead.push(*dest),
+            }
+        }
+        for dest in dead {
+            streams.remove(&dest);
+        }
+    }
+}
+
+/// Opens a CONNECT-UDP stream to one destination on the first edge that
+/// answers, H2 only. The pass is read fresh per dial so a renewal between
+/// datagrams is picked up without reopening anything else.
+fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Tls2> {
+    if edge_limited(&foxy.limited_until, now_secs()) {
+        return None;
+    }
+    let order = ferrox_core::foxy::catalog::tier(
+        &foxy.candidates,
+        &foxy.country,
+        &foxy.city,
+        MAX_FOXY_ALTERNATES,
+    );
+    for edge in ferrox_core::foxy::dial_order(
+        &order,
+        &foxy.country,
+        foxy.stored.as_ref(),
+        MAX_FOXY_ALTERNATES,
+    ) {
+        let pass = foxy
+            .account
+            .as_ref()
+            .map_or_else(|| foxy.pass.clone(), |account| account.current());
+        let dial = crate::foxy::FoxyDial {
+            host: edge.host.clone(),
+            port: edge.port,
+            address: foxy.edge_address,
+            carrier: crate::foxy::Carrier::H2,
+            upstream: foxy.upstream.clone(),
+            roots: foxy.roots.clone(),
+            pins: foxy.pins.clone(),
+            pass,
+        };
+        match crate::foxy::open_udp(&dial, &dest.ip().to_string(), dest.port()) {
+            Ok(lane) => {
+                debug_lane(
+                    &edge,
+                    crate::foxy::Carrier::H2,
+                    &format!("udp opened for {dest}"),
+                );
+                clear_limited(&foxy.limited_strikes, &foxy.limited_until);
+                let _ = lane.set_read_quantum(RELAY_QUANTUM);
+                return Some(lane);
+            }
+            Err(failure) => {
+                debug_lane(&edge, crate::foxy::Carrier::H2, &failure.to_string());
+                if matches!(failure, ferrox_core::foxy::Failure::Rejected(429)) {
+                    note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
+                    break;
+                }
+            }
+        }
+    }
+    None
 }
 
 fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
@@ -4661,6 +5148,13 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
 /// The relay a CONNECT lane uses: the same two directions, against a tunnel
 /// that is one stateful session rather than a socket, so both directions take
 /// the same lock and each holds it for one bounded copy.
+/// One backward read never holds the shared lock longer than this: past it the
+/// read answers `WouldBlock`, the lock is released, and the forward write gets
+/// its turn. Without the bound the first idle read wedges every upload.
+const RELAY_QUANTUM: Duration = Duration::from_millis(100);
+/// How long one quiet poll sleeps before retrying: long enough to not spin,
+/// short enough that interactive traffic never feels it.
+const RELAY_IDLE: Duration = Duration::from_millis(10);
 /// The QUIC dial a lane hands the pool: the edge's own name, not the address it
 /// was resolved to, so every flow of one country shares one connection.
 fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate::quic::QuicDial {
@@ -4669,6 +5163,7 @@ fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate:
         host: edge.host.clone(),
         address: edge.host.clone(),
         port: edge.port,
+        upstream: foxy.upstream.clone(),
         roots: Some(foxy.roots.clone()),
     }
 }
@@ -4698,30 +5193,109 @@ fn copy_locked(
     forward: bool,
 ) {
     const CHUNK: usize = 16 * 1024;
+    let direction = if forward { "forward" } else { "backward" };
     let mut buf = [0u8; CHUNK];
+    let mut total = 0u64;
     loop {
         let moved = if forward {
             match socket.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => match tunnel.lock() {
-                    Ok(mut lane) => lane.write(&buf[..read]).unwrap_or(0),
-                    Err(_) => 0,
-                },
+                Ok(0) => {
+                    debug_relay(direction, total, None);
+                    break;
+                }
+                Err(error) => {
+                    debug_relay(direction, total, Some(error.kind()));
+                    break;
+                }
+                // A short write is credit, not completion: the window reopens
+                // as the other direction drains, so the rest is retried rather
+                // than dropped.
+                Ok(read) => {
+                    if total == 0 {
+                        debug_bytes(direction, &buf[..read]);
+                    }
+                    write_full(tunnel, &buf[..read])
+                }
             }
         } else {
             let Ok(mut lane) = tunnel.lock() else { break };
             match lane.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => match socket.write_all(&buf[..read]) {
-                    Ok(()) => read,
-                    Err(_) => break,
-                },
+                Ok(0) => {
+                    debug_relay(direction, total, None);
+                    break;
+                }
+                Ok(read) => {
+                    if total == 0 {
+                        debug_bytes(direction, &buf[..read]);
+                    }
+                    match socket.write_all(&buf[..read]) {
+                        Ok(()) => read,
+                        Err(error) => {
+                            debug_relay(direction, total, Some(error.kind()));
+                            break;
+                        }
+                    }
+                }
+                // The quantum elapsed with no payload: release the lock so the
+                // forward write gets its turn, then poll again.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    drop(lane);
+                    std::thread::sleep(RELAY_IDLE);
+                    continue;
+                }
+                Err(error) => {
+                    debug_relay(direction, total, Some(error.kind()));
+                    break;
+                }
             }
         };
+        total += moved as u64;
         if moved == 0 {
+            debug_relay(direction, total, None);
             break;
         }
     }
+}
+
+/// Writes every byte through the shared lane, holding the lock per call so the
+/// other direction interleaves between frames.
+fn write_full(
+    tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
+    mut buf: &[u8],
+) -> usize {
+    let total = buf.len();
+    while !buf.is_empty() {
+        let Ok(mut lane) = tunnel.lock() else {
+            break;
+        };
+        match lane.write(buf) {
+            Ok(0) => {
+                drop(lane);
+                std::thread::sleep(RELAY_IDLE);
+            }
+            Ok(wrote) => buf = &buf[wrote..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                drop(lane);
+                std::thread::sleep(RELAY_IDLE);
+            }
+            Err(_) => break,
+        }
+    }
+    total - buf.len()
 }
 
 fn relay(client: &TcpStream, target: &TcpStream) {
@@ -5299,7 +5873,13 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     F: FnOnce(&mut R),
 {
     const CHUNK: usize = 16 * 1024;
+    if echo_trace_on() {
+        echo_trace("relay start");
+    }
     let Ok(peer_read) = peer.try_clone() else {
+        if echo_trace_on() {
+            echo_trace("relay no peer");
+        }
         return;
     };
     let Ok(peer_write) = peer.try_clone() else {
@@ -5310,15 +5890,39 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     let uplink = writer.clone();
     let done = thread::spawn(move || {
         let mut buf = vec![0u8; CHUNK];
+        let mut first = true;
         loop {
             match peer_read.read(&mut buf) {
                 Ok(n) if n > 0 => {
-                    if !uplink.send(&buf[..n]) {
+                    let sent = uplink.send(&buf[..n]);
+                    if echo_trace_on() && first {
+                        echo_trace(if sent {
+                            "relay fwd first send ok"
+                        } else {
+                            "relay fwd first send failed"
+                        });
+                        first = false;
+                    }
+                    if !sent {
+                        if echo_trace_on() {
+                            echo_trace("relay fwd send failed");
+                        }
                         break;
                     }
                 }
                 Err(error) if is_timeout(&error) => {}
-                _ => break,
+                Err(error) => {
+                    if echo_trace_on() {
+                        echo_trace(&format!("relay fwd read err {error:?}"));
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    if echo_trace_on() {
+                        echo_trace("relay fwd eof");
+                    }
+                    break;
+                }
             }
         }
         if CLOSE_FIRST {
@@ -5327,15 +5931,34 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
         }
     });
     let mut buf = vec![0u8; CHUNK];
+    let mut first = true;
     loop {
         match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
+                if echo_trace_on() && first {
+                    echo_trace("relay bwd first read");
+                    first = false;
+                }
                 if peer_write.write_all(&buf[..n]).is_err() {
+                    if echo_trace_on() {
+                        echo_trace("relay bwd peer write failed");
+                    }
                     break;
                 }
             }
             Err(error) if is_timeout(&error) => {}
-            _ => break,
+            Err(error) => {
+                if echo_trace_on() {
+                    echo_trace(&format!("relay bwd read err {error:?}"));
+                }
+                break;
+            }
+            Ok(_) => {
+                if echo_trace_on() {
+                    echo_trace("relay bwd eof");
+                }
+                break;
+            }
         }
     }
     if CLOSE_FIRST {
@@ -5586,6 +6209,9 @@ pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
         let mut rest = vec![0u8; consumed - 2];
         read_exact(stream, &mut rest).ok()?;
     }
+    if echo_trace_on() {
+        echo_trace("response ok");
+    }
     Some(())
 }
 
@@ -5814,8 +6440,10 @@ fn trojan_key(password: &str) -> [u8; 56] {
 }
 
 /// The same handshake, keeping the name the client sent. A CONNECT lane needs
-/// it: resolving here would hand the edge an address it cannot route.
-fn socks_target(client: &mut TcpStream) -> Option<(u8, SocksTarget)> {
+/// it: resolving here would hand the edge an address it cannot route. The grant
+/// is the caller's: lanes that relay after dialling take it here, and the Foxy
+/// lane grants after its tunnel opens instead.
+fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, SocksTarget)> {
     let mut head = [0u8; 2];
     read_exact(client, &mut head).ok()?;
     if head[0] != 5 {
@@ -5832,7 +6460,7 @@ fn socks_target(client: &mut TcpStream) -> Option<(u8, SocksTarget)> {
         return None;
     }
     let target = read_socks_named(client, req[3])?;
-    if req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
+    if grant && req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
         return None;
     }
     Some((req[1], target))
@@ -6018,6 +6646,66 @@ fn is_freedom(root: &Json) -> bool {
 /// The carrier the config names, or the one the link names, or `auto`: a lane
 /// that is told nothing tries QUIC, then HTTP/2, then HTTP/1.1, rather than
 /// committing to one carrier the edge may not answer.
+/// Where the lane may exit. An edge the config or the link names outright is
+/// dialed whatever the catalogue publishes, because naming one is a decision
+/// and guessing is not; an address is separate, the poison-proof dial that is
+/// never the TLS name. With nothing configured naming an edge the published
+/// list decides, which is what lets a link that says only `country=US` reach
+/// an exit at all.
+fn foxy_candidates(
+    outbound: &Json,
+    link: &ferrox_core::foxy::link::FoxyLink,
+    country: &str,
+    city: &str,
+    roots: Vec<Vec<u8>>,
+) -> Vec<ferrox_core::foxy::Candidate> {
+    let named = link.host();
+    let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
+        host: named.to_owned(),
+        port: link.port(),
+        country: country.to_owned(),
+        city: city.to_owned(),
+    });
+    let configured_edges = foxy_edges(outbound, country, city);
+    if let Some(edge) = named_edge {
+        return vec![edge];
+    }
+    if !configured_edges.is_empty() {
+        return configured_edges;
+    }
+    crate::foxy_catalog::edges(roots)
+}
+
+/// An edge address the config names outright, resolved once so every dial
+/// shares it; empty means the catalogue's names resolve per dial.
+fn foxy_edge_address(settings: Option<&Json>) -> Option<SocketAddr> {
+    let named = foxy_text(settings, "edgeAddress");
+    if named.is_empty() {
+        return None;
+    }
+    resolve(&named, 443)
+}
+
+/// An upstream proxy the edge dial chains through, from the config first and
+/// the link second. A named value that does not parse is the caller's to
+/// refuse: going direct past a configured proxy would be a leak, not a
+/// fallback.
+fn foxy_upstream(
+    settings: Option<&Json>,
+    link: &ferrox_core::foxy::link::FoxyLink,
+) -> Result<Option<crate::foxy::UpstreamProxy>, String> {
+    let named = foxy_text(settings, "upstreamProxy");
+    let named = if named.is_empty() {
+        link.upstream_proxy().to_owned()
+    } else {
+        named
+    };
+    if named.is_empty() {
+        return Ok(None);
+    }
+    crate::foxy::upstream_proxy(&named).map(Some).ok_or(named)
+}
+
 fn foxy_carrier(
     settings: Option<&Json>,
     link: &ferrox_core::foxy::link::FoxyLink,
@@ -6219,6 +6907,13 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         }
         let country = foxy_country(&link, settings);
         let city = foxy_text_or(&link, settings, "city").to_ascii_uppercase();
+        let upstream = match foxy_upstream(settings, &link) {
+            Ok(upstream) => upstream,
+            Err(named) => {
+                eprintln!("foxy: upstreamProxy {named:?} is not http:// or socks5(h)://host:port: serves nothing");
+                continue;
+            }
+        };
         // A CA file names the anchors to trust; without one the lane trusts the
         // anchors this machine already trusts, because an empty root store is
         // not "trust the platform" — it is trust nothing, and the account plane
@@ -6231,30 +6926,20 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             .filter(|roots: &Vec<Vec<u8>>| !roots.is_empty())
             .unwrap_or_else(crate::quic::system_roots);
         let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
-        // An edge the config or the link names outright is dialed whatever the
-        // catalogue publishes, because naming one is a decision and guessing is
-        // not; an address is the poison-proof dial and never the TLS name.
-        let named = link.host();
-        let named_address = foxy_text(settings, "edgeAddress");
-        let edge_address = if named_address.is_empty() {
-            None
-        } else {
-            resolve(&named_address, 443)
-        };
-        let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
-            host: named.to_owned(),
-            port: link.port(),
-            country: country.clone(),
-            city: city.clone(),
-        });
-        let configured_edges = foxy_edges(outbound, &country, &city);
-        let candidates = match named_edge {
-            Some(edge) => vec![edge],
-            None if !configured_edges.is_empty() => configured_edges,
-            // Nothing configured names an edge, so the published list does: this
-            // is what lets a link that says only `country=US` reach an exit.
-            None => crate::foxy_catalog::edges(roots.clone()),
-        };
+        let edge_address = foxy_edge_address(settings);
+        let candidates = foxy_candidates(outbound, &link, &country, &city, roots.clone());
+        let carrier = foxy_carrier(settings, &link);
+        // An HTTP hop carries streams, not datagrams, so the QUIC carrier has
+        // nothing to ride it with: the lane is refused here rather than silently
+        // dropping to a carrier the config did not ask for.
+        if upstream
+            .as_ref()
+            .is_some_and(crate::foxy::UpstreamProxy::http)
+            && carrier == crate::foxy::Carrier::H3
+        {
+            eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
+            continue;
+        }
         let account = foxy_account(
             &email,
             &password,
@@ -6280,9 +6965,12 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             candidates,
             stored: None,
             unauthenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             country,
             city,
-            carrier: foxy_carrier(settings, &link),
+            carrier,
+            upstream,
             roots,
             pins,
             pass,
@@ -6296,6 +6984,44 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         });
     }
     None
+}
+
+/// Mints one proxy pass from the account in the config and stores it for legs
+/// that must not sign in again: one login per job, not one per carrier, which
+/// is what the account plane's rate limit counts.
+pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
+    let text = std::fs::read_to_string(config)
+        .unwrap_or_else(|error| exit(&format!("cannot read {config}: {error}")));
+    let root = crate::json::parse(&text)
+        .unwrap_or_else(|error| exit(&format!("bad config {config}: {error}")));
+    let Some(foxy) = find_foxy_outbound(&root) else {
+        exit("no foxy outbound with an email or a pass in {config}");
+    };
+    let token = foxy.account.as_ref().map(|account| account.current());
+    let Some(pass) = token else {
+        exit("the account did not sign in, so there is no pass to store");
+    };
+    if pass.token.is_empty() {
+        exit("the account did not sign in, so there is no pass to store");
+    }
+    let mut stored = String::with_capacity(pass.token.len() + 12);
+    stored.push_str("{\"pass\":\"");
+    for byte in pass.token.bytes() {
+        if byte == b'"' || byte == b'\\' {
+            stored.push('\\');
+        }
+        stored.push(byte as char);
+    }
+    stored.push_str("\"}");
+    std::fs::write(out, stored)
+        .unwrap_or_else(|error| exit(&format!("cannot write {out}: {error}")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("minted=1 expires_at={:?}", pass.expires_at);
+    std::process::exit(0);
 }
 
 fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
@@ -6905,6 +7631,40 @@ mod tests {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             Err(std::io::Error::other("no bytes today"))
         }
+    }
+
+    #[test]
+    fn a_connect_lane_grants_only_after_its_tunnel_opens() {
+        fn handshake(grant: bool) -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let accepted = std::thread::spawn(move || listener.accept().expect("accepts").0);
+            let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("times out");
+            client
+                .write_all(&[5, 1, 0, 5, 1, 0, 3, 11])
+                .expect("greets");
+            client.write_all(b"example.com").expect("names");
+            client.write_all(&[0, 80]).expect("ports");
+            let mut server = accepted.join().expect("accepts");
+            let (cmd, target) = socks_target(&mut server, grant).expect("handshakes");
+            assert_eq!(cmd, 1);
+            assert_eq!(target.authority(), "example.com:80");
+            let mut reply = [0u8; 2];
+            client.read_exact(&mut reply).expect("selects a method");
+            assert_eq!(reply, [5, 0]);
+            let mut rest = Vec::new();
+            let _ = client.read_to_end(&mut rest);
+            drop(server);
+            rest
+        }
+        let granted = handshake(true);
+        assert_eq!(granted.len(), 10, "one grant, ten bytes");
+        assert_eq!(&granted[..3], &[5, 0, 0]);
+        let ungranted = handshake(false);
+        assert!(ungranted.is_empty(), "no grant before the tunnel opens");
     }
 
     struct Dribble {
@@ -8176,16 +8936,20 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let Some((got, _flow, cmd, _target)) = decode_request(&mut tls) else {
                 panic!("reads a vless header");
             };
             assert_eq!(got, id);
             assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
             tls.write_all(&[0, 0]).expect("answers");
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf).expect("reads");
+            echo_trace(&format!("srv {port} ping read"));
             tls.write_all(&buf).expect("echoes");
         });
         let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -8205,7 +8969,9 @@ mod tests {
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
             };
+            echo_trace(&format!("cli {port} dialing"));
             dial_vless(&client, &server, &vless, &target, Ladder::global());
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -8227,14 +8993,18 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let Some((cmd, _target)) = decode_trojan_request(&mut tls, &key) else {
                 panic!("reads a trojan header");
             };
             assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf).expect("reads");
+            echo_trace(&format!("srv {port} ping read"));
             tls.write_all(&buf).expect("echoes");
         });
         let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -8251,7 +9021,9 @@ mod tests {
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
+            echo_trace(&format!("cli {port} dialing"));
             dial_trojan(&client, &server, &trojan, &target, Ladder::global());
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -8273,19 +9045,23 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let Some((_target, mut send, mut recv, prefix, cmd)) =
                 crate::vmess::accept_request(&mut tls, &id)
             else {
                 panic!("reads a vmess header");
             };
             assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
             tls.write_all(&prefix).expect("answers");
             let mut scratch = Vec::with_capacity(16 * 1024);
             let chunk = crate::vmess::read_frame(&mut tls, &mut recv, &mut scratch)
                 .expect("reads a frame")
                 .to_vec();
+            echo_trace(&format!("srv {port} ping read"));
             let mut staging = Vec::with_capacity(16 * 1024);
             let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
             assert!(crate::vmess::write_frame(
@@ -8295,6 +9071,7 @@ mod tests {
                 &mut staging,
                 &mut pad
             ));
+            echo_trace(&format!("srv {port} echoed vmess"));
         });
         let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
@@ -8311,7 +9088,9 @@ mod tests {
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
+            echo_trace(&format!("cli {port} dialing"));
             dial_vmess(&client, &server, &vmess, &target, Ladder::global());
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -8334,13 +9113,18 @@ mod tests {
         let mut at = 0;
         while at < back.len() {
             match sock.read(&mut back[at..]) {
-                Ok(0) => panic!("echoes: closed after {:?}", start.elapsed()),
+                Ok(0) => panic!(
+                    "echoes: closed after {:?}; last dial: {:?}",
+                    start.elapsed(),
+                    last_dial_failure()
+                ),
                 Ok(n) => at += n,
                 Err(error) => {
                     assert!(
                         is_timeout(&error) && start.elapsed() < Duration::from_secs(120),
-                        "echoes: {error:?} after {:?}",
-                        start.elapsed()
+                        "echoes: {error:?} after {:?}; last dial: {:?}",
+                        start.elapsed(),
+                        last_dial_failure()
                     );
                 }
             }
@@ -8368,9 +9152,11 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::RustlsServerProvider::accept(&server_config, stream)
                 .expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let shared = Arc::new(Mutex::new(tls));
             let (mut reader, mut writer) = accept(
                 TlsHalf {
@@ -8379,6 +9165,7 @@ mod tests {
                 TlsHalf { session: shared },
             )
             .expect("accepts carrier");
+            echo_trace(&format!("srv {port} carrier up"));
             match kind {
                 TlsEcho::Vless(id) => {
                     let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
@@ -8386,19 +9173,26 @@ mod tests {
                     };
                     assert_eq!(got, id);
                     assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
                     writer.write_all(&[0, 0]).expect("answers");
+                    echo_trace(&format!("srv {port} response sent"));
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
+                    echo_trace(&format!("srv {port} ping read"));
                     writer.write_all(&buf).expect("echoes");
+                    echo_trace(&format!("srv {port} echoed vless"));
                 }
                 TlsEcho::Trojan(key) => {
                     let Some((cmd, _target)) = decode_trojan_request(&mut reader, &key) else {
                         panic!("reads a trojan header");
                     };
                     assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
+                    echo_trace(&format!("srv {port} ping read"));
                     writer.write_all(&buf).expect("echoes");
+                    echo_trace(&format!("srv {port} echoed trojan"));
                 }
                 TlsEcho::Vmess(id) => {
                     let Some((_target, mut send, mut recv, prefix, cmd)) =
@@ -8407,11 +9201,14 @@ mod tests {
                         panic!("reads a vmess header");
                     };
                     assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
                     writer.write_all(&prefix).expect("answers");
+                    echo_trace(&format!("srv {port} response sent"));
                     let mut scratch = Vec::with_capacity(16 * 1024);
                     let chunk = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
                         .expect("reads a frame")
                         .to_vec();
+                    echo_trace(&format!("srv {port} ping read"));
                     let mut staging = Vec::with_capacity(16 * 1024);
                     let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
                     assert!(crate::vmess::write_frame(
@@ -8421,6 +9218,7 @@ mod tests {
                         &mut staging,
                         &mut pad
                     ));
+                    echo_trace(&format!("srv {port} echoed vmess"));
                 }
             }
             // Exit only after the client closed: closing with its frames unread resets the echo with it.
@@ -8433,7 +9231,9 @@ mod tests {
             let (client, _) = downstream.accept().expect("accepts");
             let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
             let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            echo_trace(&format!("cli {port} dialing"));
             dial_socks_outbound(&client, &out(port), &server, &target);
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -11159,7 +11959,10 @@ mod tests {
 
     const QUIC_TEST_POLL: Duration = Duration::from_millis(100);
 
-    fn quic_server_poll(sock: &UdpSocket, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    fn quic_server_poll(
+        sock: &crate::quic::Datagram,
+        buf: &mut [u8],
+    ) -> Option<(usize, SocketAddr)> {
         sock.set_read_timeout(Some(QUIC_TEST_POLL))
             .expect("timeout");
         match sock.recv_from(buf) {
@@ -11176,7 +11979,11 @@ mod tests {
         }
     }
 
-    fn quic_server_idle(conn: &mut quiche::Connection, sock: &UdpSocket, out: &mut [u8]) {
+    fn quic_server_idle(
+        conn: &mut quiche::Connection,
+        sock: &crate::quic::Datagram,
+        out: &mut [u8],
+    ) {
         conn.on_timeout();
         while let Ok((written, info)) = conn.send(out) {
             sock.send_to(&out[..written], info.to).expect("answers");
@@ -11184,7 +11991,7 @@ mod tests {
     }
 
     fn quic_server_accept(
-        sock: &UdpSocket,
+        sock: &crate::quic::Datagram,
         local: SocketAddr,
         config: &mut quiche::Config,
     ) -> (quiche::Connection, Vec<u8>) {
@@ -11233,7 +12040,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)] // A protocol loop: header, accept, then echo.
     fn quic_vless_echo_server(
-        sock: UdpSocket,
+        sock: crate::quic::Datagram,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         expected_header: Vec<u8>,
@@ -11710,7 +12517,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)] // Temporary: timestamp stages for the Linux diagnosis.
     fn quic_concurrent_echo_server(
-        sock: UdpSocket,
+        sock: crate::quic::Datagram,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         expected_header: Vec<u8>,
@@ -11882,7 +12689,8 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let quic_sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let expected_header = vless_header(&id, 1, &target);
         let server = quic_vless_echo_server(
@@ -12060,7 +12868,8 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let quic_sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let server = quic_vless_echo_server(
             quic_sock,
@@ -12075,6 +12884,7 @@ mod tests {
             host: "localhost".to_owned(),
             address: "127.0.0.1".to_owned(),
             port: quic_port,
+            upstream: None,
             roots: Some(roots),
         };
         let relay = thread::spawn(move || {
@@ -12130,7 +12940,8 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let quic_sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let server = quic_concurrent_echo_server(
@@ -12144,6 +12955,7 @@ mod tests {
             host: "localhost".to_owned(),
             address: "127.0.0.1".to_owned(),
             port: quic_port,
+            upstream: None,
             roots: Some(roots),
         };
         let front = Arc::new(TcpListener::bind("127.0.0.1:0").expect("binds"));
@@ -12408,7 +13220,7 @@ mod tests {
 
     fn hysteria_test_answer_auth(
         conn: &mut quiche::Connection,
-        sock: &UdpSocket,
+        sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
     ) -> Vec<u8> {
@@ -12443,7 +13255,7 @@ mod tests {
 
     fn hysteria_test_read_prefix(
         conn: &mut quiche::Connection,
-        sock: &UdpSocket,
+        sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
     ) -> Vec<u8> {
@@ -12493,7 +13305,8 @@ mod tests {
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
         std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
         std::fs::write(&key_path, &key_pem).expect("stages key");
-        let sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let port = sock.local_addr().expect("addr").port();
         thread::spawn(move || {
             let mut config = hysteria_test_server_config(&cert_path, &key_path);
@@ -12568,6 +13381,7 @@ mod tests {
         let (port, roots) = hysteria_loop_with("bisect2-auth", id);
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
         getrandom::getrandom(&mut scid).expect("random");
@@ -12713,6 +13527,235 @@ mod tests {
             serve_socks(stream, &out);
         });
         port
+    }
+
+    fn http_front_with(out: Outbound) -> u16 {
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_http(stream, &out);
+        });
+        port
+    }
+
+    fn http_connect(port: u16, authority: &str) -> TcpStream {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .expect("connects");
+        client
+    }
+
+    fn http_status(client: &mut TcpStream) -> String {
+        let head = read_http_head(client, HEAD_LIMIT_TEST).expect("reads a head");
+        let line = head.split(|byte| *byte == b'\n').next().expect("a line");
+        String::from_utf8(line.to_vec()).expect("text")
+    }
+
+    #[test]
+    fn http_connect_reaches_echo_direct() {
+        let echo = echo_once();
+        let front = http_front_with(Outbound::Freedom);
+        let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
+        assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn http_get_forwards_origin_form_to_direct() {
+        let echo = echo_once();
+        let front = http_front_with(Outbound::Freedom);
+        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{echo}/path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST).expect("echoes the head");
+        assert_eq!(
+            head,
+            format!("GET /path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes()
+        );
+    }
+
+    #[test]
+    fn http_get_to_a_protocol_outbound_is_405() {
+        let front = http_front_with(Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: 1,
+            id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
+            carrier: Carrier::Raw,
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: None,
+        }));
+        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(b"GET http://127.0.0.1:1/ HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+            .expect("gets");
+        assert!(http_status(&mut client).starts_with("HTTP/1.1 405"));
+    }
+
+    #[test]
+    fn http_connect_tunnels_vless_raw_to_echo() {
+        let echo = echo_once();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_port = server.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accepts");
+            serve_vless_raw(stream, &id, true);
+        });
+        let front = http_front_with(Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_port,
+            id,
+            carrier: Carrier::Raw,
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: None,
+        }));
+        let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
+        assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn mixed_serves_socks_and_http_on_one_port() {
+        let echo_socks = echo_once();
+        let echo_http = echo_once();
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in front.incoming().take(2) {
+                let Ok(stream) = stream else { continue };
+                thread::spawn(|| serve_mixed(stream, &Outbound::Freedom));
+            }
+        });
+        let mut socks = socks_tcp_client(port, echo_socks);
+        socks.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        socks.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let mut http = http_connect(port, &format!("127.0.0.1:{echo_http}"));
+        assert!(http_status(&mut http).starts_with("HTTP/1.1 200"));
+        http.write_all(b"ping").expect("writes");
+        http.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn garbage_closes_the_http_front() {
+        let front = http_front_with(Outbound::Freedom);
+        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(b"GARBAGE\r\n\r\n").expect("writes");
+        let mut probe = [0u8; 1];
+        match client.read(&mut probe) {
+            Ok(0) | Err(_) => {}
+            Ok(_) => panic!("garbage was answered"),
+        }
+    }
+
+    #[test]
+    fn http_request_parses_connect_and_both_get_forms() {
+        let connect = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let Some(ProxyRequest::Connect(asked)) = http_proxy_request(connect) else {
+            panic!("connect parses");
+        };
+        assert_eq!(asked.authority(), "example.com:443");
+        let absolute =
+            b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(absolute) else {
+            panic!("absolute-form parses");
+        };
+        assert_eq!(asked.authority(), "example.com:8080");
+        assert_eq!(
+            origin,
+            b"GET /p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+        );
+        let origin_form = b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(origin_form) else {
+            panic!("origin-form parses");
+        };
+        assert_eq!(asked.authority(), "example.com:80");
+        assert_eq!(origin, origin_form);
+        assert!(http_proxy_request(b"GET /p HTTP/1.1\r\n\r\n").is_none());
+        assert!(http_proxy_request(b"GARBAGE\r\n\r\n").is_none());
+    }
+
+    /// An HTTP hop carries streams, not datagrams, so the QUIC carrier has
+    /// nothing to ride it with: the lane is refused here rather than silently
+    /// dropping to a carrier the config never asked for.
+    #[test]
+    fn an_http_hop_refuses_the_quic_carrier_before_any_dial() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c","password":"pw","carrier":"h3","upstreamProxy":"http://proxy.local:8080"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    /// The same lane over a SOCKS5 hop starts: the UDP association is how the
+    /// QUIC carrier rides it, so the outbound survives and carries the hop.
+    #[test]
+    fn a_socks5_hop_carries_the_quic_carrier() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c","password":"pw","carrier":"h3","upstreamProxy":"socks5://proxy.local:1080","link":"foxy://edge.example?username=a@b.c"}}]}"#,
+        )
+        .expect("parses");
+        let foxy = find_foxy_outbound(&root).expect("serves");
+        assert_eq!(foxy.carrier, crate::foxy::Carrier::H3);
+        assert!(foxy.upstream.is_some(), "the hop is dialed, not bypassed");
+    }
+
+    #[test]
+    fn a_bad_upstream_proxy_refuses_its_outbound_before_any_dial() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c","password":"pw","country":"US","upstreamProxy":"gopher://proxy.local:70"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    #[test]
+    fn rate_limit_backoff_climbs_and_clears() {
+        let strikes = AtomicU32::new(0);
+        let until = AtomicU64::new(0);
+        assert!(!edge_limited(&until, 1_000));
+        assert_eq!(note_limited(&strikes, &until, 1_000), 1_030);
+        assert!(edge_limited(&until, 1_000));
+        assert!(!edge_limited(&until, 1_030));
+        assert_eq!(note_limited(&strikes, &until, 1_030), 1_060);
+        assert_eq!(note_limited(&strikes, &until, 1_060), 1_120);
+        assert!(edge_limited(&until, 1_061));
+        clear_limited(&strikes, &until);
+        assert!(!edge_limited(&until, 1_061));
     }
 
     #[test]
