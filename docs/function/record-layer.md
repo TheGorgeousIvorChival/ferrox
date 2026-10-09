@@ -235,16 +235,34 @@ the change is the tail and not the run.
 `TAIL_STATES` on every arch — which took `aarch64` back to the shape `c8e19b4`
 had just measured away: seven states and a dependent round chain for the one to
 three blocks a remainder of 449 to 511 leaves over. The `aarch64` runner was
-never re-read for that. Restoring `GROUP_STATES` there brings those four lengths
-back to one group of eight, spilling though it does, and the claim is gated by
+never re-read for that.
+
+`TAIL_STATES` is per-arch now — the group itself on `aarch64`, one fewer
+elsewhere. The two runs that name the difference are `bench.yml` run
+`37981057929` (main at `c54fae6`, the clamp at seven) against run `37976368393`
+(this branch), each `ferrox` column read against its own reference column so the
+runner cancels. The control is 448 bytes, the last length seven states cover,
+and it does not move:
+
+| bytes | linux aarch64, before | linux aarch64, after | macos aarch64, before | macos aarch64, after |
+| ---: | ---: | ---: | ---: | ---: |
+| 448 | 1.58x (459 ns) | 1.56x (463 ns) | 2.75x (260 ns) | 2.84x (240 ns) |
+| 449 | 1.29x (639 ns) | 1.55x (536 ns) | 1.85x (452 ns) | 2.93x (259 ns) |
+| 511 | 1.29x (645 ns) | 1.54x (541 ns) | 1.88x (516 ns) | 2.93x (261 ns) |
+| 1023 | 1.44x (1 147 ns) | 1.58x (1 043 ns) | 2.36x (726 ns) | 3.00x (508 ns) |
+| 1535 | 1.52x (1 632 ns) | 1.63x (1 525 ns) | 2.52x (1 086 ns) | 3.03x (777 ns) |
+
+`x86_64` is the arch this does not touch — one state fewer than its group, before
+and after — and its 449-byte row reads 2.05x against 2.08x on the same two runs,
+which is the runner and not the change. The claim is gated on the aarch64 side by
 `chacha::tail_sizing_tests::the_first_group_carries_the_whole_remainder_a_pass_leaves`
-— the pass always leaves less than a pass behind, so on `aarch64` the tail's
-first group carries the whole remainder of every record — while `x86_64` keeps
-one state fewer, as a `const` assertion over its own sixteen-register file. The
-pass hands that group the state it already holds instead of rebuilding it from
-the key to feed `xor_ladder`, whose group loop a pass's remainder can never
-reach: on `aarch64` the ladder is what the tests read the pass against, and it
-ships with them rather than in the release binary.
+— a pass always leaves less than a pass behind, so the tail's first group carries
+the whole remainder of every record — and on the `x86_64` side by a `const`
+assertion over its own sixteen-register file. The pass hands that group the state
+it already holds instead of rebuilding it from the key to feed `xor_ladder`, whose
+group loop a pass's remainder can never reach: on `aarch64` the ladder is what the
+tests read the pass against, and it ships with them rather than in the release
+binary.
 
 The `x86_64` rows of those two runs are not usable for that comparison, and the
 reason is the one the `x86_64` pass below exists for. GitHub moved those runners
