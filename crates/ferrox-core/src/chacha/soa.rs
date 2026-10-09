@@ -21,7 +21,7 @@
 //! its cost per block is the rounds plus one transpose of four registers; the
 //! ladder's is the rounds plus sixty lane permutations a block.
 
-use super::{base_state, xor_ladder, Wide};
+use super::{base, base_state, xor_tail, Wide};
 #[allow(clippy::wildcard_imports)]
 use core::arch::aarch64::*;
 
@@ -292,11 +292,16 @@ fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]
     }
 }
 
-/// The eight-block pass over whole passes, the ladder over what is left.
+/// The eight-block pass over whole passes, the tail of what the pass leaves.
 ///
 /// Same contract as `chacha::xor_blocks`: the head, when there is one, is the
 /// keystream of block `start` and the buffer's first byte is encrypted with
 /// block `start + 1`.
+///
+/// The remainder goes straight to `xor_tail`, with the state this already holds:
+/// a pass always leaves fewer than `group_bytes` behind, so the ladder's group
+/// loop above the tail can never run here, and rebuilding the state from the key
+/// to feed it would be the whole of the work the tail does not do.
 pub(crate) fn xor_blocks(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -305,6 +310,7 @@ pub(crate) fn xor_blocks(
     buf: &mut [u8],
 ) -> u32 {
     let state = base_state(key, nonce);
+    let rows = base::<Wide>(&state);
     let mut ctr = start;
     let mut rest = buf;
     let mut blocks = 0u32;
@@ -327,7 +333,7 @@ pub(crate) fn xor_blocks(
         rest = tail;
     }
 
-    blocks + xor_ladder::<Wide>(key, nonce, ctr, head, rest)
+    blocks + xor_tail::<Wide>(&state, &rows, ctr, head, rest)
 }
 
 #[cfg(test)]

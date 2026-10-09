@@ -240,7 +240,11 @@ back to one group of eight, spilling though it does, and the claim is gated by
 `chacha::tail_sizing_tests::the_first_group_carries_the_whole_remainder_a_pass_leaves`
 — the pass always leaves less than a pass behind, so on `aarch64` the tail's
 first group carries the whole remainder of every record — while `x86_64` keeps
-one state fewer, as a `const` assertion over its own sixteen-register file.
+one state fewer, as a `const` assertion over its own sixteen-register file. The
+pass hands that group the state it already holds instead of rebuilding it from
+the key to feed `xor_ladder`, whose group loop a pass's remainder can never
+reach: on `aarch64` the ladder is what the tests read the pass against, and it
+ships with them rather than in the release binary.
 
 The `x86_64` rows of those two runs are not usable for that comparison, and the
 reason is the one the `x86_64` pass below exists for. GitHub moved those runners
