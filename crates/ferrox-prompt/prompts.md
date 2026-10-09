@@ -969,7 +969,7 @@ Decide the shape before writing the stack: a native TUN inbound (row 29) that te
 ## P47 · Make the TLS-carrier loopback tests stop losing to the linux runner
 
 **When to use:** When a `ci.yml` linux run goes red on `*_over_tls_*` echo tests that pass everywhere else. Measured across `foxy-relay-fix` runs 37857599012 (4 failed), 37860540928 (5), 37884230403 (2), 37898258482 (6) and 37912894136 (2), each time a different subset, each a ~120 s stall with zero wrong bytes — while macos, windows and quiet local runs stay green. A no-Rust-change commit fails them too, so the diff is never the cause. Since `FERROX_ECHO_TRACE` landed, every failure names its stage: handshake, carrier accept, header decode and response exchange all complete in milliseconds, then relay-phase mutual silence with no error on any thread.
-**Status:** doing
+**Status:** done
 **Leverage:** 3
 **Effort:** medium
 **Gates:** `cargo test --workspace` green on three consecutive `ci.yml` runs
@@ -1006,4 +1006,18 @@ One H2 connection per flow is correct — the relay proves it carries megabytes 
 
 ```text
 Read the edge hostname, port and pass exactly as today; only the transport changes: TCP (and, for H3, UDP association) to the edge goes through the configured upstream instead of direct. The TLS server name and pins stay the edge's, the way the reference verifies the edge name against a custom TCP address. Plain HTTP CONNECT upstream is one handshake; SOCKS5 upstream is the greeting this tree already speaks. Refuse a chain the carrier cannot use with the reason rather than silently going direct — a lane that bypasses its configured proxy is a leak, not a fallback.
+```
+
+## P50 · Ask the edge whether it multiplexes before pooling its H2 session
+
+**When to use:** When the lane's HTTP/2 session is pooled and the live relay goes red on the h2 and auto legs: the first CONNECT works, the second is answered with the stream closed, and the 1 MB download rides out its 30 s deadline. Pooling was reverted on run 37988332095 because `foxy-relay.yml` ubuntu lost the h2 leg while `cargo test --workspace` was green — a loopback mux edge proves nothing about the real one.
+**Status:** todo
+**Leverage:** 3
+**Effort:** small
+**Gates:** a loopback or live leg that opens two CONNECT streams on one connection and records what the edge does with the second; `foxy-relay.yml` green with the h2 and auto legs unmoved
+**Touches:** crates/ferrox-app/src/foxy.rs
+**Random weight:** 1
+
+```text
+The reference multiplexes, and this tree pools QUIC, so pooling HTTP/2 looked like the same job. The edge this tree dials answered the first CONNECT on one connection and closed the stream on the second, so the premise is unproven and the pool was reverted rather than landed: a lane that works by dialling per flow is worth more than a pool the edge refuses. Before pooling, ask the edge: a live leg that opens two streams on one connection, or a loopback edge that mirrors what the real one did with the second one, and only pool when the answer is that it takes them both. The stop where it was reverted is the pre-slice state: `open_h2_with` dials, handshakes, writes the preface and one HEADERS frame per flow.
 ```
