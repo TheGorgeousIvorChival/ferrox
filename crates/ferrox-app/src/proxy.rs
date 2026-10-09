@@ -8823,16 +8823,20 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let Some((got, _flow, cmd, _target)) = decode_request(&mut tls) else {
                 panic!("reads a vless header");
             };
             assert_eq!(got, id);
             assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
             tls.write_all(&[0, 0]).expect("answers");
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf).expect("reads");
+            echo_trace(&format!("srv {port} ping read"));
             tls.write_all(&buf).expect("echoes");
         });
         let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -8852,7 +8856,9 @@ mod tests {
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
             };
+            echo_trace(&format!("cli {port} dialing"));
             dial_vless(&client, &server, &vless, &target, Ladder::global());
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -8874,14 +8880,18 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let Some((cmd, _target)) = decode_trojan_request(&mut tls, &key) else {
                 panic!("reads a trojan header");
             };
             assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf).expect("reads");
+            echo_trace(&format!("srv {port} ping read"));
             tls.write_all(&buf).expect("echoes");
         });
         let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -8898,7 +8908,9 @@ mod tests {
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
+            echo_trace(&format!("cli {port} dialing"));
             dial_trojan(&client, &server, &trojan, &target, Ladder::global());
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -8920,19 +8932,23 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let Some((_target, mut send, mut recv, prefix, cmd)) =
                 crate::vmess::accept_request(&mut tls, &id)
             else {
                 panic!("reads a vmess header");
             };
             assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
             tls.write_all(&prefix).expect("answers");
             let mut scratch = Vec::with_capacity(16 * 1024);
             let chunk = crate::vmess::read_frame(&mut tls, &mut recv, &mut scratch)
                 .expect("reads a frame")
                 .to_vec();
+            echo_trace(&format!("srv {port} ping read"));
             let mut staging = Vec::with_capacity(16 * 1024);
             let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
             assert!(crate::vmess::write_frame(
@@ -8942,6 +8958,7 @@ mod tests {
                 &mut staging,
                 &mut pad
             ));
+            echo_trace(&format!("srv {port} echoed vmess"));
         });
         let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
@@ -8958,7 +8975,9 @@ mod tests {
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
+            echo_trace(&format!("cli {port} dialing"));
             dial_vmess(&client, &server, &vmess, &target, Ladder::global());
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
