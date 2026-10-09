@@ -174,14 +174,17 @@ jobs:
               sleep 20
             done
             grep -E '^(loc|ip)=' trace.txt || true
-            if grep -qx "loc=$FOXY_COUNTRY" trace.txt 2>/dev/null \
-              && curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
-                'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin" \
-              && test "$(wc -c < "file-$carrier.bin")" = 1000000; then
+            trace_ok=0
+            grep -qx "loc=$FOXY_COUNTRY" trace.txt 2>/dev/null || trace_ok=$?
+            code=0
+            curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin" || code=$?
+            got=$(wc -c < "file-$carrier.bin" 2>/dev/null || echo "0")
+            if test "$trace_ok" = 0 && test "$code" = 0 && test "$got" = 1000000; then
               sha_of "file-$carrier.bin"
               echo "carrier $carrier: 1000000 B, exit $FOXY_COUNTRY"
             else
-              echo "carrier $carrier FAILED" >&2
+              echo "carrier $carrier FAILED: trace_ok=$trace_ok curl_exit=$code bytes=$got" >&2
               FAILED="$FAILED $carrier"
             fi
             stop_lane
