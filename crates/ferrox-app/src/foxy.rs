@@ -9,9 +9,10 @@
 
 use ferrox_core::foxy::{self, authority, frames, hpack, masque, Failure, Pass};
 use ferrox_core::tls::TlsProvider;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -369,36 +370,38 @@ pub(crate) fn open_udp(
 }
 
 fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
-    let stream = tcp(dial)?;
-    let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
-        .map_err(|_| Failure::Io)?;
-    tls.handshake().map_err(|_| Failure::Io)?;
-    negotiated(&tls, dial)?;
+    let pool = h2_pool();
+    let edge = H2Pool::edge(dial);
+    // A session this edge already has serves this flow. One that answered
+    // GOAWAY, or a keepalive found dead, is replaced by one the flow dials
+    // itself, because a refused stream is not a failed lane.
+    let existing = pool.take(&edge).and_then(|shared| {
+        let stream = shared.lock().ok()?.open()?;
+        Some((shared, stream))
+    });
+    let (session, stream) = if let Some(found) = existing {
+        found
+    } else {
+        // A session that answered GOAWAY, or a keepalive found dead, is replaced
+        // by one the flow dials itself, because a refused stream is not a failed
+        // lane.
+        pool.drop(&edge);
+        let session = Arc::new(Mutex::new(H2Session::dial(dial)?));
+        h2_watch(&session);
+        pool.put(edge, Arc::clone(&session));
+        let stream = session
+            .lock()
+            .map_err(|_| Failure::Io)?
+            .open()
+            .ok_or(Failure::Io)?;
+        (session, stream)
+    };
 
-    // The stream window arrives in the settings; the connection window only
-    // moves by a frame, so without this one the tunnel is paced by a round trip
-    // for its first 64 KiB however large the stream window is.
-    let mut opening = Vec::with_capacity(48 + block.len());
-    opening.extend_from_slice(frames::PREFACE);
-    h2_frame(
-        frames::SETTINGS,
-        0,
-        0,
-        &frames::client_settings(),
-        &mut opening,
-    );
-    h2_frame(
-        frames::WINDOW_UPDATE,
-        0,
-        0,
-        &(frames::WINDOW - frames::DEFAULT_WINDOW).to_be_bytes(),
-        &mut opening,
-    );
-    h2_frame(frames::HEADERS, 0x4, 1, block, &mut opening);
-    tls.write_all(&opening).map_err(|_| Failure::Io)?;
-
+    // The preface, the settings and the connection window belong to the first
+    // flow's session; every later flow only opens its own stream on it.
     let mut lane = Tls2 {
-        tls,
+        session,
+        stream,
         window: foxy::flow::Window::new(i64::from(frames::WINDOW), i64::from(frames::WINDOW)),
         max_frame: MAX_FRAME,
         carry: Vec::new(),
@@ -407,9 +410,175 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         capsule_buf: Vec::new(),
         fin: false,
     };
-    let status = lane.await_status()?;
+    let status = lane.open_stream(block)?;
     opened(status)?;
     Ok(lane)
+}
+
+/// One HTTP/2 session every flow of an edge shares: the handshake, the
+/// preface, the settings and the connection window are paid once, and each flow
+/// opens its own stream on it the way the reference multiplexes. The H3 pool
+/// above the carrier is the same idea; this is the TCP one.
+#[derive(Debug)]
+struct H2Session {
+    tls: ferrox_core::tls::RustlsProvider<TcpStream>,
+    /// The next odd stream id to hand out, and how many flows hold one.
+    next: u32,
+    flows: usize,
+    /// A GOAWAY ends new streams on this session and not the ones open.
+    gone: bool,
+    /// When the session last carried a frame, which is what the keepalive
+    /// calls idle.
+    busy: Instant,
+}
+
+impl H2Session {
+    fn dial(dial: &FoxyDial) -> Result<Self, Failure> {
+        let stream = tcp(dial)?;
+        let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
+            .map_err(|_| Failure::Io)?;
+        tls.handshake().map_err(|_| Failure::Io)?;
+        negotiated(&tls, dial)?;
+
+        // The stream window arrives in the settings; the connection window only
+        // moves by a frame, so without this one the tunnel is paced by a round
+        // trip for its first 64 KiB however large the stream window is.
+        let mut opening = Vec::with_capacity(48);
+        opening.extend_from_slice(frames::PREFACE);
+        h2_frame(
+            frames::SETTINGS,
+            0,
+            0,
+            &frames::client_settings(),
+            &mut opening,
+        );
+        h2_frame(
+            frames::WINDOW_UPDATE,
+            0,
+            0,
+            &(frames::WINDOW - frames::DEFAULT_WINDOW).to_be_bytes(),
+            &mut opening,
+        );
+        tls.write_all(&opening).map_err(|_| Failure::Io)?;
+        tls.flush().map_err(|_| Failure::Io)?;
+        Ok(Self {
+            tls,
+            next: 1,
+            flows: 0,
+            gone: false,
+            busy: Instant::now(),
+        })
+    }
+
+    /// One stream id for a new flow: client ids are odd, and a session that
+    /// answered GOAWAY hands out none.
+    fn open(&mut self) -> Option<u32> {
+        if self.gone {
+            return None;
+        }
+        let stream = self.next;
+        self.next = self.next.checked_add(2)?;
+        Some(stream)
+    }
+
+    fn release(&mut self) {
+        self.flows = self.flows.saturating_sub(1);
+    }
+
+    /// Marks this session as done with new streams, which is what a GOAWAY
+    /// means: the flows already on it keep their bytes.
+    fn goaway(&mut self) {
+        self.gone = true;
+    }
+
+    fn carried(&mut self) {
+        self.busy = Instant::now();
+    }
+}
+
+/// The pooled sessions, keyed the way the QUIC pool keys its connections: one
+/// edge, one hop, one root store. A flow that dials a second edge never reuses
+/// the first one's handshake.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct H2Edge {
+    host: String,
+    port: u16,
+    address: Option<SocketAddr>,
+    upstream: Option<UpstreamProxy>,
+}
+
+struct H2Pool {
+    inner: Mutex<HashMap<H2Edge, Arc<Mutex<H2Session>>>>,
+}
+
+impl H2Pool {
+    fn edge(dial: &FoxyDial) -> H2Edge {
+        H2Edge {
+            host: dial.host.clone(),
+            port: dial.port,
+            address: dial.address,
+            upstream: dial.upstream.clone(),
+        }
+    }
+
+    fn take(&self, edge: &H2Edge) -> Option<Arc<Mutex<H2Session>>> {
+        self.inner.lock().ok()?.get(edge).cloned()
+    }
+
+    fn put(&self, edge: H2Edge, session: Arc<Mutex<H2Session>>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.insert(edge, session);
+        }
+    }
+
+    fn drop(&self, edge: &H2Edge) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.remove(edge);
+        }
+    }
+}
+
+static H2_POOL: OnceLock<H2Pool> = OnceLock::new();
+
+fn h2_pool() -> &'static H2Pool {
+    H2_POOL.get_or_init(|| H2Pool {
+        inner: Mutex::new(HashMap::new()),
+    })
+}
+
+/// How long a session may sit with no frame before a keepalive PING goes out,
+/// and how long the wait between two of them is, the schedule the reference
+/// names: quiet for 15 s, then a ping every 10 s rather than a dead session
+/// discovered by the next flow that has to pay for it.
+const H2_IDLE: Duration = Duration::from_secs(15);
+const H2_PING: Duration = Duration::from_secs(10);
+
+/// Watches one session for as long as anyone holds it. A ping the edge answers
+/// is nothing; one it does not answer within the next wait ends the session,
+/// because a lane that never writes is a lane nobody finds out about.
+/// Watches one session for as long as anyone holds it, on its own thread
+/// because a lane that writes nothing is the lane a keepalive is for.
+fn h2_watch(session: &Arc<Mutex<H2Session>>) {
+    let watched = Arc::downgrade(session);
+    std::thread::spawn(move || h2_keepalive(&watched));
+}
+
+fn h2_keepalive(session: &Weak<Mutex<H2Session>>) {
+    while let Some(shared) = session.upgrade() {
+        std::thread::sleep(H2_PING);
+        let Ok(mut held) = shared.lock() else {
+            return;
+        };
+        if held.busy.elapsed() < H2_IDLE {
+            continue;
+        }
+        let mut out = Vec::with_capacity(frames::H2_HEADER + 8);
+        h2_frame(frames::PING, 0, 0, &[], &mut out);
+        if held.tls.write_all(&out).is_err() || held.tls.flush().is_err() {
+            return;
+        }
+        held.carried();
+    }
 }
 
 fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8], out: &mut Vec<u8>) {
@@ -425,9 +594,12 @@ fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8], out: &mut Vec<u8>)
 
 /// A relay over a TLS stream that speaks HTTP/2: the frames go on and come off,
 /// and a caller writing bytes sees a DATA frame and a caller reading bytes sees
-/// the payload of one.
+/// the payload of one. The connection belongs to every flow of the edge, so the
+/// lane is a stream on it and nothing more: the session is what the pool holds
+/// and the drop is what releases it.
 pub(crate) struct Tls2 {
-    tls: ferrox_core::tls::RustlsProvider<TcpStream>,
+    session: Arc<Mutex<H2Session>>,
+    stream: u32,
     window: foxy::flow::Window,
     max_frame: usize,
     /// Bytes read from a DATA frame that the caller has not taken yet, and how
@@ -463,26 +635,40 @@ fn read_frame(
 
 impl Tls2 {
     pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
-        self.tls.get_ref().set_read_timeout(Some(quantum))
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
+        session.tls.get_ref().set_read_timeout(Some(quantum))
     }
 
     /// Reads one frame, hands it to `body` with the payload borrowed, and puts
-    /// the buffer back: the frame is handled while the lane owns it.
+    /// the buffer back: the frame is handled while the lane owns it. Frames for
+    /// streams this lane did not open come back as events the bodies ignore,
+    /// which is what makes one connection carry many flows.
     fn with_frame<R>(
         &mut self,
         body: impl FnOnce(&mut Self, frames::H2Frame, &[u8]) -> R,
     ) -> std::io::Result<R> {
         let mut payload = std::mem::take(&mut self.out);
-        let frame = read_frame(&mut self.tls, &mut payload, self.max_frame);
-        let out = match frame {
-            Ok(frame) => body(self, frame, &payload),
+        let frame = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
+            let frame = read_frame(&mut session.tls, &mut payload, self.max_frame);
+            if frame.is_ok() {
+                session.carried();
+            }
+            frame
+        };
+        match frame {
             Err(error) => {
                 self.out = payload;
-                return Err(error);
+                Err(error)
             }
-        };
-        self.out = payload;
-        Ok(out)
+            Ok(frame) => Ok(body(self, frame, &payload)),
+        }
     }
 
     /// The window this lane grants back as it reads, one update per frame: the
@@ -491,7 +677,7 @@ impl Tls2 {
     fn credit(&mut self, len: usize) -> Result<(), Failure> {
         let increment = (len as u32).to_be_bytes();
         let mut out = [0u8; 26];
-        for (slot, stream) in [(9usize, 1u32), (22, 0)] {
+        for (slot, stream) in [(9usize, self.stream), (22, 0)] {
             let frame = frames::H2Frame {
                 kind: frames::WINDOW_UPDATE,
                 flags: 0,
@@ -501,21 +687,51 @@ impl Tls2 {
             out[slot - 9..slot].copy_from_slice(&frame.header());
             out[slot..slot + 4].copy_from_slice(&increment);
         }
-        self.tls.write_all(&out).map_err(|_| Failure::Io)
+        self.session
+            .lock()
+            .map_err(|_| Failure::Io)?
+            .tls
+            .write_all(&out)
+            .map_err(|_| Failure::Io)
     }
 
     fn ack(&mut self, kind: u8, payload: &[u8]) -> Result<(), Failure> {
         self.out.clear();
         h2_frame(kind, 0x1, 0, payload, &mut self.out);
-        self.tls.write_all(&self.out).map_err(|_| Failure::Io)
+        self.session
+            .lock()
+            .map_err(|_| Failure::Io)?
+            .tls
+            .write_all(&self.out)
+            .map_err(|_| Failure::Io)
     }
 
     /// A push promise is refused by name, which is the only stream the lane
-    /// answers that is not the one stream it opened.
+    /// answers that is not the one it opened.
     fn refuse_push(&mut self) -> Result<(), Failure> {
         self.out.clear();
-        h2_frame(frames::RST_STREAM, 0, 1, &8u32.to_be_bytes(), &mut self.out);
-        self.tls.write_all(&self.out).map_err(|_| Failure::Io)
+        h2_frame(frames::RST_STREAM, 0, 0, &8u32.to_be_bytes(), &mut self.out);
+        self.session
+            .lock()
+            .map_err(|_| Failure::Io)?
+            .tls
+            .write_all(&self.out)
+            .map_err(|_| Failure::Io)
+    }
+
+    /// One flow's opening: the HEADERS on this lane's stream, and the status
+    /// the first block of the answer carries. The preface went out with the
+    /// session, so all this flow writes is its own three fields.
+    fn open_stream(&mut self, block: &[u8]) -> Result<u16, Failure> {
+        let mut opening = Vec::with_capacity(frames::H2_HEADER + block.len());
+        h2_frame(frames::HEADERS, 0x4, self.stream, block, &mut opening);
+        {
+            let mut session = self.session.lock().map_err(|_| Failure::Io)?;
+            session.tls.write_all(&opening).map_err(|_| Failure::Io)?;
+            session.tls.flush().map_err(|_| Failure::Io)?;
+            session.carried();
+        }
+        self.await_status()
     }
 
     fn await_status(&mut self) -> Result<u16, Failure> {
@@ -523,8 +739,8 @@ impl Tls2 {
         let mut block = Vec::with_capacity(64);
         while Instant::now() < deadline {
             let status = self
-                .with_frame(
-                    |lane, frame, payload| match frames::h2_event(frame, payload, 1) {
+                .with_frame(|lane, frame, payload| {
+                    match frames::h2_event(frame, payload, lane.stream) {
                         frames::H2Event::Headers { block: more, .. } => {
                             header_status(&mut block, more, frame.flags & frames::END_HEADERS != 0)
                         }
@@ -544,9 +760,15 @@ impl Tls2 {
                             lane.ack(frames::PING, payload).map(|()| None)
                         }
                         frames::H2Event::Push => lane.refuse_push().map(|()| None),
-                        frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        frames::H2Event::GoAway { .. } => {
+                            // No new stream rides a session the edge is closing;
+                            // the ones it carries keep their bytes.
+                            if let Ok(mut held) = lane.session.lock() {
+                                held.goaway();
+                            }
                             Err(Failure::Stream)
                         }
+                        frames::H2Event::Reset { .. } => Err(Failure::Stream),
                         // A status larger than one frame arrives in pieces: each
                         // fragment is appended and the block is read once the
                         // peer's `END_HEADERS` says it is whole.
@@ -558,8 +780,8 @@ impl Tls2 {
                             )
                         }
                         _ => Ok(None),
-                    },
-                )
+                    }
+                })
                 .map_err(|_| Failure::Stream)??;
             if let Some(status) = status {
                 return Ok(status);
@@ -590,12 +812,21 @@ impl Tls2 {
         }
         self.out.clear();
         masque::datagram_encode(payload, &mut self.out);
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
         let mut at = 0usize;
         while at < self.out.len() {
             let frame = foxy::flow::frame_size(self.out.len() - at, self.max_frame)
                 .min(self.window.stream());
             if frame == 0 {
+                drop(session);
                 std::thread::sleep(Duration::from_millis(5));
+                session = self
+                    .session
+                    .lock()
+                    .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
                 continue;
             }
             self.window.take(frame);
@@ -603,12 +834,13 @@ impl Tls2 {
             let header = frames::H2Frame {
                 kind: frames::DATA,
                 flags: 0,
-                stream: 1,
+                stream: self.stream,
                 length: frame as u32,
             }
             .header();
-            self.tls.write_all(&header)?;
-            self.tls.write_all(&self.out[at..at + frame])?;
+            session.tls.write_all(&header)?;
+            session.tls.write_all(&self.out[at..at + frame])?;
+            session.carried();
             at += frame;
         }
         Ok(())
@@ -640,7 +872,7 @@ impl Tls2 {
                 ));
             }
             let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
-                match frames::h2_event(frame, payload, 1) {
+                match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end } => {
                         lane.capsule_buf.extend_from_slice(payload);
                         lane.fin = end;
@@ -667,6 +899,16 @@ impl Tls2 {
     }
 }
 
+impl Drop for Tls2 {
+    fn drop(&mut self) {
+        // The stream is this lane's and nobody else's: the session lives as
+        // long as the edge's flows keep opening them.
+        if let Ok(mut held) = self.session.lock() {
+            held.release();
+        }
+    }
+}
+
 impl Write for Tls2 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.fin {
@@ -679,13 +921,22 @@ impl Write for Tls2 {
         self.window.take(frame);
         let frame = frame as usize;
         self.out.clear();
-        h2_frame(frames::DATA, 0, 1, &buf[..frame], &mut self.out);
-        self.tls.write_all(&self.out)?;
+        h2_frame(frames::DATA, 0, self.stream, &buf[..frame], &mut self.out);
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
+        session.tls.write_all(&self.out)?;
+        session.carried();
         Ok(frame)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.tls.flush()
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
+        session.tls.flush()
     }
 }
 
@@ -699,7 +950,7 @@ impl Read for Tls2 {
                 return Ok(0);
             }
             let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
-                match frames::h2_event(frame, payload, 1) {
+                match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end } => {
                         let len = payload.len();
                         lane.carry.clear();
@@ -1117,7 +1368,9 @@ fn io(failure: Failure) -> std::io::Error {
 /// something it can read and write. The `H3` arm needs its connection already
 /// established, which the pool is what provides.
 pub(crate) enum Tunnel {
-    H1(Tls1),
+    /// The HTTP/1.1 lane owns its TLS connection outright, which is the
+    /// variant that carries it: boxed so the enum stays the size of a handle.
+    H1(Box<Tls1>),
     H2(Tls2),
     H3(Box<H3>),
 }
@@ -1125,7 +1378,7 @@ pub(crate) enum Tunnel {
 impl Tunnel {
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Option<Quic>) -> Result<Self, Failure> {
         match (dial.carrier, quic) {
-            (Carrier::H1, _) => open_h1(dial, target).map(Self::H1),
+            (Carrier::H1, _) => open_h1(dial, target).map(Box::new).map(Self::H1),
             (Carrier::H2, _) => open_h2(dial, target).map(Self::H2),
             (Carrier::H3, Some(quic)) => {
                 H3::open(dial, target, quic).map(|lane| Self::H3(Box::new(lane)))
@@ -1837,6 +2090,212 @@ mod loopback {
                 }
             }
         })
+    }
+
+    /// A multiplexing edge: one connection carrying every flow the lane opens
+    /// on it, one status and one echo per stream, and a report of every
+    /// connection the lane dialed to the edge at all.
+    fn h2_mux_edge(
+        listener: TcpListener,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+        dials: std::sync::mpsc::Sender<()>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            loop {
+                let (stream, _) = listener.accept().expect("accepts");
+                dials.send(()).expect("reports the dial");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .expect("times out");
+                let mut tls = ferrox_core::tls::RustlsServerProvider::accept(&server, stream)
+                    .expect("accepts");
+                tls.handshake().expect("handshakes");
+                let mut head = vec![0u8; frames::PREFACE.len()];
+                read_exact(&mut tls, &mut head).expect("reads the preface");
+                assert_eq!(head, frames::PREFACE);
+                let mut ack = Vec::new();
+                h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+                tls.write_all(&ack).expect("acks");
+                loop {
+                    let mut header = [0u8; frames::H2_HEADER];
+                    if read_exact(&mut tls, &mut header).is_err() {
+                        break;
+                    }
+                    let Some(frame) = frames::H2Frame::parse(&header) else {
+                        break;
+                    };
+                    let mut payload = vec![0u8; frame.length as usize];
+                    if read_exact(&mut tls, &mut payload).is_err() {
+                        break;
+                    }
+                    // Every stream of this connection, whichever flow opened it.
+                    match frames::h2_event(frame, &payload, frame.stream) {
+                        frames::H2Event::Settings { ack: false, .. } => {
+                            let mut out = Vec::new();
+                            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                            tls.write_all(&out).expect("acks the settings");
+                        }
+                        frames::H2Event::Headers { block, .. } => {
+                            seen.send(block.to_vec()).expect("reports the block");
+                            let mut out = Vec::new();
+                            h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                            tls.write_all(&out).expect("answers the flow");
+                        }
+                        frames::H2Event::Data { payload, .. } => {
+                            let mut out = Vec::new();
+                            h2_frame(frames::DATA, 0, frame.stream, payload, &mut out);
+                            tls.write_all(&out).expect("echoes the flow");
+                        }
+                        frames::H2Event::Ping { ack: false, .. } => {
+                            let mut out = Vec::new();
+                            h2_frame(frames::PING, 0x1, 0, &payload, &mut out);
+                            tls.write_all(&out).expect("acks the ping");
+                        }
+                        frames::H2Event::GoAway { .. } => return,
+                        _ => {}
+                    }
+                }
+            }
+        })
+    }
+
+    /// One handshake per edge and streams per flow, the way the reference
+    /// multiplexes and the way QUIC is already pooled here: the second flow
+    /// rides the first flow's connection, and the bytes it puts on the wire are
+    /// the bytes a fresh connection would have put there.
+    #[test]
+    fn one_http2_session_carries_every_flow_of_an_edge() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (dials_tx, dials_rx) = std::sync::mpsc::channel();
+        let _edge = h2_mux_edge(listener, server, seen_tx, dials_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+
+        let mut first = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        round_trip(&mut first);
+        let mut second = Tunnel::open(&dial, "example.com:443", None).expect("opens again");
+        round_trip(&mut second);
+        // Both flows are still on the one connection the pool dialed.
+        drop(first);
+        drop(second);
+
+        let mut want = Vec::new();
+        hpack::hpack_connect("example.com:443", "the-pass", &mut want);
+        assert_eq!(
+            seen_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("block"),
+            want,
+            "the first flow wrote the block a fresh connection would have written"
+        );
+        assert_eq!(
+            seen_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("block"),
+            want,
+            "the second flow wrote the same block on the same connection"
+        );
+        assert_eq!(
+            dials_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("dialed"),
+            (),
+            "the pool dialed the edge once"
+        );
+        assert!(
+            dials_rx.try_recv().is_err(),
+            "the second flow reused the session instead of dialing again"
+        );
+    }
+
+    /// A GOAWAY ends new streams on a session and not the ones it still
+    /// carries, so the next flow dials a fresh session instead of a queue the
+    /// edge stopped taking: a pool that latched a refused edge would be a lane
+    /// that never recovers.
+    #[test]
+    fn a_goaway_ends_new_streams_and_the_next_flow_redials() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (dials_tx, dials_rx) = std::sync::mpsc::channel();
+        let said_no = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::spawn(move || loop {
+            let (stream, _) = listener.accept().expect("accepts");
+            dials_tx.send(()).expect("reports the dial");
+            let server = server.clone();
+            let said_no = std::sync::Arc::clone(&said_no);
+            std::thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .expect("times out");
+                let mut tls = ferrox_core::tls::RustlsServerProvider::accept(&server, stream)
+                    .expect("accepts");
+                tls.handshake().expect("handshakes");
+                let mut head = vec![0u8; frames::PREFACE.len()];
+                read_exact(&mut tls, &mut head).expect("reads the preface");
+                let mut ack = Vec::new();
+                h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+                tls.write_all(&ack).expect("acks");
+                loop {
+                    let mut header = [0u8; frames::H2_HEADER];
+                    read_exact(&mut tls, &mut header).expect("reads a frame");
+                    let frame = frames::H2Frame::parse(&header).expect("parses");
+                    let mut payload = vec![0u8; frame.length as usize];
+                    read_exact(&mut tls, &mut payload).expect("reads a payload");
+                    match frames::h2_event(frame, &payload, frame.stream) {
+                        frames::H2Event::Settings { ack: false, .. } => {
+                            let mut out = Vec::new();
+                            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                            tls.write_all(&out).expect("acks the settings");
+                        }
+                        frames::H2Event::Headers { .. }
+                            if !said_no.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                        {
+                            // The edge takes no more streams on this session.
+                            let mut out = Vec::new();
+                            h2_frame(frames::GOAWAY, 0, 0, &7u32.to_be_bytes(), &mut out);
+                            tls.write_all(&out).expect("says goodbye");
+                        }
+                        frames::H2Event::Headers { .. } => {
+                            let mut out = Vec::new();
+                            h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                            tls.write_all(&out).expect("answers the flow");
+                        }
+                        frames::H2Event::Data { payload, .. } => {
+                            let mut out = Vec::new();
+                            h2_frame(frames::DATA, 0, frame.stream, payload, &mut out);
+                            tls.write_all(&out).expect("echoes the flow");
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        });
+
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        assert!(
+            Tunnel::open(&dial, "example.com:443", None).is_err(),
+            "a session the edge is closing refuses a new stream"
+        );
+        let mut second = Tunnel::open(&dial, "example.com:443", None).expect("dials a new session");
+        round_trip(&mut second);
+        assert_eq!(
+            dials_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("dialed"),
+            (),
+            "the refused session was the first dial"
+        );
+        assert_eq!(
+            dials_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("dialed"),
+            (),
+            "the next flow dialed a fresh session rather than the dead one"
+        );
     }
 
     #[test]
