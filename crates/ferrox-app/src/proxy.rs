@@ -5862,6 +5862,7 @@ const CLOSE_BEFORE_JOIN: bool = true;
 
 const CLOSE_AFTER_JOIN: bool = false;
 
+/// Forwards both directions between a carrier reader and the peer it rides on.
 fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     mut reader: R,
     writer: &W,
