@@ -254,9 +254,15 @@ pub(crate) fn echo_trace_on() -> bool {
     *ECHO_TRACE_ON.get_or_init(|| std::env::var("FERROX_ECHO_TRACE").is_ok())
 }
 
+static ECHO_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 pub(crate) fn echo_trace(stage: &str) {
     if echo_trace_on() {
-        println!("echo-trace: {stage}");
+        let at = ECHO_T0
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis();
+        println!("echo-trace: t={at} {stage}");
     }
 }
 
@@ -5814,7 +5820,13 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     F: FnOnce(&mut R),
 {
     const CHUNK: usize = 16 * 1024;
+    if echo_trace_on() {
+        echo_trace("relay start");
+    }
     let Ok(peer_read) = peer.try_clone() else {
+        if echo_trace_on() {
+            echo_trace("relay no peer");
+        }
         return;
     };
     let Ok(peer_write) = peer.try_clone() else {
@@ -5825,15 +5837,39 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     let uplink = writer.clone();
     let done = thread::spawn(move || {
         let mut buf = vec![0u8; CHUNK];
+        let mut first = true;
         loop {
             match peer_read.read(&mut buf) {
                 Ok(n) if n > 0 => {
-                    if !uplink.send(&buf[..n]) {
+                    let sent = uplink.send(&buf[..n]);
+                    if echo_trace_on() && first {
+                        echo_trace(if sent {
+                            "relay fwd first send ok"
+                        } else {
+                            "relay fwd first send failed"
+                        });
+                        first = false;
+                    }
+                    if !sent {
+                        if echo_trace_on() {
+                            echo_trace("relay fwd send failed");
+                        }
                         break;
                     }
                 }
                 Err(error) if is_timeout(&error) => {}
-                _ => break,
+                Err(error) => {
+                    if echo_trace_on() {
+                        echo_trace(&format!("relay fwd read err {error:?}"));
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    if echo_trace_on() {
+                        echo_trace("relay fwd eof");
+                    }
+                    break;
+                }
             }
         }
         if CLOSE_FIRST {
@@ -5842,15 +5878,34 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
         }
     });
     let mut buf = vec![0u8; CHUNK];
+    let mut first = true;
     loop {
         match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
+                if echo_trace_on() && first {
+                    echo_trace("relay bwd first read");
+                    first = false;
+                }
                 if peer_write.write_all(&buf[..n]).is_err() {
+                    if echo_trace_on() {
+                        echo_trace("relay bwd peer write failed");
+                    }
                     break;
                 }
             }
             Err(error) if is_timeout(&error) => {}
-            _ => break,
+            Err(error) => {
+                if echo_trace_on() {
+                    echo_trace(&format!("relay bwd read err {error:?}"));
+                }
+                break;
+            }
+            Ok(_) => {
+                if echo_trace_on() {
+                    echo_trace("relay bwd eof");
+                }
+                break;
+            }
         }
     }
     if CLOSE_FIRST {
@@ -8991,6 +9046,7 @@ mod tests {
                     echo_trace(&format!("srv {port} response sent"));
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
+                    echo_trace(&format!("srv {port} ping read"));
                     writer.write_all(&buf).expect("echoes");
                     echo_trace(&format!("srv {port} echoed vless"));
                 }
@@ -9002,6 +9058,7 @@ mod tests {
                     echo_trace(&format!("srv {port} header ok"));
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
+                    echo_trace(&format!("srv {port} ping read"));
                     writer.write_all(&buf).expect("echoes");
                     echo_trace(&format!("srv {port} echoed trojan"));
                 }
@@ -9019,6 +9076,7 @@ mod tests {
                     let chunk = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
                         .expect("reads a frame")
                         .to_vec();
+                    echo_trace(&format!("srv {port} ping read"));
                     let mut staging = Vec::with_capacity(16 * 1024);
                     let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
                     assert!(crate::vmess::write_frame(
