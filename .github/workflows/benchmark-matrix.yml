@@ -183,11 +183,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # No pip cache here: this job installs nothing, so setup-python's post
+      # step has no cache to save and fails on the empty folder.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: scripts/requirements-benchmark.txt
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
@@ -195,7 +195,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: matrix-ferrox-${{ matrix.os }}
-          path: .
+          path: target/release
       - uses: actions/download-artifact@v4
         with:
           name: upstream-trees

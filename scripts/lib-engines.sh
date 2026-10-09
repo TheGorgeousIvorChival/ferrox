@@ -36,13 +36,21 @@ exe_suffix() {
 }
 
 built() {
-  if [[ -x "$1$(exe_suffix)" ]]; then
-    printf '%s\n' "$1$(exe_suffix)"
-  elif [[ -x "$1" ]]; then
-    printf '%s\n' "$1"
-  else
-    return 1
-  fi
+  # `download-artifact` records the mode in its zip and restores 0644, so a
+  # binary handed over from the build job arrives non-executable and would be
+  # refused for the one thing `--no-build` needs it for. Put the bit back
+  # before judging, or the cells job fails on a binary it was given.
+  local path
+  for path in "$1$(exe_suffix)" "$1"; do
+    if [[ -f "$path" ]]; then
+      chmod +x "$path" 2>/dev/null || true
+    fi
+    if [[ -x "$path" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+  return 1
 }
 
 build() {
