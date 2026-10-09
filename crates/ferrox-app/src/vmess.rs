@@ -1060,10 +1060,15 @@ pub(crate) fn pump_relay_carried<R, W>(
         let Some(mut pad) = PadSource::fresh() else {
             return;
         };
+        let mut first = true;
         while let Ok(read) = plain_read.read(&mut buf) {
             if read == 0 {
                 let _ = write_frame(&mut writer, &mut send, &[], &mut staging, &mut pad);
                 break;
+            }
+            let traced = crate::proxy::echo_trace_on() && first;
+            if traced {
+                crate::proxy::echo_trace("relay fwd first read");
             }
             let mut at = 0;
             let mut ok = true;
@@ -1081,6 +1086,14 @@ pub(crate) fn pump_relay_carried<R, W>(
                 }
                 at = end;
             }
+            if traced {
+                crate::proxy::echo_trace(if ok {
+                    "relay fwd first send ok"
+                } else {
+                    "relay fwd first send failed"
+                });
+                first = false;
+            }
             if !ok {
                 break;
             }
@@ -1091,7 +1104,12 @@ pub(crate) fn pump_relay_carried<R, W>(
 
     let mut recv = recv;
     let mut scratch = Vec::with_capacity(MAX_PLAIN + TAG_LEN + 64);
+    let mut first = true;
     while let Some(chunk) = read_frame(&mut reader, &mut recv, &mut scratch) {
+        if crate::proxy::echo_trace_on() && first {
+            crate::proxy::echo_trace("relay bwd first read");
+            first = false;
+        }
         if chunk.is_empty() || plain_write.write_all(chunk).is_err() {
             break;
         }
