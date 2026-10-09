@@ -196,7 +196,16 @@ fn note_dial_failure(target: &SocketAddr, failure: Failure) {
     } else {
         FATAL_DIALS.fetch_add(1, Ordering::Relaxed);
     }
+    if let Ok(mut last) = LAST_DIAL.lock() {
+        *last = Some((*target, failure));
+    }
+    echo_trace(&format!("dial {target} failed: {failure}"));
     eprintln!("dial {target} failed: {failure}");
+}
+
+#[cfg(test)]
+pub(crate) fn last_dial_failure() -> Option<(SocketAddr, Failure)> {
+    LAST_DIAL.lock().ok().and_then(|last| *last)
 }
 
 // The ladder rung a configured carrier answers, if it is on the ladder.
@@ -231,6 +240,25 @@ fn ladder_start(carrier: &Carrier) -> Rung {
 static FATAL_DIALS: AtomicU64 = AtomicU64::new(0);
 
 static RETRYABLE_DIALS: AtomicU64 = AtomicU64::new(0);
+// The last reported dial failure, so a test that outlives its dial names the
+// stage it died at instead of timing out in silence.
+static LAST_DIAL: std::sync::Mutex<Option<(SocketAddr, Failure)>> = std::sync::Mutex::new(None);
+
+// Stage tracing for the loopback echo family, behind one env flag so quiet
+// runs stay quiet: a stalled test's last line names where it stopped. stdout,
+// not stderr, because the harness captures stdout per test and a global
+// interleaving cannot attribute a line to its flow.
+static ECHO_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn echo_trace_on() -> bool {
+    *ECHO_TRACE_ON.get_or_init(|| std::env::var("FERROX_ECHO_TRACE").is_ok())
+}
+
+pub(crate) fn echo_trace(stage: &str) {
+    if echo_trace_on() {
+        println!("echo-trace: {stage}");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DialFailures {
@@ -6073,6 +6101,9 @@ pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
         let mut rest = vec![0u8; consumed - 2];
         read_exact(stream, &mut rest).ok()?;
     }
+    if echo_trace_on() {
+        echo_trace("response ok");
+    }
     Some(())
 }
 
@@ -8895,13 +8926,18 @@ mod tests {
         let mut at = 0;
         while at < back.len() {
             match sock.read(&mut back[at..]) {
-                Ok(0) => panic!("echoes: closed after {:?}", start.elapsed()),
+                Ok(0) => panic!(
+                    "echoes: closed after {:?}; last dial: {:?}",
+                    start.elapsed(),
+                    last_dial_failure()
+                ),
                 Ok(n) => at += n,
                 Err(error) => {
                     assert!(
                         is_timeout(&error) && start.elapsed() < Duration::from_secs(120),
-                        "echoes: {error:?} after {:?}",
-                        start.elapsed()
+                        "echoes: {error:?} after {:?}; last dial: {:?}",
+                        start.elapsed(),
+                        last_dial_failure()
                     );
                 }
             }
@@ -8929,9 +8965,11 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
             let mut tls = ferrox_core::tls::RustlsServerProvider::accept(&server_config, stream)
                 .expect("accepts");
             tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
             let shared = Arc::new(Mutex::new(tls));
             let (mut reader, mut writer) = accept(
                 TlsHalf {
@@ -8940,6 +8978,7 @@ mod tests {
                 TlsHalf { session: shared },
             )
             .expect("accepts carrier");
+            echo_trace(&format!("srv {port} carrier up"));
             match kind {
                 TlsEcho::Vless(id) => {
                     let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
@@ -8947,19 +8986,24 @@ mod tests {
                     };
                     assert_eq!(got, id);
                     assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
                     writer.write_all(&[0, 0]).expect("answers");
+                    echo_trace(&format!("srv {port} response sent"));
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
                     writer.write_all(&buf).expect("echoes");
+                    echo_trace(&format!("srv {port} echoed vless"));
                 }
                 TlsEcho::Trojan(key) => {
                     let Some((cmd, _target)) = decode_trojan_request(&mut reader, &key) else {
                         panic!("reads a trojan header");
                     };
                     assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
                     let mut buf = [0u8; 4];
                     reader.read_exact(&mut buf).expect("reads");
                     writer.write_all(&buf).expect("echoes");
+                    echo_trace(&format!("srv {port} echoed trojan"));
                 }
                 TlsEcho::Vmess(id) => {
                     let Some((_target, mut send, mut recv, prefix, cmd)) =
@@ -8968,7 +9012,9 @@ mod tests {
                         panic!("reads a vmess header");
                     };
                     assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
                     writer.write_all(&prefix).expect("answers");
+                    echo_trace(&format!("srv {port} response sent"));
                     let mut scratch = Vec::with_capacity(16 * 1024);
                     let chunk = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
                         .expect("reads a frame")
@@ -8982,6 +9028,7 @@ mod tests {
                         &mut staging,
                         &mut pad
                     ));
+                    echo_trace(&format!("srv {port} echoed vmess"));
                 }
             }
             // Exit only after the client closed: closing with its frames unread resets the echo with it.
@@ -8994,7 +9041,9 @@ mod tests {
             let (client, _) = downstream.accept().expect("accepts");
             let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
             let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            echo_trace(&format!("cli {port} dialing"));
             dial_socks_outbound(&client, &out(port), &server, &target);
+            echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))

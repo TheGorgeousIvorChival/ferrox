@@ -913,6 +913,9 @@ pub(crate) fn read_response(
     let Some(clear_body) = open_header(&body_key, &body_nonce, &sealed_body, &[]) else {
         return false;
     };
+    if crate::proxy::echo_trace_on() {
+        crate::proxy::echo_trace("response ok");
+    }
     clear_body.len() == 4 && clear_body[0] == auth
 }
 
@@ -1377,7 +1380,44 @@ pub(crate) fn pump_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::net::TcpListener;
+
+    #[test]
+    fn a_frame_coalesced_behind_its_header_still_arrives() {
+        // The stall this guards against is silent on both ends: the server
+        // decodes the header and the dial waits for the echo, while the ping
+        // frame sits in bytes a decode already consumed. No socket, no
+        // scheduler, so a loss here fails every run instead of one run in nine.
+        let id = [0x77u8; 16];
+        let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let Some((request, mut send, _recv, _, _, _)) =
+            client_request(&id, Cipher::Auto, &target, 1)
+        else {
+            panic!("builds a request");
+        };
+        let mut staging = Vec::with_capacity(16 * 1024);
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut frame = Vec::new();
+        assert!(write_frame(
+            &mut frame,
+            &mut send,
+            b"ping",
+            &mut staging,
+            &mut pad
+        ));
+        let mut cursor = Cursor::new([request, frame].concat());
+        let Some((got, _send, mut take, _prefix, cmd)) = accept_request(&mut cursor, &id) else {
+            panic!("decodes a header");
+        };
+        assert_eq!(cmd, 1);
+        assert_eq!(got, target);
+        let mut scratch = Vec::with_capacity(16 * 1024);
+        let Some(back) = read_frame(&mut cursor, &mut take, &mut scratch) else {
+            panic!("reads a coalesced frame");
+        };
+        assert_eq!(back, b"ping");
+    }
 
     #[test]
     fn instruction_splits_uuid_and_magic() {
