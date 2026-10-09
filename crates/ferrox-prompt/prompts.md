@@ -968,8 +968,8 @@ Decide the shape before writing the stack: a native TUN inbound (row 29) that te
 
 ## P47 · Make the TLS-carrier loopback tests stop losing to the linux runner
 
-**When to use:** When a `ci.yml` linux run goes red on `*_over_tls_*` echo tests that pass everywhere else: three consecutive runs on `foxy-relay-fix` (37857599012, 37860540928, 37884230403) failed 4, 5 and 2 of them respectively, each time a different subset (`trojan`/`vless`/`vmess` over `ws`/`grpc`/`xhttp`/`httpheader`), each after ~60 s stalls against a 120 s read timeout — while the same commits are green on macos, on windows, and across four consecutive local full-suite runs. A no-Rust-change commit fails them too, so the diff is never the cause.
-**Status:** todo
+**When to use:** When a `ci.yml` linux run goes red on `*_over_tls_*` echo tests that pass everywhere else. Measured across `foxy-relay-fix` runs 37857599012 (4 failed), 37860540928 (5), 37884230403 (2), 37898258482 (6) and 37912894136 (2), each time a different subset, each a ~120 s stall with zero wrong bytes — while macos, windows and quiet local runs stay green. A no-Rust-change commit fails them too, so the diff is never the cause. Since `FERROX_ECHO_TRACE` landed, every failure names its stage: handshake, carrier accept, header decode and response exchange all complete in milliseconds, then relay-phase mutual silence with no error on any thread.
+**Status:** doing
 **Leverage:** 3
 **Effort:** medium
 **Gates:** `cargo test --workspace` green on three consecutive `ci.yml` runs
@@ -978,4 +978,32 @@ Decide the shape before writing the stack: a native TUN inbound (row 29) that te
 
 ```text
 Every one of these is a full stack — SOCKS front, TLS handshake, carrier accept, protocol header, echo — run in parallel with two hundred others on a shared runner, and the failure is always a stall, never a wrong byte. That is the P13 shape (scheduler, not framing) in the TLS family, and P23's two named races are the same class one layer down. Do what P13 prescribes: instrument `tls_carried_echo` with the stage each end reached, then loop the family until a run fails and read which stage stalled — the TLS handshake, the carrier accept, or the echo. A timeout raised without that trace is budget, not a fix, and a quarantine without it hides the signal this slice exists to read.
+```
+
+## P48 · Pool the Foxy H2 session instead of handshaking per flow
+
+**When to use:** When a profile shows the H2 carrier paying a full TCP+TLS handshake per flow: `open_h2` opens stream 1 on a fresh connection every time by design, while the reference FoxyVPN multiplexes flows over one H2 session with keepalive, GOAWAY handling and stream slots — and this tree already pools its H3 connections the same way.
+**Status:** todo
+**Leverage:** 3
+**Effort:** large
+**Gates:** `cargo test --workspace`; CI: `foxy-relay.yml` green with per-carrier 1 MB legs unmoved
+**Touches:** crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/proxy.rs
+**Random weight:** 1
+
+```text
+One H2 connection per flow is correct — the relay proves it carries megabytes — but it pays the handshake on every flow and never notices a dead session until a flow fails on it, where the reference notices in 15 s idle plus a 10 s ping and stops opening streams on GOAWAY. Pool the session the way the H3 pool already does: one handshake per edge, streams per flow, keepalive pings on the same schedule the reference names, and a refused pass still latches process-wide rather than per session. Prove it the way H3 earned its pool: the block on the wire unchanged, a loopback echo over a shared session, and the relay legs green with no per-carrier regression. A pool that changes a byte is a new carrier, not an optimisation.
+```
+
+## P49 · Chain the edge dial through an upstream proxy
+
+**When to use:** When the lane must start behind a corporate or captive proxy: the reference FoxyVPN chains its edge dial through a configured SOCKS5 or HTTP proxy (and dials TCP to an overridden address while verifying the edge name), while this tree dials the edge directly and has no such key — so a network that only permits proxy egress cannot start the lane at all.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace`; a loopback test dialling the lane through a local upstream proxy
+**Touches:** crates/ferrox-app/src/proxy.rs, crates/ferrox-app/src/foxy.rs
+**Random weight:** 1
+
+```text
+Read the edge hostname, port and pass exactly as today; only the transport changes: TCP (and, for H3, UDP association) to the edge goes through the configured upstream instead of direct. The TLS server name and pins stay the edge's, the way the reference verifies the edge name against a custom TCP address. Plain HTTP CONNECT upstream is one handshake; SOCKS5 upstream is the greeting this tree already speaks. Refuse a chain the carrier cannot use with the reason rather than silently going direct — a lane that bypasses its configured proxy is a leak, not a fallback.
 ```

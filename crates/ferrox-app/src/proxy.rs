@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -385,6 +385,11 @@ struct FoxyOut {
     /// Set when the edge refuses the pass, so every later flow is answered
     /// locally instead of paying a round trip to hear the same status again.
     unauthenticated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Consecutive rate-limited flows and the second before which the next one
+    /// may dial: a 429 answers one attempt per flow and the rest wait out the
+    /// refusal curve instead of extending the limit across every edge.
+    limited_strikes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    limited_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
     roots: Vec<Vec<u8>>,
     pins: ferrox_core::foxy::pin::Pins,
     pass: ferrox_core::foxy::Pass,
@@ -4305,6 +4310,28 @@ enum FoxyOpen {
     Silent,
 }
 
+/// Whether a flow may dial yet: inside the refusal curve it is refused
+/// locally, because one more attempt only extends the account's limit.
+fn edge_limited(until: &AtomicU64, now: u64) -> bool {
+    until.load(Ordering::Relaxed) > now
+}
+
+/// Records one rate-limited attempt and returns when the next flow may dial,
+/// climbing the refusal curve instead of hammering every edge and carrier.
+fn note_limited(strikes: &AtomicU32, until: &AtomicU64, now: u64) -> u64 {
+    let wait = ferrox_core::foxy::refusal_backoff(strikes.fetch_add(1, Ordering::Relaxed));
+    let at = now.saturating_add(wait.as_secs());
+    until.store(at, Ordering::Relaxed);
+    at
+}
+
+/// A working tunnel clears the limit: the account answers again, so the curve
+/// restarts rather than punishing later flows for an old limit.
+fn clear_limited(strikes: &AtomicU32, until: &AtomicU64) {
+    strikes.store(0, Ordering::Relaxed);
+    until.store(0, Ordering::Relaxed);
+}
+
 /// The edge and carrier loop both fronts share: first answer wins, a refused
 /// pass stops every carrier and every edge, and the grant stays with the front.
 fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
@@ -4312,6 +4339,9 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
         .unauthenticated
         .load(std::sync::atomic::Ordering::Relaxed)
     {
+        return FoxyOpen::Refused(0x01);
+    }
+    if edge_limited(&foxy.limited_until, now_secs()) {
         return FoxyOpen::Refused(0x01);
     }
     if foxy_splits(foxy, asked) {
@@ -4365,6 +4395,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
                     debug_lane(&edge, carrier, &format!("opened for {target}"));
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                    clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     let h3 = h3.map(|id| (foxy_quic_dial(foxy, &edge), id));
                     return FoxyOpen::Tunnel(Box::new(tunnel), h3);
                 }
@@ -4376,6 +4407,12 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
                         if ferrox_core::foxy::pass_is_rejected(status) {
                             foxy.unauthenticated
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        // A limit is account-wide, so one attempt per flow is
+                        // the whole budget: the rest wait out the curve.
+                        if status == 429 {
+                            note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
                             break;
                         }
                         if ferrox_core::foxy::target_is_unreachable(status) {
@@ -4711,6 +4748,9 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
 /// answers, H2 only. The pass is read fresh per dial so a renewal between
 /// datagrams is picked up without reopening anything else.
 fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Tls2> {
+    if edge_limited(&foxy.limited_until, now_secs()) {
+        return None;
+    }
     let order = ferrox_core::foxy::catalog::tier(
         &foxy.candidates,
         &foxy.country,
@@ -4743,11 +4783,16 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Tls2>
                     crate::foxy::Carrier::H2,
                     &format!("udp opened for {dest}"),
                 );
+                clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                 let _ = lane.set_read_quantum(RELAY_QUANTUM);
                 return Some(lane);
             }
             Err(failure) => {
                 debug_lane(&edge, crate::foxy::Carrier::H2, &failure.to_string());
+                if matches!(failure, ferrox_core::foxy::Failure::Rejected(429)) {
+                    note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
+                    break;
+                }
             }
         }
     }
@@ -6855,6 +6900,8 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             candidates,
             stored: None,
             unauthenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             country,
             city,
             carrier: foxy_carrier(settings, &link),
@@ -13580,6 +13627,21 @@ mod tests {
         assert_eq!(origin, origin_form);
         assert!(http_proxy_request(b"GET /p HTTP/1.1\r\n\r\n").is_none());
         assert!(http_proxy_request(b"GARBAGE\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn rate_limit_backoff_climbs_and_clears() {
+        let strikes = AtomicU32::new(0);
+        let until = AtomicU64::new(0);
+        assert!(!edge_limited(&until, 1_000));
+        assert_eq!(note_limited(&strikes, &until, 1_000), 1_030);
+        assert!(edge_limited(&until, 1_000));
+        assert!(!edge_limited(&until, 1_030));
+        assert_eq!(note_limited(&strikes, &until, 1_030), 1_060);
+        assert_eq!(note_limited(&strikes, &until, 1_060), 1_120);
+        assert!(edge_limited(&until, 1_061));
+        clear_limited(&strikes, &until);
+        assert!(!edge_limited(&until, 1_061));
     }
 
     #[test]
