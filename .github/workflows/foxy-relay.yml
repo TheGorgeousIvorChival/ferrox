@@ -135,6 +135,9 @@ jobs:
             python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
           }
           : > ferrox-relay.log
+          # Every carrier is attempted even when one fails, so one bad method
+          # cannot hide the others; the job fails at the end if any leg did.
+          FAILED=""
           for carrier in h1 h2 h3 auto; do
             echo "== carrier $carrier =="
             CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
@@ -144,7 +147,9 @@ jobs:
             if ! wait_port "$PORT"; then
               echo "carrier $carrier never listened" >&2
               tail -n 30 ferrox-relay.log
-              exit 1
+              stop_lane
+              FAILED="$FAILED $carrier(listen)"
+              continue
             fi
             # Diagnosis first, one shot each: full SOCKS+TLS transcript and the
             # raw bytes a plain-HTTP GET brings back through the same tunnel.
@@ -164,15 +169,23 @@ jobs:
               fi
               sleep 20
             done
-            grep -E '^(loc|ip)=' trace.txt
-            grep -qx "loc=$FOXY_COUNTRY" trace.txt
-            curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
-              'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin"
-            test "$(wc -c < "file-$carrier.bin")" = 1000000
-            sha_of "file-$carrier.bin"
-            echo "carrier $carrier: 1000000 B, exit $FOXY_COUNTRY"
+            grep -E '^(loc|ip)=' trace.txt || true
+            if grep -qx "loc=$FOXY_COUNTRY" trace.txt 2>/dev/null \
+              && curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+                'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin" \
+              && test "$(wc -c < "file-$carrier.bin")" = 1000000; then
+              sha_of "file-$carrier.bin"
+              echo "carrier $carrier: 1000000 B, exit $FOXY_COUNTRY"
+            else
+              echo "carrier $carrier FAILED" >&2
+              FAILED="$FAILED $carrier"
+            fi
             stop_lane
           done
+          if [ -n "$FAILED" ]; then
+            echo "failed legs:$FAILED" >&2
+            exit 1
+          fi
       - name: Second country, http front, UDP path
         # One runner proves the legs that are about the lane rather than the
         # platform: a different exit server, the http front the app now serves
