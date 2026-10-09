@@ -965,3 +965,17 @@ A TUN device is not another front: it needs a platform device (`utun` on macOS, 
 
 Decide the shape before writing the stack: a native TUN inbound (row 29) that terminates IP itself, or the zeptun-style translator (row 58) that turns TUN into TCP/UDP/ICMP through the SOCKS front that already exists. Either way the proof is a CI leg that captures device traffic and downloads 1 MB through it, because a TUN path proven only by framing is the loopback mistake P39 already paid for once. Until then rows 29 and 58 stay planned and say so, and no config key names a device this binary cannot open.
 ```
+
+## P47 · Make the TLS-carrier loopback tests stop losing to the linux runner
+
+**When to use:** When a `ci.yml` linux run goes red on `*_over_tls_*` echo tests that pass everywhere else: three consecutive runs on `foxy-relay-fix` (37857599012, 37860540928, 37884230403) failed 4, 5 and 2 of them respectively, each time a different subset (`trojan`/`vless`/`vmess` over `ws`/`grpc`/`xhttp`/`httpheader`), each after ~60 s stalls against a 120 s read timeout — while the same commits are green on macos, on windows, and across four consecutive local full-suite runs. A no-Rust-change commit fails them too, so the diff is never the cause.
+**Status:** todo
+**Leverage:** 3
+**Effort:** medium
+**Gates:** `cargo test --workspace` green on three consecutive `ci.yml` runs
+**Touches:** crates/ferrox-app/src/proxy.rs
+**Random weight:** 2
+
+```text
+Every one of these is a full stack — SOCKS front, TLS handshake, carrier accept, protocol header, echo — run in parallel with two hundred others on a shared runner, and the failure is always a stall, never a wrong byte. That is the P13 shape (scheduler, not framing) in the TLS family, and P23's two named races are the same class one layer down. Do what P13 prescribes: instrument `tls_carried_echo` with the stage each end reached, then loop the family until a run fails and read which stage stalled — the TLS handshake, the carrier accept, or the echo. A timeout raised without that trace is budget, not a fix, and a quarantine without it hides the signal this slice exists to read.
+```
