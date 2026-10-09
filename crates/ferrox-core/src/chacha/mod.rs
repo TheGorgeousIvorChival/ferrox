@@ -268,22 +268,59 @@ fn xor_last_bytes(dst: &mut [u8], staged: &[u8; 16]) {
     }
 }
 
+/// Bytes a ladder group covers: the ladder's own budget, not the tail's.
+#[cfg(any(not(target_arch = "aarch64"), test))]
 const fn group_bytes<V: Lanes>() -> usize {
     GROUP_STATES * V::CHUNKS * 64
 }
 
-/// States `xor_tail`'s group may run: `GROUP_STATES` less one, so the group it
-/// sizes still fits the register file.
+/// States `xor_tail`'s group may run: on `x86_64` one fewer than the group that
+/// fits the register file, on `aarch64` the group itself.
 ///
-/// `xor_groups::<V, NST>` keeps `NST * 4` lane registers live for the counters
-/// and reads four more for the base, so on `x86_64` — sixteen `ymm` — the round
-/// loop of an `A8` group spills once `NST` reaches `GROUP_STATES`. One state
-/// fewer is `12 + 4`, which is exactly the file. `xor_tail` is the one caller
-/// whose group size it picks itself, so it is the one that has to hold this
-/// line: the ladder's group loop and the pass above it both size for their own
-/// register budget. A seven- or eight-block tail was measured at +25% against
-/// the two smaller groups it was then split into.
-const TAIL_STATES: usize = if GROUP_STATES < 8 { GROUP_STATES } else { 8 } - 1;
+/// `xor_groups::<V, NST>` keeps `NST * 4` lane registers live for the state and
+/// reads four more for the base, so on `x86_64` — sixteen `ymm` — the round loop
+/// of an `A8` group spills once `NST` reaches `GROUP_STATES`. One state fewer is
+/// `12 + 4`, which is exactly the file. `xor_tail` is the one caller whose group
+/// size it picks itself, so it is the one that has to hold this line: the
+/// ladder's group loop and the pass above it both size for their own register
+/// budget. A seven- or eight-block tail was measured at +25% against the two
+/// smaller groups it was then split into.
+///
+/// `aarch64` is the measured exception, and it is the other way round. Eight
+/// `neon` states need thirty-seven of the thirty-two registers and the round
+/// loop spills, but the alternative is a remainder of one to three blocks left
+/// for `one_block`, which is a whole dependent round chain with nothing beside
+/// it to issue, and the chain costs more than the spill: `c8e19b4` measured
+/// 449 bytes at 640 ns against 539 ns on linux aarch64 and 445 ns against 280 ns
+/// on macos aarch64 for one group of eight against seven states and a chain.
+/// `d207fe2` then took the `x86_64` measurement and lowered this constant on
+/// every arch, which is where the `aarch64` numbers above were lost again.
+const TAIL_STATES: usize = if cfg!(target_arch = "aarch64") {
+    GROUP_STATES
+} else {
+    GROUP_STATES - 1
+};
+
+/// The `x86_64` half of the line above, as an arithmetic gate: the tail's group
+/// holds `TAIL_STATES * 4` lane registers and reads four for the base, which
+/// has to stay inside the sixteen `ymm`.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    TAIL_STATES * 4 + 4 <= 16,
+    "the tail group is past the ymm file"
+);
+
+/// The states one tail group runs and the bytes of the remainder it stores, for a
+/// remainder of `len` bytes with `owed` bytes of head riding along.
+///
+/// The two numbers the loop needs, apart from each other so a test can read them.
+#[inline(always)]
+fn tail_group(len: usize, owed: usize, chunks: usize) -> (usize, usize) {
+    let needed = (len + owed).div_ceil(64);
+    let states = needed.div_ceil(chunks).clamp(1, TAIL_STATES);
+    let nominal = states * chunks;
+    (states, (nominal * 64 - owed).min(len))
+}
 
 /// The ladder's last stretch: one group sized to the blocks the rest of the
 /// buffer needs, with its final block stored partial.
@@ -295,12 +332,13 @@ const TAIL_STATES: usize = if GROUP_STATES < 8 { GROUP_STATES } else { 8 } - 1;
 /// carries (`CHUNKS` states cover two blocks on `x86_64`) computes them and the
 /// count reports only what was stored, which is what the caller counts.
 ///
-/// What the group may not do is reach `GROUP_STATES`, because a group that
-/// large does not fit. `xor_groups` holds `NST * 4` lane registers for the
-/// counters and reads four more for the base, and on `x86_64` that is the whole
-/// `ymm` file at `NST = GROUP_STATES`, so the round loop spills. A seven- or
-/// eight-block tail was measured at +25% against the two smaller groups it was
-/// then split into.
+/// What the group may not do is reach `GROUP_STATES` on `x86_64`, because a
+/// group that large does not fit: `xor_groups` holds `NST * 4` lane registers
+/// for the counters and reads four more for the base, and on `x86_64` that is
+/// the whole `ymm` file at `NST = GROUP_STATES`, so the round loop spills. A
+/// seven- or eight-block tail was measured at +25% against the two smaller
+/// groups it was then split into. `aarch64` asks for the group and pays the
+/// spill; see `TAIL_STATES`.
 #[inline(always)]
 fn xor_tail<V: Lanes>(
     state: &[u32; 16],
@@ -315,14 +353,14 @@ fn xor_tail<V: Lanes>(
     let mut owed = 64 * usize::from(head.is_some());
     while rest.len() + owed > 64 {
         let needed = (rest.len() + owed).div_ceil(64);
-        let states = needed.div_ceil(V::CHUNKS).clamp(1, TAIL_STATES);
+        let (states, take) = tail_group(rest.len(), owed, V::CHUNKS);
         let nominal = states * V::CHUNKS;
-        let (chunk, tail) = rest.split_at_mut((nominal * 64 - owed).min(rest.len()));
+        let (chunk, tail) = rest.split_at_mut(take);
         macro_rules! pass {
             ($($n:literal),+ $(,)?) => {
                 match states {
                     $($n => xor_groups::<V, $n>(base, ctr, chunk, head.take()),)+
-                    _ => unreachable!("`states` is clamped to GROUP_STATES"),
+                    _ => unreachable!("`states` is clamped to TAIL_STATES"),
                 }
             };
         }
@@ -400,6 +438,10 @@ pub(crate) fn xor_blocks(
     xor_ladder::<Wide>(key, nonce, start, head, buf)
 }
 
+/// The group loop, then the tail. On `aarch64` the pass above it always leaves
+/// less than `group_bytes`, so only the tests reach the group: it is the
+/// independent ladder every pass is read against, and it ships with them.
+#[cfg(any(not(target_arch = "aarch64"), test))]
 #[inline(always)]
 fn xor_ladder<V: Lanes>(
     key: &[u8; 32],
@@ -554,6 +596,45 @@ mod avx2_counter_tests {
         assert_eq!(second[4], 1, "chunk 1 of the next state");
         assert_eq!(&second[1..4], &tail, "and the tails do not move");
         assert_eq!(&second[5..8], &tail);
+    }
+}
+
+#[cfg(test)]
+mod tail_sizing_tests {
+    use super::{tail_group, TAIL_STATES};
+
+    /// The group stores only what the buffer holds and always takes some of it,
+    /// so the loop that sizes it cannot store past the end or spin.
+    #[test]
+    fn the_group_stores_what_the_buffer_holds_and_advances() {
+        for chunks in [1usize, 2] {
+            for len in 0..=(TAIL_STATES * chunks * 64 + 64) {
+                for owed in [0usize, 64] {
+                    if len + owed <= 64 {
+                        continue;
+                    }
+                    let (states, take) = tail_group(len, owed, chunks);
+                    assert!(states <= TAIL_STATES, "chunks {chunks} len {len}");
+                    assert!(take <= len, "chunks {chunks} len {len}: stored {take}");
+                    assert!(take > 0, "chunks {chunks} len {len} must advance");
+                }
+            }
+        }
+    }
+
+    /// The pass always leaves less than a pass behind, so on `aarch64` the tail's
+    /// first group is the last stretch of every record: one group carries the
+    /// whole remainder, and the one-to-three blocks that a smaller clamp would
+    /// leave for `one_block` are a dependent round chain with nothing to issue
+    /// beside it. `TAIL_STATES` names the measurement.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn the_first_group_carries_the_whole_remainder_a_pass_leaves() {
+        for len in 1..512usize {
+            let (states, take) = tail_group(len, 0, 1);
+            assert_eq!(take, len, "{len} bytes in one group");
+            assert_eq!(states, len.div_ceil(64), "{len} blocks in one group");
+        }
     }
 }
 

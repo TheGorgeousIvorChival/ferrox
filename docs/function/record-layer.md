@@ -117,7 +117,7 @@ graph TD
     F --> G{"more than a group left?"}
     G -- yes --> D
     W -- no --> H
-    G -- no --> H["one group sized to the blocks left,<br/>the last stored partial,<br/>then the single-block path"]
+    G -- no --> H["one group sized to the blocks left,<br/>the last stored partial,<br/>the single-block path for what the clamp cannot cover"]
     H --> I(("buffer, in place, nothing discarded"))
     J["decrypt_in_place, len bytes"] --> K["poly_key: block 0 only,<br/>32 bytes, no body"]
     K --> L["Poly1305 over the ciphertext<br/>pad_to_block per section"]
@@ -229,6 +229,18 @@ them rather than claimed:
 Run `37740838172` repeats those two rows on the same two runners — 449 bytes
 reads 1.53x (543 ns) on linux aarch64 and 2.93x (274 ns) on macos aarch64 — so
 the change is the tail and not the run.
+
+`d207fe2` then answered the same question on `x86_64`, where a group of four
+`A8` states spills and the split groups are what fit, and it lowered
+`TAIL_STATES` on every arch — which took `aarch64` back to the shape `c8e19b4`
+had just measured away: seven states and a dependent round chain for the one to
+three blocks a remainder of 449 to 511 leaves over. The `aarch64` runner was
+never re-read for that. Restoring `GROUP_STATES` there brings those four lengths
+back to one group of eight, spilling though it does, and the claim is gated by
+`chacha::tail_sizing_tests::the_first_group_carries_the_whole_remainder_a_pass_leaves`
+— the pass always leaves less than a pass behind, so on `aarch64` the tail's
+first group carries the whole remainder of every record — while `x86_64` keeps
+one state fewer, as a `const` assertion over its own sixteen-register file.
 
 The `x86_64` rows of those two runs are not usable for that comparison, and the
 reason is the one the `x86_64` pass below exists for. GitHub moved those runners
