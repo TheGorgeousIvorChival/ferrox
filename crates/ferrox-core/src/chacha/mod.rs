@@ -272,6 +272,19 @@ const fn group_bytes<V: Lanes>() -> usize {
     GROUP_STATES * V::CHUNKS * 64
 }
 
+/// States `xor_tail`'s group may run: `GROUP_STATES` less one, so the group it
+/// sizes still fits the register file.
+///
+/// `xor_groups::<V, NST>` keeps `NST * 4` lane registers live for the counters
+/// and reads four more for the base, so on `x86_64` — sixteen `ymm` — the round
+/// loop of an `A8` group spills once `NST` reaches `GROUP_STATES`. One state
+/// fewer is `12 + 4`, which is exactly the file. `xor_tail` is the one caller
+/// whose group size it picks itself, so it is the one that has to hold this
+/// line: the ladder's group loop and the pass above it both size for their own
+/// register budget. A seven- or eight-block tail was measured at +25% against
+/// the two smaller groups it was then split into.
+const TAIL_STATES: usize = if GROUP_STATES < 8 { GROUP_STATES } else { 8 } - 1;
+
 /// The ladder's last stretch: one group sized to the blocks the rest of the
 /// buffer needs, with its final block stored partial.
 ///
@@ -281,6 +294,13 @@ const fn group_bytes<V: Lanes>() -> usize {
 /// round chain of its own. A group that rounds up past the blocks the buffer
 /// carries (`CHUNKS` states cover two blocks on `x86_64`) computes them and the
 /// count reports only what was stored, which is what the caller counts.
+///
+/// What the group may not do is reach `GROUP_STATES`, because a group that
+/// large does not fit. `xor_groups` holds `NST * 4` lane registers for the
+/// counters and reads four more for the base, and on `x86_64` that is the whole
+/// `ymm` file at `NST = GROUP_STATES`, so the round loop spills. A seven- or
+/// eight-block tail was measured at +25% against the two smaller groups it was
+/// then split into.
 #[inline(always)]
 fn xor_tail<V: Lanes>(
     state: &[u32; 16],
@@ -295,7 +315,7 @@ fn xor_tail<V: Lanes>(
     let mut owed = 64 * usize::from(head.is_some());
     while rest.len() + owed > 64 {
         let needed = (rest.len() + owed).div_ceil(64);
-        let states = needed.div_ceil(V::CHUNKS).clamp(1, GROUP_STATES);
+        let states = needed.div_ceil(V::CHUNKS).clamp(1, TAIL_STATES);
         let nominal = states * V::CHUNKS;
         let (chunk, tail) = rest.split_at_mut((nominal * 64 - owed).min(rest.len()));
         macro_rules! pass {
