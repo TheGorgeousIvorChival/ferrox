@@ -227,7 +227,7 @@ This table is the verdict; the page is the evidence. Rows 1–22 are the share-l
 | 26 | DNS outbound | — (config-driven) | refused | — | Planned. Xray `proxy/dns/` + `app/dns/` (UDP/TCP/DoH/QUIC/FakeDNS); sing-box `protocol/dns/`; ZeroNet `zero-dns` (UDP/TCP/DoT/DoH/DoH2/DoH3/DoQ). No `dns` protocol in `proxy.rs`. |
 | 27 | loopback re-inject inbound | — (config-driven) | refused | — | Planned. Xray `proxy/loopback/`. `loopback` in tree means loopback test sockets only. |
 | 28 | Shadowsocks-2022 ciphers | — (config-driven) | refused by name (row 7) | [shadowsocks](docs/function/shadowsocks.md) | Planned. Xray `proxy/shadowsocks_2022/`; ZeroNet `shadowsocks2022.rs` (`2022-blake3-*`, TCP-only like ours). |
-| 29 | TUN inbound (native) | — (config-driven) | refused | — | Planned. Xray `proxy/tun/`; sing-box `protocol/tun/` + `transport/device/`; ZeroNet `zero-tun`. Row 58 is the tun2socks translator; this row is the native inbound. |
+| 29 | TUN inbound (native) | — (config-driven) | refused by name | [a_device_inbound_is_refused_by_name_rather_than_served](crates/ferrox-app/src/proxy.rs) | Planned. Xray `proxy/tun/`; sing-box `protocol/tun/` + `transport/device/`; ZeroNet `zero-tun`. Row 58 is the tun2socks translator; this row is the native inbound. A device needs a platform device (`utun`/`tun`/Wintun), a userspace IP stack and root or an entitlement, none of which this binary has, so a config naming one is refused and serves nothing — the served surface stays the fronts, and `foxy-macos.sh --vpn` is the documented system-proxy mode. |
 | 30 | Unix domain sockets | — (config-driven) | refused | — | Planned. Xray `transport/internet/system_listener.go:46-75` Unix wrappers. Tree binds TCP only (`unix` hits are `UNIX_EPOCH` clocks). |
 | 31 | finalmask post-TLS mask chain | — (config-driven) | refused | — | Planned. Xray `transport/internet/finalmask/` (`fragment`/`noise`/`salamander`/`realm`/…). Zero occurrences in `crates/`. |
 | 32 | xdrive cloud-drive carrier | — (config-driven) | refused | — | Name only: `TransportKind::Xdrive`, `Carrier::Xdrive` (`refused_carriers!`, `proxy.rs:284`). Xray `transport/internet/xdrive/` polls Drive remotes. |
@@ -266,7 +266,7 @@ This table is the verdict; the page is the evidence. Rows 1–22 are the share-l
 | 55 | Nested MASQUE (`mim`, tunnel in a tunnel) | planned | Aether |
 | 56 | TCP-over-DNS covert channel (base32 domain + TXT) | planned | slipstream |
 | 57 | Multi-resolver parallel + port-53 impersonation, DCUBIC/BBR | planned | slipstream |
-| 58 | tun2socks engine (TUN → TCP/UDP/ICMP; `userspace`/`hybrid`/`system`) | planned — zeptun, one device away from row 3 | zeptun |
+| 58 | tun2socks engine (TUN → TCP/UDP/ICMP; `userspace`/`hybrid`/`system`) | planned — zeptun, one device away from row 3; the name alone refuses a config, same as row 29 | zeptun |
 
 ### D — DNS-tunnel ways (learned from CottenDNS / MasterDnsVPN, not pinned)
 

@@ -43,6 +43,15 @@ pub(crate) fn serve_file(path: &str) -> ! {
             };
             let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
             let address = format!("{listen}:{port}");
+            if !inbound_served(protocol) {
+                // Named here rather than dropped in silence: a device inbound is
+                // one this binary cannot open, and a config that asks for one
+                // learns that instead of serving nothing.
+                eprintln!(
+                    "unsupported inbound protocol `{protocol}` in {path}: refused, not served"
+                );
+                continue;
+            }
             match protocol {
                 "vless" => {
                     if serve_vless_inbound(&address, inbound, freedom, path) {
@@ -107,6 +116,27 @@ pub(crate) fn serve_file(path: &str) -> ! {
         thread::park();
         report_dial_failures();
     }
+}
+
+/// The inbound protocols this binary serves, in one place. A device inbound
+/// (`tun`, `utun`, `wintun`) is not one of them: it needs a platform device
+/// this binary cannot open and root or an entitlement to create it, so README
+/// rows 29 and 58 stay planned and the serve path refuses such a config by
+/// name rather than serving nothing quietly.
+const SERVED_INBOUNDS: [&str; 8] = [
+    "vless",
+    "trojan",
+    "vmess",
+    "shadowsocks",
+    "hysteria",
+    "socks",
+    "http",
+    "mixed",
+];
+
+/// Whether this protocol is an inbound this binary serves.
+fn inbound_served(protocol: &str) -> bool {
+    SERVED_INBOUNDS.contains(&protocol)
 }
 
 fn spawn_role(address: &str, role: Role) {
@@ -8658,6 +8688,23 @@ mod tests {
                 ))
             },
         );
+    }
+
+    /// Rows 29 and 58 stay planned, and the claim is checked here: a config that
+    /// names a device this binary cannot open serves nothing at all, while every
+    /// front it does serve still starts. A key that named a device the binary
+    /// cannot open would be a lane that quietly serves nothing.
+    #[test]
+    fn a_device_inbound_is_refused_by_name_rather_than_served() {
+        for name in ["tun", "utun", "wintun", "tun2socks"] {
+            assert!(
+                !inbound_served(name),
+                "the device inbound `{name}` is refused by name"
+            );
+        }
+        for name in SERVED_INBOUNDS {
+            assert!(inbound_served(name), "the front `{name}` serves");
+        }
     }
 
     fn carried_tls_configs() -> (
