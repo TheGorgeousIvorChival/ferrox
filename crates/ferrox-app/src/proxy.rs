@@ -380,6 +380,10 @@ struct FoxyOut {
     country: String,
     city: String,
     carrier: crate::foxy::Carrier,
+    /// An upstream proxy the edge dial chains through; going direct past a
+    /// configured one would be a leak, so a value that does not parse refuses
+    /// the outbound the way a missing account does.
+    upstream: Option<crate::foxy::UpstreamProxy>,
     candidates: Vec<ferrox_core::foxy::Candidate>,
     stored: Option<ferrox_core::foxy::Candidate>,
     /// Set when the edge refuses the pass, so every later flow is answered
@@ -1667,7 +1671,7 @@ pub(crate) fn read_into_tail(read: &mut impl Read, buf: &mut Vec<u8>) -> std::io
 }
 
 pub(crate) fn refresh_read_timeout(
-    sock: &UdpSocket,
+    sock: &crate::quic::Datagram,
     want: Duration,
     applied: &mut Option<Duration>,
 ) -> bool {
@@ -4126,6 +4130,7 @@ fn serve_connect(
                         host: vless.host.clone(),
                         address: vless.address.clone(),
                         port: vless.port,
+                        upstream: None,
                         roots: vless.quic_roots.clone(),
                     },
                     &target,
@@ -4379,6 +4384,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
                 port: edge.port,
                 address: foxy.edge_address,
                 carrier,
+                upstream: foxy.upstream.clone(),
                 roots: foxy.roots.clone(),
                 pins: foxy.pins.clone(),
                 pass: pass.clone(),
@@ -4772,6 +4778,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Tls2>
             port: edge.port,
             address: foxy.edge_address,
             carrier: crate::foxy::Carrier::H2,
+            upstream: foxy.upstream.clone(),
             roots: foxy.roots.clone(),
             pins: foxy.pins.clone(),
             pass,
@@ -5156,6 +5163,7 @@ fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate:
         host: edge.host.clone(),
         address: edge.host.clone(),
         port: edge.port,
+        upstream: foxy.upstream.clone(),
         roots: Some(foxy.roots.clone()),
     }
 }
@@ -6638,6 +6646,66 @@ fn is_freedom(root: &Json) -> bool {
 /// The carrier the config names, or the one the link names, or `auto`: a lane
 /// that is told nothing tries QUIC, then HTTP/2, then HTTP/1.1, rather than
 /// committing to one carrier the edge may not answer.
+/// Where the lane may exit. An edge the config or the link names outright is
+/// dialed whatever the catalogue publishes, because naming one is a decision
+/// and guessing is not; an address is separate, the poison-proof dial that is
+/// never the TLS name. With nothing configured naming an edge the published
+/// list decides, which is what lets a link that says only `country=US` reach
+/// an exit at all.
+fn foxy_candidates(
+    outbound: &Json,
+    link: &ferrox_core::foxy::link::FoxyLink,
+    country: &str,
+    city: &str,
+    roots: Vec<Vec<u8>>,
+) -> Vec<ferrox_core::foxy::Candidate> {
+    let named = link.host();
+    let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
+        host: named.to_owned(),
+        port: link.port(),
+        country: country.to_owned(),
+        city: city.to_owned(),
+    });
+    let configured_edges = foxy_edges(outbound, country, city);
+    if let Some(edge) = named_edge {
+        return vec![edge];
+    }
+    if !configured_edges.is_empty() {
+        return configured_edges;
+    }
+    crate::foxy_catalog::edges(roots)
+}
+
+/// An edge address the config names outright, resolved once so every dial
+/// shares it; empty means the catalogue's names resolve per dial.
+fn foxy_edge_address(settings: Option<&Json>) -> Option<SocketAddr> {
+    let named = foxy_text(settings, "edgeAddress");
+    if named.is_empty() {
+        return None;
+    }
+    resolve(&named, 443)
+}
+
+/// An upstream proxy the edge dial chains through, from the config first and
+/// the link second. A named value that does not parse is the caller's to
+/// refuse: going direct past a configured proxy would be a leak, not a
+/// fallback.
+fn foxy_upstream(
+    settings: Option<&Json>,
+    link: &ferrox_core::foxy::link::FoxyLink,
+) -> Result<Option<crate::foxy::UpstreamProxy>, String> {
+    let named = foxy_text(settings, "upstreamProxy");
+    let named = if named.is_empty() {
+        link.upstream_proxy().to_owned()
+    } else {
+        named
+    };
+    if named.is_empty() {
+        return Ok(None);
+    }
+    crate::foxy::upstream_proxy(&named).map(Some).ok_or(named)
+}
+
 fn foxy_carrier(
     settings: Option<&Json>,
     link: &ferrox_core::foxy::link::FoxyLink,
@@ -6839,6 +6907,13 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         }
         let country = foxy_country(&link, settings);
         let city = foxy_text_or(&link, settings, "city").to_ascii_uppercase();
+        let upstream = match foxy_upstream(settings, &link) {
+            Ok(upstream) => upstream,
+            Err(named) => {
+                eprintln!("foxy: upstreamProxy {named:?} is not http:// or socks5(h)://host:port: serves nothing");
+                continue;
+            }
+        };
         // A CA file names the anchors to trust; without one the lane trusts the
         // anchors this machine already trusts, because an empty root store is
         // not "trust the platform" — it is trust nothing, and the account plane
@@ -6851,30 +6926,20 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             .filter(|roots: &Vec<Vec<u8>>| !roots.is_empty())
             .unwrap_or_else(crate::quic::system_roots);
         let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
-        // An edge the config or the link names outright is dialed whatever the
-        // catalogue publishes, because naming one is a decision and guessing is
-        // not; an address is the poison-proof dial and never the TLS name.
-        let named = link.host();
-        let named_address = foxy_text(settings, "edgeAddress");
-        let edge_address = if named_address.is_empty() {
-            None
-        } else {
-            resolve(&named_address, 443)
-        };
-        let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
-            host: named.to_owned(),
-            port: link.port(),
-            country: country.clone(),
-            city: city.clone(),
-        });
-        let configured_edges = foxy_edges(outbound, &country, &city);
-        let candidates = match named_edge {
-            Some(edge) => vec![edge],
-            None if !configured_edges.is_empty() => configured_edges,
-            // Nothing configured names an edge, so the published list does: this
-            // is what lets a link that says only `country=US` reach an exit.
-            None => crate::foxy_catalog::edges(roots.clone()),
-        };
+        let edge_address = foxy_edge_address(settings);
+        let candidates = foxy_candidates(outbound, &link, &country, &city, roots.clone());
+        let carrier = foxy_carrier(settings, &link);
+        // An HTTP hop carries streams, not datagrams, so the QUIC carrier has
+        // nothing to ride it with: the lane is refused here rather than silently
+        // dropping to a carrier the config did not ask for.
+        if upstream
+            .as_ref()
+            .is_some_and(crate::foxy::UpstreamProxy::http)
+            && carrier == crate::foxy::Carrier::H3
+        {
+            eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
+            continue;
+        }
         let account = foxy_account(
             &email,
             &password,
@@ -6904,7 +6969,8 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             limited_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             country,
             city,
-            carrier: foxy_carrier(settings, &link),
+            carrier,
+            upstream,
             roots,
             pins,
             pass,
@@ -11893,7 +11959,10 @@ mod tests {
 
     const QUIC_TEST_POLL: Duration = Duration::from_millis(100);
 
-    fn quic_server_poll(sock: &UdpSocket, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    fn quic_server_poll(
+        sock: &crate::quic::Datagram,
+        buf: &mut [u8],
+    ) -> Option<(usize, SocketAddr)> {
         sock.set_read_timeout(Some(QUIC_TEST_POLL))
             .expect("timeout");
         match sock.recv_from(buf) {
@@ -11910,7 +11979,11 @@ mod tests {
         }
     }
 
-    fn quic_server_idle(conn: &mut quiche::Connection, sock: &UdpSocket, out: &mut [u8]) {
+    fn quic_server_idle(
+        conn: &mut quiche::Connection,
+        sock: &crate::quic::Datagram,
+        out: &mut [u8],
+    ) {
         conn.on_timeout();
         while let Ok((written, info)) = conn.send(out) {
             sock.send_to(&out[..written], info.to).expect("answers");
@@ -11918,7 +11991,7 @@ mod tests {
     }
 
     fn quic_server_accept(
-        sock: &UdpSocket,
+        sock: &crate::quic::Datagram,
         local: SocketAddr,
         config: &mut quiche::Config,
     ) -> (quiche::Connection, Vec<u8>) {
@@ -11967,7 +12040,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)] // A protocol loop: header, accept, then echo.
     fn quic_vless_echo_server(
-        sock: UdpSocket,
+        sock: crate::quic::Datagram,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         expected_header: Vec<u8>,
@@ -12444,7 +12517,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)] // Temporary: timestamp stages for the Linux diagnosis.
     fn quic_concurrent_echo_server(
-        sock: UdpSocket,
+        sock: crate::quic::Datagram,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         expected_header: Vec<u8>,
@@ -12616,7 +12689,8 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let quic_sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let expected_header = vless_header(&id, 1, &target);
         let server = quic_vless_echo_server(
@@ -12794,7 +12868,8 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let quic_sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let server = quic_vless_echo_server(
             quic_sock,
@@ -12809,6 +12884,7 @@ mod tests {
             host: "localhost".to_owned(),
             address: "127.0.0.1".to_owned(),
             port: quic_port,
+            upstream: None,
             roots: Some(roots),
         };
         let relay = thread::spawn(move || {
@@ -12864,7 +12940,8 @@ mod tests {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
-        let quic_sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let quic_sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let server = quic_concurrent_echo_server(
@@ -12878,6 +12955,7 @@ mod tests {
             host: "localhost".to_owned(),
             address: "127.0.0.1".to_owned(),
             port: quic_port,
+            upstream: None,
             roots: Some(roots),
         };
         let front = Arc::new(TcpListener::bind("127.0.0.1:0").expect("binds"));
@@ -13142,7 +13220,7 @@ mod tests {
 
     fn hysteria_test_answer_auth(
         conn: &mut quiche::Connection,
-        sock: &UdpSocket,
+        sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
     ) -> Vec<u8> {
@@ -13177,7 +13255,7 @@ mod tests {
 
     fn hysteria_test_read_prefix(
         conn: &mut quiche::Connection,
-        sock: &UdpSocket,
+        sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
     ) -> Vec<u8> {
@@ -13227,7 +13305,8 @@ mod tests {
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
         std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
         std::fs::write(&key_path, &key_pem).expect("stages key");
-        let sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let port = sock.local_addr().expect("addr").port();
         thread::spawn(move || {
             let mut config = hysteria_test_server_config(&cert_path, &key_path);
@@ -13302,6 +13381,7 @@ mod tests {
         let (port, roots) = hysteria_loop_with("bisect2-auth", id);
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
         getrandom::getrandom(&mut scid).expect("random");
@@ -13627,6 +13707,40 @@ mod tests {
         assert_eq!(origin, origin_form);
         assert!(http_proxy_request(b"GET /p HTTP/1.1\r\n\r\n").is_none());
         assert!(http_proxy_request(b"GARBAGE\r\n\r\n").is_none());
+    }
+
+    /// An HTTP hop carries streams, not datagrams, so the QUIC carrier has
+    /// nothing to ride it with: the lane is refused here rather than silently
+    /// dropping to a carrier the config never asked for.
+    #[test]
+    fn an_http_hop_refuses_the_quic_carrier_before_any_dial() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c","password":"pw","carrier":"h3","upstreamProxy":"http://proxy.local:8080"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    /// The same lane over a SOCKS5 hop starts: the UDP association is how the
+    /// QUIC carrier rides it, so the outbound survives and carries the hop.
+    #[test]
+    fn a_socks5_hop_carries_the_quic_carrier() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c","password":"pw","carrier":"h3","upstreamProxy":"socks5://proxy.local:1080","link":"foxy://edge.example?username=a@b.c"}}]}"#,
+        )
+        .expect("parses");
+        let foxy = find_foxy_outbound(&root).expect("serves");
+        assert_eq!(foxy.carrier, crate::foxy::Carrier::H3);
+        assert!(foxy.upstream.is_some(), "the hop is dialed, not bypassed");
+    }
+
+    #[test]
+    fn a_bad_upstream_proxy_refuses_its_outbound_before_any_dial() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c","password":"pw","country":"US","upstreamProxy":"gopher://proxy.local:70"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_foxy_outbound(&root).is_none());
     }
 
     #[test]

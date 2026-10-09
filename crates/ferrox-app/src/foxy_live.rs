@@ -91,6 +91,7 @@ fn try_carrier(
         port: edge.port,
         address: None,
         carrier,
+        upstream: None,
         roots: crate::quic::system_roots(),
         pins: ferrox_core::foxy::pin::Pins::default(),
         pass: pass.clone(),
@@ -100,6 +101,7 @@ fn try_carrier(
         host: edge.host.clone(),
         address: edge.host.clone(),
         port: edge.port,
+        upstream: None,
         roots: None,
     };
     let started = Instant::now();
@@ -209,6 +211,7 @@ fn the_quic_lane_reaches_the_edge_over_udp_or_says_why_not() {
         host: edge.host.clone(),
         address: edge.host.clone(),
         port: edge.port,
+        upstream: None,
         roots: None,
     };
     // The same authority over TCP, so a failure names the protocol rather than

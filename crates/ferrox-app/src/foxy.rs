@@ -7,10 +7,11 @@
 //! hands the caller a `Read + Write` and the caller does not know which carrier
 //! produced it.
 
-use ferrox_core::foxy::{self, frames, hpack, masque, Failure, Pass};
+use ferrox_core::foxy::{self, authority, frames, hpack, masque, Failure, Pass};
 use ferrox_core::tls::TlsProvider;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -87,9 +88,49 @@ pub(crate) struct FoxyDial {
     /// The address to connect to, when it is not the name's own resolution.
     pub(crate) address: Option<SocketAddr>,
     pub(crate) carrier: Carrier,
+    /// The upstream hop the dial chains through, so a network that only permits
+    /// proxy egress can still start the lane: TCP over CONNECT or a SOCKS5
+    /// stream, and the QUIC carrier over a SOCKS5 UDP association.
+    pub(crate) upstream: Option<UpstreamProxy>,
     pub(crate) roots: Vec<Vec<u8>>,
     pub(crate) pins: foxy::pin::Pins,
     pub(crate) pass: Pass,
+}
+
+/// One hop before the edge: plain HTTP CONNECT or a no-auth SOCKS5 handshake.
+/// Anything else, including credentials the lane has nowhere to put, refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamProxy {
+    http: bool,
+    host: String,
+    port: u16,
+}
+
+impl UpstreamProxy {
+    /// Whether the hop speaks HTTP CONNECT, which is a TCP-only hop: a QUIC
+    /// carrier has nothing to ride it with and must be refused instead.
+    pub(crate) fn http(&self) -> bool {
+        self.http
+    }
+}
+
+pub(crate) fn upstream_proxy(text: &str) -> Option<UpstreamProxy> {
+    let text = text.trim();
+    let (http, rest) = text
+        .strip_prefix("http://")
+        .map(|rest| (true, rest))
+        .or_else(|| text.strip_prefix("socks5://").map(|rest| (false, rest)))
+        .or_else(|| text.strip_prefix("socks5h://").map(|rest| (false, rest)))?;
+    let (host, port) = rest.rsplit_once(':')?;
+    if host.is_empty() || host.contains('/') || host.contains('@') {
+        return None;
+    }
+    let port = port.parse::<u16>().ok()?;
+    Some(UpstreamProxy {
+        http,
+        host: host.to_owned(),
+        port,
+    })
 }
 
 fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
@@ -113,10 +154,130 @@ fn peer(dial: &FoxyDial) -> Result<SocketAddr, Failure> {
 }
 
 fn tcp(dial: &FoxyDial) -> Result<TcpStream, Failure> {
+    if let Some(proxy) = dial.upstream.as_ref() {
+        return tcp_via(proxy, dial);
+    }
     let stream =
         TcpStream::connect_timeout(&peer(dial)?, CONNECT_TIMEOUT).map_err(|_| Failure::Io)?;
     let _ = stream.set_nodelay(true);
     Ok(stream)
+}
+
+/// TCP to the edge through one upstream hop: the TLS name stays the edge's,
+/// so the hop carries bytes it can neither read nor address.
+fn tcp_via(proxy: &UpstreamProxy, dial: &FoxyDial) -> Result<TcpStream, Failure> {
+    let mut stream = tcp_to_proxy(proxy).ok_or(Failure::Io)?;
+    let edge = authority(&dial.host, dial.port);
+    if proxy.http {
+        let request = format!("CONNECT {edge} HTTP/1.1\r\nHost: {edge}\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|_| Failure::Io)?;
+        // The whole head, not just the status line: the blank line's bytes
+        // belong to the proxy, and anything left in the stream becomes the
+        // first bytes of the TLS handshake that follows.
+        let mut head = Vec::with_capacity(64);
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            read_exact(&mut stream, &mut byte).map_err(|_| Failure::Io)?;
+            head.push(byte[0]);
+            if head.len() > 4096 {
+                return Err(Failure::Io);
+            }
+        }
+        let code = head
+            .split(|b| *b == b'\n')
+            .next()
+            .and_then(|line| line.split(|b| *b == b' ').nth(1))
+            .and_then(|code| std::str::from_utf8(code).ok())
+            .and_then(|code| code.trim().parse::<u16>().ok())
+            .ok_or(Failure::Io)?;
+        opened(code)?;
+    } else {
+        socks_greeting(&mut stream)?;
+        let host_len = u8::try_from(dial.host.len()).map_err(|_| Failure::Io)?;
+        let mut request = vec![5, 1, 0, 3, host_len];
+        request.extend_from_slice(dial.host.as_bytes());
+        request.extend_from_slice(&dial.port.to_be_bytes());
+        stream.write_all(&request).map_err(|_| Failure::Io)?;
+        // The address the hop bound is not the edge's, so it is read past and
+        // dropped: the connection itself is the answer.
+        if socks_reply(&mut stream)?.is_none() {
+            return Err(Failure::Io);
+        }
+    }
+    Ok(stream)
+}
+
+/// One UDP association with a SOCKS5 hop: the greeting this tree already speaks,
+/// a request that names no destination yet, and the relay address the hop
+/// answers with. The control connection is the caller's to hold — dropping it
+/// is how the association ends — and a hop that refuses answers the way it
+/// refuses a CONNECT, with a status that is not zero.
+pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<TcpStream>, SocketAddr)> {
+    let mut control = tcp_to_proxy(proxy)?;
+    if socks_greeting(&mut control).is_err() {
+        return None;
+    }
+    if control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
+        return None;
+    }
+    let Ok(Some(relay)) = socks_reply(&mut control) else {
+        return None;
+    };
+    Some((Arc::new(control), relay))
+}
+
+/// The one hop this tree speaks to, dialed and kept alive: a proxy that does
+/// not answer at all is a failed dial, not a lane running direct.
+fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<TcpStream> {
+    let proxy_addr = format!("{}:{}", proxy.host, proxy.port)
+        .to_socket_addrs()
+        .ok()?
+        .next()?;
+    let stream = TcpStream::connect_timeout(&proxy_addr, CONNECT_TIMEOUT).ok()?;
+    let _ = stream.set_nodelay(true);
+    Some(stream)
+}
+
+/// No authentication offered, no authentication accepted: a hop that selects
+/// anything else is one this lane cannot use.
+fn socks_greeting(stream: &mut TcpStream) -> Result<(), Failure> {
+    stream.write_all(&[5, 1, 0]).map_err(|_| Failure::Io)?;
+    let mut method = [0u8; 2];
+    read_exact(stream, &mut method).map_err(|_| Failure::Io)?;
+    if method != [5, 0] {
+        return Err(Failure::Io);
+    }
+    Ok(())
+}
+
+/// Whether the hop granted the request, and the address it bound the far side
+/// to: a refusal answers the same reply with a non-zero status, and a hop that
+/// answers in a name is one this tree cannot address back.
+fn socks_reply(stream: &mut TcpStream) -> Result<Option<SocketAddr>, Failure> {
+    let mut head = [0u8; 4];
+    read_exact(stream, &mut head).map_err(|_| Failure::Io)?;
+    if head[1] != 0 {
+        return Ok(None);
+    }
+    let mut read = |into: &mut [u8]| read_exact(stream, into).map_err(|_| Failure::Io);
+    let ip = match head[3] {
+        1 => {
+            let mut octets = [0u8; 4];
+            read(&mut octets)?;
+            std::net::Ipv4Addr::from(octets).into()
+        }
+        4 => {
+            let mut octets = [0u8; 16];
+            read(&mut octets)?;
+            std::net::Ipv6Addr::from(octets).into()
+        }
+        _ => return Err(Failure::Io),
+    };
+    let mut port = [0u8; 2];
+    read(&mut port)?;
+    Ok(Some(SocketAddr::new(ip, u16::from_be_bytes(port))))
 }
 
 /// A handshake that answered a different ALPN is a refusal, not a downgrade: the
@@ -630,14 +791,14 @@ impl Read for Tls1 {
 /// bidirectional stream id this flow opened.
 pub(crate) type Quic = (
     std::sync::Arc<std::sync::Mutex<quiche::Connection>>,
-    std::sync::Arc<UdpSocket>,
+    std::sync::Arc<crate::quic::Datagram>,
     SocketAddr,
     u64,
 );
 
 pub(crate) struct H3 {
     shared: std::sync::Arc<std::sync::Mutex<quiche::Connection>>,
-    sock: std::sync::Arc<UdpSocket>,
+    sock: std::sync::Arc<crate::quic::Datagram>,
     local: SocketAddr,
     stream: u64,
     /// The request's HEADERS frame and whatever followed it on the same stream,
@@ -1039,6 +1200,7 @@ mod tests {
             port: 443,
             address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
             carrier,
+            upstream: None,
             roots: Vec::new(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
@@ -1132,6 +1294,29 @@ mod tests {
     }
 
     #[test]
+    fn an_upstream_proxy_names_its_scheme_host_and_port() {
+        let http = upstream_proxy("http://proxy.local:8080").expect("parses");
+        assert!(http.http);
+        assert_eq!((http.host, http.port), ("proxy.local".to_owned(), 8080));
+        let socks = upstream_proxy("socks5://proxy.local:1080").expect("parses");
+        assert!(!socks.http);
+        assert_eq!((socks.host, socks.port), ("proxy.local".to_owned(), 1080));
+        let h = upstream_proxy("socks5h://proxy.local:1080").expect("parses");
+        assert!(!h.http);
+        for bad in [
+            "",
+            "proxy.local:8080",
+            "gopher://proxy.local:70",
+            "http://proxy.local",
+            "http://proxy.local:99999",
+            "http://proxy.local:80/extra",
+            "http://user:pass@proxy.local:8080",
+        ] {
+            assert!(upstream_proxy(bad).is_none(), "{bad:?} refuses");
+        }
+    }
+
+    #[test]
     fn an_exit_probe_is_read_in_either_shape_it_can_answer_in() {
         assert_eq!(exit_country(b"fl=1\nloc=DE\n"), Some("DE".to_owned()));
         assert_eq!(
@@ -1179,6 +1364,7 @@ mod loopback {
             port,
             address: Some(SocketAddr::from(([127, 0, 0, 1], port))),
             carrier,
+            upstream: None,
             roots,
             pins,
             pass: Pass {
@@ -1196,6 +1382,346 @@ mod loopback {
         let mut back = vec![0u8; PAYLOAD.len()];
         tunnel.read_exact(&mut back).expect("reads");
         assert_eq!(back, PAYLOAD);
+    }
+
+    /// A dial whose hop is the only way to the edge: the name the CONNECT
+    /// carries is not the name anything resolves, so a dial that reaches the
+    /// edge has gone through the hop.
+    fn upstream_dial(proxy: UpstreamProxy, edge: Option<SocketAddr>) -> FoxyDial {
+        FoxyDial {
+            host: "edge.test".to_owned(),
+            port: 2499,
+            address: edge,
+            carrier: Carrier::H1,
+            upstream: Some(proxy),
+            roots: Vec::new(),
+            pins: foxy::pin::Pins::default(),
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        }
+    }
+
+    fn read_head(stream: &mut dyn std::io::Read) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("reads a head");
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("ascii")
+    }
+
+    #[test]
+    fn tcp_through_an_http_upstream_sends_connect_and_carries_bytes() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = proxy.local_addr().expect("addr").port();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let head = read_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let mut buf = [0u8; 64];
+            let read = stream.read(&mut buf).expect("reads");
+            stream.write_all(&buf[..read]).expect("echoes");
+            head
+        });
+        let proxy = upstream_proxy(&format!("http://127.0.0.1:{port}")).expect("parses");
+        let mut stream = tcp(&upstream_dial(proxy, None)).expect("chains");
+        stream.write_all(PAYLOAD).expect("writes");
+        let mut back = vec![0u8; PAYLOAD.len()];
+        stream.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, PAYLOAD);
+        assert_eq!(
+            seen.join().expect("joins"),
+            "CONNECT edge.test:2499 HTTP/1.1\r\nHost: edge.test:2499\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn tcp_through_a_socks5_upstream_shakes_hands_and_carries_bytes() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = proxy.local_addr().expect("addr").port();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut greet = [0u8; 3];
+            read_exact(&mut stream, &mut greet).expect("greets");
+            stream.write_all(&[5, 0]).expect("selects");
+            let mut request = vec![0u8; 16];
+            read_exact(&mut stream, &mut request).expect("connects");
+            let mut want = vec![5, 1, 0, 3, 9];
+            want.extend_from_slice(b"edge.test");
+            want.extend_from_slice(&2499u16.to_be_bytes());
+            assert_eq!(request, want);
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("grants");
+            let mut buf = [0u8; 64];
+            let read = stream.read(&mut buf).expect("reads");
+            stream.write_all(&buf[..read]).expect("echoes");
+            greet.to_vec()
+        });
+        let proxy = upstream_proxy(&format!("socks5://127.0.0.1:{port}")).expect("parses");
+        let mut stream = tcp(&upstream_dial(proxy, None)).expect("chains");
+        stream.write_all(PAYLOAD).expect("writes");
+        let mut back = vec![0u8; PAYLOAD.len()];
+        stream.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, PAYLOAD);
+        assert_eq!(seen.join().expect("joins"), vec![5, 1, 0]);
+    }
+
+    /// A hop that refuses is a failed dial and not a fallback: the edge is
+    /// never dialed around a proxy the config named, because a lane that
+    /// bypasses its configured hop is a leak.
+    #[test]
+    fn a_refused_upstream_is_a_failed_dial_and_not_a_direct_one() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = proxy.local_addr().expect("addr").port();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let edge_port = listener.local_addr().expect("addr").port();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+                let _ = dialed_tx.send(());
+            }
+        });
+        std::thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut greet = [0u8; 3];
+            read_exact(&mut stream, &mut greet).expect("greets");
+            stream.write_all(&[5, 0]).expect("selects");
+            let mut request = vec![0u8; 15];
+            read_exact(&mut stream, &mut request).expect("connects");
+            // A general failure, which is how a hop says it will not connect.
+            stream
+                .write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("refuses");
+        });
+        let proxy = upstream_proxy(&format!("socks5://127.0.0.1:{port}")).expect("parses");
+        let edge = Some(SocketAddr::from(([127, 0, 0, 1], edge_port)));
+        assert!(
+            tcp(&upstream_dial(proxy, edge)).is_err(),
+            "a refused hop is a failed dial"
+        );
+        assert!(
+            dialed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the edge on port {edge_port} was dialed around the hop"
+        );
+    }
+
+    #[test]
+    fn h1_through_an_http_upstream_reaches_its_edge() {
+        let (roots, server) = minted(b"http/1.1");
+        let edge = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let edge_port = edge.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (stream, _) = edge.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(&server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let request = read_head(&mut tls);
+            assert_eq!(
+                request,
+                "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer the-pass\r\n\r\n"
+            );
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let mut buf = [0u8; 64];
+            let read = tls.read(&mut buf).expect("reads");
+            assert_eq!(&buf[..read], PAYLOAD);
+            tls.write_all(&buf[..read]).expect("echoes");
+        });
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy_port = proxy.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut downstream, _) = proxy.accept().expect("accepts");
+            downstream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let head = read_head(&mut downstream);
+            assert_eq!(
+                head,
+                format!(
+                    "CONNECT localhost:{edge_port} HTTP/1.1\r\nHost: localhost:{edge_port}\r\n\r\n"
+                )
+            );
+            downstream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let edge = TcpStream::connect(("127.0.0.1", edge_port)).expect("dials");
+            let (mut up_read, mut up_write) = (edge.try_clone().expect("clones"), edge);
+            let mut down = downstream.try_clone().expect("clones");
+            let pipe = std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                while let Ok(read) = down.read(&mut buf) {
+                    if read == 0 || up_write.write_all(&buf[..read]).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut buf = [0u8; 8192];
+            while let Ok(read) = up_read.read(&mut buf) {
+                if read == 0 || downstream.write_all(&buf[..read]).is_err() {
+                    break;
+                }
+            }
+            pipe.join().expect("joins");
+        });
+        let mut dial = dial_for(roots, edge_port, Carrier::H1, foxy::pin::Pins::default());
+        dial.upstream = upstream_proxy(&format!("http://127.0.0.1:{proxy_port}"));
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        round_trip(&mut tunnel);
+    }
+
+    /// A SOCKS5 hop for the QUIC carrier: a TCP side that answers `UDP
+    /// ASSOCIATE` with the address of its own relay socket, and a relay socket
+    /// that carries datagrams between the lane and the edge with the header the
+    /// association frames them in. Both halves write that header themselves, so
+    /// the framing is witnessed by something other than the code it checks.
+    fn socks_relay(edge_port: u16) -> UpstreamProxy {
+        let control = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy_port = control.local_addr().expect("addr").port();
+        let relay = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = control.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("times out");
+            let mut greet = [0u8; 3];
+            read_exact(&mut stream, &mut greet).expect("greets");
+            assert_eq!(greet, [5, 1, 0], "no authentication offered");
+            stream.write_all(&[5, 0]).expect("selects");
+            let mut ask = [0u8; 10];
+            read_exact(&mut stream, &mut ask).expect("associates");
+            assert_eq!(&ask[..4], [5, 3, 0, 1], "a UDP association, naming nothing");
+            let octets = match relay_addr.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            let mut grant = vec![5, 0, 0, 1];
+            grant.extend_from_slice(&octets);
+            grant.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&grant).expect("grants");
+            // The association lives as long as the control connection does, so
+            // this thread holds it until the lane is done with the hop.
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink);
+        });
+        std::thread::spawn(move || {
+            relay
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("times out");
+            let mut lane: Option<SocketAddr> = None;
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = relay.recv_from(&mut buf) {
+                match lane {
+                    // The lane's first datagram is the one that says so: the
+                    // association names no destination, so nothing arrives from
+                    // the edge until the lane has spoken.
+                    None => lane = Some(from),
+                    Some(lane) if lane == from => {
+                        if n < 10 || buf[2] != 0 || buf[3] != 1 {
+                            continue;
+                        }
+                        let ip = [buf[4], buf[5], buf[6], buf[7]];
+                        let port = u16::from_be_bytes([buf[8], buf[9]]);
+                        let _ = relay.send_to(&buf[10..n], SocketAddr::from((ip, port)));
+                    }
+                    Some(lane) => {
+                        // The edge's answer, framed for the lane the way the
+                        // lane's own header framed the request.
+                        let mut framed = vec![0, 0, 0, 1, 127, 0, 0, 1];
+                        framed.extend_from_slice(&edge_port.to_be_bytes());
+                        framed.extend_from_slice(&buf[..n]);
+                        let _ = relay.send_to(&framed, lane);
+                    }
+                }
+            }
+        });
+        upstream_proxy(&format!("socks5://127.0.0.1:{proxy_port}")).expect("parses")
+    }
+
+    #[test]
+    fn the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let edge_port = sock.local_addr().expect("addr").port();
+        let cert = crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE");
+        let key = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (uni_tx, uni_rx) = std::sync::mpsc::channel();
+        let edge = h3_edge(sock, cert, key, seen_tx, uni_tx);
+        let proxy = socks_relay(edge_port);
+        let (client, peer, local) = crate::quic::udp_to_server("127.0.0.1", edge_port)
+            .expect("a socket the edge can be addressed from");
+        let (relay_control, relay) = associate_udp(&proxy).expect("associates");
+        let quic = crate::quic::direct_stream_on(
+            crate::quic::Datagram::relayed(client, relay, relay_control),
+            peer,
+            local,
+            "localhost",
+            &roots,
+        )
+        .expect("a connection through the hop");
+        let mut dial = dial_for(roots, edge_port, Carrier::H3, foxy::pin::Pins::default());
+        dial.upstream = Some(proxy);
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        let block = seen_rx
+            // The edge's own budget is a minute, so a lane that needs longer
+            // than that is a hang and not a slow machine.
+            .recv_timeout(Duration::from_secs(60))
+            .expect("block");
+        let mut want = Vec::new();
+        hpack::qpack_connect("example.com:443", "the-pass", &mut want);
+        assert_eq!(block, want, "the edge read the block the lane wrote");
+        // The opening arrived as well as the request: a relay that dropped the
+        // control stream would still carry the request stream, because both
+        // travel the same datagrams.
+        let uni = uni_rx.recv_timeout(Duration::from_secs(60)).expect("uni");
+        let stream = |id| {
+            uni.iter()
+                .find(|(known, _, _)| *known == id)
+                .unwrap_or_else(|| panic!("stream {id} opened"))
+        };
+        let (_, control, control_fin) = stream(2);
+        let mut at = 0usize;
+        assert_eq!(control.first(), Some(&0x00), "a control stream type");
+        at += 1;
+        assert_eq!(control.get(at), Some(&0x04), "one SETTINGS frame");
+        at += 1;
+        let len = frames::quic_read(control, &mut at).expect("a length") as usize;
+        assert_eq!(
+            control.len(),
+            at + len,
+            "a complete SETTINGS, no truncation"
+        );
+        assert!(!control_fin, "control stays open");
+        for (id, first) in [(6u64, 0x02u8), (10, 0x03)] {
+            let (_, bytes, fin) = stream(id);
+            assert_eq!(bytes.as_slice(), &[first], "qpack stream {id}");
+            assert!(!fin, "qpack stream {id} stays open");
+        }
+        round_trip(&mut tunnel);
+        edge.join().expect("joins");
     }
 
     #[test]
@@ -1601,7 +2127,7 @@ mod loopback {
     /// through the QPACK decoder, and the bytes that follow the head travel
     /// through the tunnel. A codec test cannot answer any of those three.
     fn h3_edge(
-        sock: UdpSocket,
+        sock: crate::quic::Datagram,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         seen: std::sync::mpsc::Sender<Vec<u8>>,
@@ -1701,7 +2227,7 @@ mod loopback {
     /// Echoes one request stream's DATA payloads until the lane's whole
     /// payload has come back: the tunnel half of the loopback proof.
     fn echo_stream(
-        sock: &UdpSocket,
+        sock: &crate::quic::Datagram,
         local: SocketAddr,
         conn: &mut quiche::Connection,
         buf: &mut [u8; 1350],
@@ -1778,7 +2304,8 @@ mod loopback {
     #[test]
     fn the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes() {
         let (roots, server) = minted(b"h3");
-        let sock = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let port = sock.local_addr().expect("addr").port();
         let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();

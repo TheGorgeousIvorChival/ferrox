@@ -997,7 +997,7 @@ One H2 connection per flow is correct — the relay proves it carries megabytes 
 ## P49 · Chain the edge dial through an upstream proxy
 
 **When to use:** When the lane must start behind a corporate or captive proxy: the reference FoxyVPN chains its edge dial through a configured SOCKS5 or HTTP proxy (and dials TCP to an overridden address while verifying the edge name), while this tree dials the edge directly and has no such key — so a network that only permits proxy egress cannot start the lane at all.
-**Status:** todo
+**Status:** done
 **Leverage:** 3
 **Effort:** medium
 **Gates:** `cargo test --workspace`; a loopback test dialling the lane through a local upstream proxy
