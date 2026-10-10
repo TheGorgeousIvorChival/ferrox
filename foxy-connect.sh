@@ -291,7 +291,13 @@ done
 mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
 
 if [ "$ACTION" = countries ]; then list_countries; exit 0; fi
-if [ "$ACTION" = down ]; then CLEAR_VPN=1; stop_lane; echo "lane stopped."; exit 0; fi
+if [ "$ACTION" = down ]; then
+  CLEAR_VPN=1; stop_lane
+  # The lane configs carry the account password, so they go when the lane does.
+  rm -f "$CONF_DIR"/foxy-*.json
+  echo "lane stopped; configs under $CONF_DIR removed."
+  exit 0
+fi
 
 # Everything after this point needs a lane, so the binary and the pass first.
 if [ "${FORCE_BUILD:-0}" = 1 ] || [ ! -x "$BIN" ]; then
