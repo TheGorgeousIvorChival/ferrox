@@ -1413,11 +1413,19 @@ fn accept_tls_session(
         echo_trace("tls-server accept refused");
         return None;
     };
-    if session.handshake().is_err() {
-        echo_trace("tls-server handshake refused");
-        return None;
+    // One quantum of silence is scheduling, not death: an idle handshake is
+    // retried until the deadline, anything else refuses at once.
+    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    loop {
+        match session.handshake() {
+            Ok(()) => return Some(session),
+            Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {}
+            Err(_) => {
+                echo_trace("tls-server handshake refused");
+                return None;
+            }
+        }
     }
-    Some(session)
 }
 
 fn serve_vless_tls(
@@ -9373,6 +9381,36 @@ mod tests {
                 ))
             },
         );
+    }
+
+    /// A peer quiet past one quantum still handshakes: the accept retries an
+    /// idle handshake until the deadline, so scheduling is not a refusal.
+    #[test]
+    fn a_peer_quiet_past_one_quantum_still_handshakes() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream.set_read_timeout(Some(RELAY_POLL)).expect("timeout");
+            let Some(mut tls) = accept_tls_session(stream, &server_config) else {
+                panic!("handshakes past the pause");
+            };
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            tls.write_all(&buf).expect("echoes");
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        thread::sleep(RELAY_POLL * 5);
+        let mut tls = ferrox_core::tls::connect(&client_config, stream).expect("configures");
+        tls.handshake().expect("handshakes");
+        tls.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        tls.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping");
+        server.join().expect("joins");
     }
 
     fn vnext_tls_root(protocol: &str, stream: &str) -> crate::json::Json {
