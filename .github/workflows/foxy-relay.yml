@@ -101,6 +101,31 @@ jobs:
           "$BIN" mint-foxy-pass -c foxy-mint.json -o foxy-pass.json
           chmod 600 foxy-pass.json
           rm -f foxy-mint.json
+      # What the runner itself can move, with no lane anywhere in the path:
+      # the leg below cannot tell a refused tunnel from a runner that cannot
+      # carry a megabyte, and the macos leg has been red for both reasons
+      # across this workflow's history. This control names which one it is.
+      - name: Egress control - 1 MB with no lane
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          code=0
+          curl -sS --noproxy '*' --max-time 300 \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin || code=$?
+          got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
+          echo "egress control: curl exit $code, ${got:-0} bytes of 1000000"
+          {
+            echo "### Egress control, no lane (${{ matrix.os }})"
+            echo
+            echo "curl exit $code, ${got:-0} bytes of 1000000, straight from the"
+            echo "runner with no tunnel in the path. A short read here is the"
+            echo "runner's egress, not the lane: the lane legs below are read"
+            echo "against this number."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if test "$code" = 0 && test "${got:-0}" = 1000000; then
+            echo "egress control carried the whole megabyte"
+          else
+            echo "::warning::this runner cannot itself download 1 MB (curl exit $code, ${got:-0} bytes)"
+          fi
       - name: Download 1 MB through every carrier
         if: steps.secrets.outputs.present == 'true'
         env:
