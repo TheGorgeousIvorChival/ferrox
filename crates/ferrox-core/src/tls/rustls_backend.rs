@@ -162,27 +162,22 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
 
 impl<S: Stream> Read for RustlsProvider<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // One pump and one re-check, then idle: the caller polls, so a dry socket returns instead of spinning behind the shared session lock.
-        self.drive()?;
-        let dry = match self.conn.reader().read(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => e,
-            outcome => return outcome,
-        };
-        match self.conn.complete_io(&mut self.io) {
-            Err(io_error)
-                if matches!(
-                    io_error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Err(io_error);
+        loop {
+            self.drive()?;
+            match self.conn.reader().read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Err(io_error) = self.conn.complete_io(&mut self.io) {
+                        if matches!(
+                            io_error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) {
+                            return Err(io_error);
+                        }
+                        return Err(recover(io_error).into());
+                    }
+                }
+                outcome => return outcome,
             }
-            Err(io_error) => return Err(recover(io_error).into()),
-            Ok(_) => {}
-        }
-        match self.conn.reader().read(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(dry),
-            outcome => outcome,
         }
     }
 }
@@ -297,27 +292,22 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 
 impl<S: Stream> Read for RustlsServerProvider<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // One pump and one re-check, then idle: the caller polls, so a dry socket returns instead of spinning behind the shared session lock.
-        self.drive()?;
-        let dry = match self.conn.reader().read(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => e,
-            outcome => return outcome,
-        };
-        match self.conn.complete_io(&mut self.io) {
-            Err(io_error)
-                if matches!(
-                    io_error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Err(io_error);
+        loop {
+            self.drive()?;
+            match self.conn.reader().read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Err(io_error) = self.conn.complete_io(&mut self.io) {
+                        if matches!(
+                            io_error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) {
+                            return Err(io_error);
+                        }
+                        return Err(recover(io_error).into());
+                    }
+                }
+                outcome => return outcome,
             }
-            Err(io_error) => return Err(recover(io_error).into()),
-            Ok(_) => {}
-        }
-        match self.conn.reader().read(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(dry),
-            outcome => outcome,
         }
     }
 }

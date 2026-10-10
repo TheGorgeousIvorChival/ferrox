@@ -1022,7 +1022,7 @@ Read the edge hostname, port and pass exactly as today; only the transport chang
 The reference multiplexes, and this tree pools QUIC, so pooling HTTP/2 looked like the same job. The edge this tree dials answered the first CONNECT on one connection and closed the stream on the second, so the premise is unproven and the pool was reverted rather than landed: a lane that works by dialling per flow is worth more than a pool the edge refuses. Before pooling, ask the edge: a live leg that opens two streams on one connection, or a loopback edge that mirrors what the real one did with the second one, and only pool when the answer is that it takes them both. The stop where it was reverted is the pre-slice state: `open_h2_with` dials, handshakes, writes the preface and one HEADERS frame per flow.
 ```
 
-## P51 · Bound the server handshake drive the way the read path is bounded
+## P51 · Bound the server handshake drive that spins on an idle peer
 
 **When to use:** When a `RustlsServerProvider::drive` can spin: it `continue`s on `TimedOut`/`WouldBlock`, so a peer that connects and sends nothing burns a thread at 100% CPU with no deadline, while the client drive returns the same error to its caller.
 **Status:** todo
@@ -1033,5 +1033,5 @@ The reference multiplexes, and this tree pools QUIC, so pooling HTTP/2 looked li
 **Random weight:** 1
 
 ```text
-The read path was fixed first: it pumped until progress and held the shared session lock across the spin, starving every writer sharing the session, which is what the `ws_tls` conformance row measured as a 15 s echo timeout. The handshake drive has the same shape one layer down — `continue` on an idle socket with no deadline — and only peer-close bounds it today. Give it the same bound the read took: return the idle error to the caller, whose poll grain already exists, and prove it with a peer that connects and then does nothing.
+The server handshake drive `continue`s on `TimedOut`/`WouldBlock`, so a peer that connects and sends nothing burns a thread with no deadline — only peer-close bounds it today — while the client drive returns the same error to its caller. (A bound in the same shape was tried on the session read path and reverted: blocking callers like `read_exact` need the pump-until-progress loop, so the bound belongs here, not there.) Return the idle error to the caller, whose poll grain already exists, and prove it with a peer that connects and then does nothing.
 ```

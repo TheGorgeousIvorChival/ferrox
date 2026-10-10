@@ -74,15 +74,7 @@ handshake duration is quoted from a machine without a named runner.
   (`:284-306`). One provider that *is* the stream means Vision never needs to
   reach into anything, which is why
   [the Vision page](xtls-vision.md) can end the framing by handing the socket
-  over instead of by copying bytes out of someone else's buffer.
-- **A session read that pumped until progress behind a shared lock.** Both
-  `Read` impls looped `reader → WouldBlock → complete_io → retry`, so an idle
-  socket spun inside one `read` call with the session mutex held and starved
-  every writer sharing the session; the `ws_tls` conformance row measured it as
-  a 15 s echo timeout with the pong already read. Now one pump and one
-  re-check, then idle back to the caller, whose poll grain already exists —
-  same bytes, bounded hold. The handshake drive has the same shape and keeps
-  it: that is P51, not this bullet.
+   over instead of by copying bytes out of someone else's buffer.
 - **Reflection and `unsafe` in the handshake.** The gates are
   `an_authenticated_hello_is_accepted`, `every_unauthenticated_hello_is_refused`
   and `the_certificate_differs_per_auth_key`.
