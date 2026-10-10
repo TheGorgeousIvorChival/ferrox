@@ -174,9 +174,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
         let _ = stream.set_nodelay(true);
         match finish_tls(dial, stream) {
             Ok(tls) => return Ok(tls),
-            Err(failure) => {
-                debug_address(peer, &failure.to_string());
-            }
+            Err(failure) => debug_address(peer, &failure.to_string()),
         }
     }
     if tried > 1 {
@@ -189,6 +187,15 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
 /// stderr unconditionally when more than one address was tried: a red leg is
 /// only actionable when it names the address it lost on and why, because the
 /// same loss on a different family is a different bug.
+/// One loss in the lane's edge dial, with the platform's own error beside it:
+/// a refusal and a hang are different bugs with the same message, and the error
+/// kind is the whole of what tells them apart.
+fn debug_loss(stage: &str, error: &dyn std::fmt::Display) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: {stage}: {error}");
+    }
+}
+
 fn debug_address(peer: SocketAddr, why: &str) {
     if std::env::var("FOXY_DEBUG").is_ok() {
         eprintln!("foxy-debug: address {peer} lost: {why}");
@@ -202,12 +209,17 @@ fn finish_tls(
     dial: &FoxyDial,
     stream: TcpStream,
 ) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
-    let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
-    tls.handshake()
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
+    let mut tls = match ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream) {
+        Ok(tls) => tls,
+        Err(error) => {
+            debug_loss("the TLS client failed to start", &error.to_string());
+            return Err(Failure::Io);
+        }
+    };
+    if let Err(error) = tls.handshake() {
+        debug_loss("the TLS handshake with the edge failed", &error.to_string());
+        return Err(Failure::Io);
+    }
     negotiated(&tls, dial)
         .inspect_err(|_| debug_stage("the edge named no protocol this lane speaks"))
         .map(|()| tls)
