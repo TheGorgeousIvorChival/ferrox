@@ -569,7 +569,7 @@ Put the measured number in `scripts/expected-ops.txt` only after reading the dif
 ## P26 · Refuse a conformance run where no suite ran at all
 
 **When to use:** When `conformance.yml` is green and the log says no upstream suite reached a Ferrox binary. `run-upstream-suite.sh` now refuses a per-suite `PASS` that ran zero tests or a different number than its pin names, and then prints its tally and exits 0 whatever that tally says — so a `pins.toml` edit that disables every pin leaves a green job whose entire upstream-conformance content is a line of skips.
-**Status:** todo
+**Status:** doing
 **Leverage:** 4
 **Effort:** small
 **Gates:** `./scripts/check-upstream-pins.sh`; CI: `pins.yml` green, and `conformance.yml` refusing a tally of zero

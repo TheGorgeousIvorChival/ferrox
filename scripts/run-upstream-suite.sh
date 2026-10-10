@@ -51,6 +51,27 @@ for shape in exact:accept prefix:refuse empty:refuse other:accept; do
 done
 rm -rf "$selftest"
 
+tally_floor() {
+  local ran="$1" filtered="$2"
+  if [[ -z "$filtered" && "$ran" -eq 0 ]]; then
+    echo "::error::upstream suites: none ran green against a Ferrox binary, so a green job would prove nothing"
+    return 1
+  fi
+}
+
+for shape in zero-full:refuse some-full:accept zero-filtered:accept; do
+  verdict=0
+  case "${shape%%:*}" in
+    zero-full) tally_floor 0 "" >/dev/null || verdict=$? ;;
+    some-full) tally_floor 2 "" >/dev/null || verdict=$? ;;
+    zero-filtered) tally_floor 0 "one-pin" >/dev/null || verdict=$? ;;
+  esac
+  if [[ "$verdict" -eq 0 && "${shape##*:}" == refuse ]] || [[ "$verdict" -ne 0 && "${shape##*:}" == accept ]]; then
+    echo "::error::self-test: tally ${shape%%:*} is answered $verdict; it must be ${shape##*:}"
+    status=1
+  fi
+done
+
 parse_pins() {
   awk '
     function f(v) { return v == "" ? "-" : v }
@@ -159,4 +180,7 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path; do
 done < <(parse_pins)
 
 echo "upstream suites: $ran ran green against Ferrox binaries (the rest skipped with reasons above)"
+if ! tally_floor "$ran" "$name_filter"; then
+  status=1
+fi
 exit "$status"
