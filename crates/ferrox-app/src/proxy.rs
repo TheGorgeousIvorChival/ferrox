@@ -6192,7 +6192,13 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                     if echo_trace_on() && first {
                         echo_trace("relay fwd first read");
                     }
+                    if echo_trace_on() && first {
+                        echo_trace("relay fwd sending");
+                    }
                     let sent = uplink.send(&buf[..n]);
+                    if echo_trace_on() && first {
+                        echo_trace("relay fwd sent");
+                    }
                     if echo_trace_on() && first {
                         echo_trace(if sent {
                             "relay fwd first send ok"
@@ -6235,13 +6241,19 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
             Ok(n) if n > 0 => {
                 if echo_trace_on() && first {
                     echo_trace("relay bwd first read");
-                    first = false;
+                }
+                if echo_trace_on() && first {
+                    echo_trace("relay bwd forwarding");
                 }
                 if peer_write.write_all(&buf[..n]).is_err() {
                     if echo_trace_on() {
                         echo_trace("relay bwd peer write failed");
                     }
                     break;
+                }
+                if echo_trace_on() && first {
+                    echo_trace("relay bwd forwarded");
+                    first = false;
                 }
             }
             Err(error) if is_timeout(&error) => {}
