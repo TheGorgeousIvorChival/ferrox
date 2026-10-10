@@ -4735,7 +4735,75 @@ fn serve_socks_udp(mut client: TcpStream, out: &Outbound) {
         Outbound::Foxy(foxy) => {
             serve_socks_udp_foxy(&relay, foxy);
         }
+        Outbound::Freedom => serve_socks_udp_freedom(&relay),
         _ => {}
+    }
+}
+
+/// UDP straight out of the machine's own socket, one socket per destination:
+/// a freedom outbound is the hop a captive network offers, and a datagram
+/// that reaches it has to leave by the plain dial rather than by a carrier it
+/// was never given.
+fn serve_socks_udp_freedom(relay: &UdpSocket) {
+    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let mut uplinks: HashMap<SocketAddr, (UdpSocket, thread::JoinHandle<()>)> = HashMap::new();
+    let mut buf = vec![0u8; UDP_BUF];
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if let Ok(mut slot) = source.lock() {
+            *slot = Some(src);
+        }
+        if uplinks.contains_key(&dest) {
+            let _ = uplinks[&dest].0.send(payload);
+            continue;
+        }
+        let Ok(up) = UdpSocket::bind(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            0,
+        )) else {
+            continue;
+        };
+        let Ok(()) = up.connect(dest) else {
+            continue;
+        };
+        let Ok(writer) = up.try_clone() else {
+            continue;
+        };
+        let peer = source.clone();
+        let Ok(relay_write) = relay.try_clone() else {
+            continue;
+        };
+        let _ = up.set_read_timeout(Some(UDP_IDLE));
+        let done = thread::spawn(move || {
+            let mut back = vec![0u8; UDP_BUF];
+            let writer = up;
+            while let Ok(read) = writer.recv(&mut back) {
+                let Some(source) = peer.lock().ok().and_then(|slot| *slot) else {
+                    continue;
+                };
+                let mut framed = Vec::with_capacity(HEAD + read);
+                framed.extend_from_slice(&[0, 0, 0]);
+                push_socks_addr(&mut framed, &dest);
+                framed.extend_from_slice(&back[..read]);
+                if relay_write.send_to(&framed, source).is_err() {
+                    break;
+                }
+            }
+        });
+        uplinks.insert(dest, (writer, done));
+        // The datagram that opened the destination is the first payload: a hop
+        // that drops it loses the client's first packet.
+        let _ = uplinks[&dest].0.send(payload);
+    }
+    for (_, (_, handle)) in uplinks {
+        // The datagrams this relay was forwarding are on their own sockets, so
+        // ending here is the idle timeout the sockets already carry.
+        let _ = handle.join();
     }
 }
 
@@ -5381,6 +5449,10 @@ fn relay(client: &TcpStream, target: &TcpStream) {
 pub(crate) const UDP_IDLE: Duration = Duration::from_secs(120);
 
 pub(crate) const UDP_BUF: usize = 65535;
+
+/// The largest SOCKS5 UDP request header a request can carry: the three-byte
+/// opening plus the longest address this tree frames.
+const HEAD: usize = 22;
 
 fn read_udp_datagram(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
     let mut len = [0u8; 2];
@@ -10215,6 +10287,65 @@ mod tests {
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut datagram = vec![0u8, 0, 0];
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"ping");
+    }
+
+    /// A datagram that traverses a freedom hop leaves by the plain dial: the
+    /// hop a captive network offers carries streams for a carrier it was never
+    /// given, so a QUIC datagram on it has to reach its target directly. This
+    /// is the shape the SOCKS5 upstream leg of `foxy-relay.yml` uses, where the
+    /// QUIC carrier would otherwise have nothing to ride.
+    #[test]
+    fn socks_associate_over_a_freedom_hop_reaches_an_udp_echo() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &Outbound::Freedom);
         });
         let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
