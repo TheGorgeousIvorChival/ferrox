@@ -665,7 +665,7 @@ Then earn the gate the hard way: three consecutive green `ci.yml` runs with no c
 ## P31 · Put the security layer outside the carrier, where both references put it
 
 **When to use:** When a `security: tls` or `security: reality` row over a stream carrier is next to carry, and a real Xray peer cannot complete the handshake: this tree serves the carrier first and runs the TLS session inside it, where both references run TLS first and build the carrier on top.
-**Status:** todo
+**Status:** doing
 **Leverage:** 5
 **Effort:** large
 **Gates:** `cargo test --workspace`; CI: `conformance.yml` green with the `ws_tls`, `httpupgrade_tls` and `grpc_tls` rows executed against `ferrox-app`

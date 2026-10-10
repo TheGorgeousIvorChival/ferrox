@@ -437,7 +437,6 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<(&'a str, Vec<u8>)> {
 }
 
 // The same accept over halves that cannot peek: pipelined bytes arrive as a prefix, after the early data.
-#[cfg(test)]
 pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
