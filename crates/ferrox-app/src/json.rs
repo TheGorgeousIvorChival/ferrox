@@ -38,6 +38,13 @@ impl Json {
         self.as_u32().and_then(|n| u16::try_from(n).ok())
     }
 
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_arr(&self) -> Option<&[Json]> {
         match self {
             Self::Arr(items) => Some(items),

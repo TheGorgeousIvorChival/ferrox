@@ -22,15 +22,18 @@ sessions never present the same bytes.
 
 ```mermaid
 graph TD
-    C["client: ClientHello with a key share"] --> S["server: rustls reads it<br/>one provider, no feature"]
+    C["client: ClientHello with a key share"] --> S["server: read the whole hello<br/>across however many records"]
     S --> X["find the X25519 share<br/>prefer a plain one over a hybrid"]
     X --> G["one X25519 group operation"]
     G --> K["HKDF the shared secret<br/>into the authentication key"]
-    K --> A["check the certificate<br/>that this key accounts for"]
-    A --> I["compare the 8-byte shortId"]
+    K --> A["open the sealed session id<br/>over the zeroed hello as AAD"]
+    A --> I["compare the 8-byte shortId<br/>and the clock and the client version"]
     I --> P["HandshakeContext:<br/>the TLS 1.3 exchange proceeds"]
+    A -->|"no authed hello"| D["dial the cover origin"]
+    D --> H["PROXY-protocol header<br/>then the hello the server read"]
+    H --> R["splice: bytes in, bytes out<br/>paced by the rate limit its side was given"]
     P --> V["with Vision: the padding<br/>frames stop and the socket is raw"]
-    V --> R["relay: bytes in, bytes out"]
+    V --> L["relay: bytes in, bytes out"]
 ```
 
 ## Measured
@@ -41,18 +44,22 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | tls-providers | 1 | ferrox-core::active_backends |
 | client-outbound-rows-dialled | 0 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_is_skipped |
-| x25519-group-operations-per-authenticated-hello | 1 | ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one |
+| x25519-shares-recognised | 3 | ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one |
 | short-id-bytes | 8 | ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes |
+| cover-origin-dials-per-authenticated-hello | 0 | ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing |
+| cover-origin-bytes-per-spliced-hello | 1 | ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte |
+| proxy-protocol-header-bytes | 28 | ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes |
 <!-- counts:end -->
 
 ## Ops
 
 ```bash
 ./scripts/count-ops.sh report \
-  reality::tests::an_authenticated_hello_is_accepted 'ferrox_core::tls::reality::verify'
+  reality::tests::an_authenticated_hello_is_accepted 'ferrox_core::tls::reality::authenticate'
 ```
 
-`UNBLESSED`, as above.
+`UNBLESSED`, as above, and `scripts/method-ops.txt` names no REALITY symbol, so
+`ops.yml` will not report one until it does.
 
 ## Time
 
@@ -81,14 +88,25 @@ handshake duration is quoted from a machine without a named runner.
 - **A hybrid key share when a plain one is present.** One group operation per
   authenticated hello, not two; `a_plain_share_is_preferred_over_a_hybrid_one`
   is the gate.
+- **One cover-origin dial per accepted socket.** Both references dial the real
+  site *before* reading a byte, so a port scanner costs one outbound connection
+  each. The dial here is lazy: an authenticated hello costs the cover origin
+  nothing, and a refused one costs exactly the hello the server read, which is
+  `an_authenticated_hello_costs_the_cover_origin_nothing`.
+- **A split hello reassembled twice.** The reader grows one buffer and stops at
+  the declared handshake length, then hands rustls the same bytes through a
+  replay prefix, so the record framing is read once rather than re-parsed by a
+  second implementation. A timeout keeps waiting for a hello that arrived in
+  two segments instead of refusing a handshake that was working.
 
 What is **not** removed, and is the open row this method is really waiting on:
 there is no uTLS fingerprint shaping in this tree at all, so the
 `unsafe-*` fingerprint extension parses, requires opt-in, and would spoof nothing
-even with consent. And the certificate problem the roadmap calls out is still
-open: REALITY's only recognised certificate has an Ed25519 key, no uTLS
-fingerprint offers signature algorithm `0x0807`, and all eleven committed raw
-ClientHellos list eight to eleven signature algorithms, none of them `0x0807`.
+even with consent. The REALITY client role is unwired, so a REALITY outbound is
+still skipped rather than dialled. And the certificate problem the roadmap calls
+out is still open: REALITY's only recognised certificate has an Ed25519 key, no
+uTLS fingerprint offers signature algorithm `0x0807`, and all eleven committed
+raw ClientHellos list eight to eleven signature algorithms, none of them `0x0807`.
 
 ## Pins
 
