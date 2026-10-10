@@ -595,10 +595,11 @@ fn h2_keepalive(session: &Weak<Mutex<H2Session>>) {
     }
 }
 
-/// Which stream the edge reset, and with what error code, behind FOXY_DEBUG:
-/// REFUSED_STREAM (0x7) says the edge will not carry this stream now,
-/// PROTOCOL_ERROR (0x1) says this lane wrote something wrong, FLOW_CONTROL_ERROR
-/// (0x3) says the windows disagree, and nothing else diagnoses the refusal.
+/// Which stream the edge reset, and with what error code, behind `FOXY_DEBUG`:
+/// `REFUSED_STREAM` (0x7) says the edge will not carry this stream now,
+/// `PROTOCOL_ERROR` (0x1) says this lane wrote something wrong,
+/// `FLOW_CONTROL_ERROR` (0x3) says the windows disagree, and nothing else
+/// diagnoses the refusal.
 fn debug_lane_code(stream: u32, code: u32) {
     if std::env::var("FOXY_DEBUG").is_ok() {
         let named = if code == 0x7 {
