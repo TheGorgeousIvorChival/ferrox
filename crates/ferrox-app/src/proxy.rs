@@ -1222,6 +1222,141 @@ fn serve_vless_reality_inbound(
     true
 }
 
+fn serve_session_ws<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::ws::accept_split(read, write, path) else {
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !cwriter.send(&[0, 0]) {
+        return;
+    }
+    relay_sink(creader, &cwriter, &uplink, |_| {});
+}
+
+fn serve_session_xhttp<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::xhttp::accept_split(read, write, path) else {
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !cwriter.send(&[0, 0]) {
+        return;
+    }
+    relay_sink_drained(creader, &cwriter, &uplink);
+}
+
+fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: TcpStream,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path) else {
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    let mut sink = SessionSink {
+        half: cwriter,
+        raw: Arc::new(raw),
+    };
+    if sink.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    relay_sink(creader, &sink, &uplink, |_| {});
+}
+
+fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: TcpStream,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    let mut sink = SessionSink {
+        half: cwriter,
+        raw: Arc::new(raw),
+    };
+    if sink.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    relay_sink(creader, &sink, &uplink, |_| {});
+}
+
+fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::grpc::accept_split(read, write, path) else {
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !cwriter.send(&[0, 0]) {
+        return;
+    }
+    relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+}
+
 fn serve_vless_tls(
     stream: TcpStream,
     id: &[u8; 16],
@@ -1244,51 +1379,56 @@ fn serve_vless_tls(
             relay_vless(tls, Some(raw), id, freedom);
         }
         Carrier::Ws { path, .. } => {
-            let Some((reader, writer)) = crate::ws::accept(stream, path) else {
+            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
                 return;
             };
-            serve_carried_tls(CarrierStream { reader, writer }, id, freedom, server);
+            if session.handshake().is_err() {
+                return;
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_ws(reader, writer, path, id, freedom);
         }
         Carrier::Xhttp { path, .. } => {
-            let Some((reader, writer)) = crate::xhttp::accept(stream, path) else {
+            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
                 return;
             };
-            let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
-            serve_carried_tls(CarrierStream { reader, writer }, id, freedom, server);
+            if session.handshake().is_err() {
+                return;
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_xhttp(reader, writer, path, id, freedom);
         }
         Carrier::HttpUpgrade { path } => {
-            let Some((reader, write)) = crate::httpupgrade::accept(stream, path) else {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
                 return;
             };
-            serve_carried_tls(
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-                id,
-                freedom,
-                server,
-            );
+            if session.handshake().is_err() {
+                return;
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
         }
         Carrier::HttpHeader { path } => {
-            let Some((reader, write)) = crate::httpheader::accept(stream, path) else {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
                 return;
             };
-            serve_carried_tls(
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-                id,
-                freedom,
-                server,
-            );
+            if session.handshake().is_err() {
+                return;
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_httpheader(reader, writer, raw, path, id, freedom);
         }
         Carrier::Grpc { path } => {
-            let Some((reader, writer)) = crate::grpc::accept(stream, path) else {
+            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
                 return;
             };
-            serve_carried_tls(Grpc::new(reader, writer), id, freedom, server);
+            if session.handshake().is_err() {
+                return;
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_grpc(reader, writer, path, id, freedom);
         }
         refused_carriers!() => {}
     }
@@ -1316,87 +1456,79 @@ fn serve_vless_reality(
     carrier: &Carrier,
     server: &ferrox_core::tls::RealityServerConfig,
 ) {
-    let Ok(raw) = stream.try_clone() else { return };
     if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
     match carrier {
         Carrier::Raw => {
+            let Ok(raw) = stream.try_clone() else { return };
             let Ok(session) = ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
             else {
                 return;
             };
             finish_reality(session, Some(raw), id, freedom);
         }
-        Carrier::Grpc { path } => {
-            let Some((reader, writer)) = crate::grpc::accept(stream, path) else {
-                return;
-            };
-            let tunnel = Grpc::new(reader, writer);
-            let Ok(session) = ferrox_core::tls::RealityServer::accept(server, unix_now(), tunnel)
+        Carrier::Ws { path, .. } => {
+            let Ok(mut session) =
+                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
             else {
                 return;
             };
-            finish_reality(session, Some(raw), id, freedom);
-        }
-        Carrier::Ws { path, .. } => {
-            let Some((reader, writer)) = crate::ws::accept(stream, path) else {
+            if session.handshake().is_err() {
                 return;
-            };
-            let Ok(session) = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_now(),
-                CarrierStream { reader, writer },
-            ) else {
-                return;
-            };
-            finish_reality(session, None, id, freedom);
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_ws(reader, writer, path, id, freedom);
         }
         Carrier::Xhttp { path, .. } => {
-            let Some((reader, writer)) = crate::xhttp::accept(stream, path) else {
+            let Ok(mut session) =
+                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
+            else {
                 return;
             };
-            let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
-            let Ok(session) = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_now(),
-                CarrierStream { reader, writer },
-            ) else {
+            if session.handshake().is_err() {
                 return;
-            };
-            finish_reality(session, None, id, freedom);
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_xhttp(reader, writer, path, id, freedom);
         }
         Carrier::HttpUpgrade { path } => {
-            let Some((reader, write)) = crate::httpupgrade::accept(stream, path) else {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(mut session) =
+                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
+            else {
                 return;
             };
-            let Ok(session) = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_now(),
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-            ) else {
+            if session.handshake().is_err() {
                 return;
-            };
-            finish_reality(session, None, id, freedom);
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
         }
         Carrier::HttpHeader { path } => {
-            let Some((reader, write)) = crate::httpheader::accept(stream, path) else {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(mut session) =
+                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
+            else {
                 return;
             };
-            let Ok(session) = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_now(),
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-            ) else {
+            if session.handshake().is_err() {
+                return;
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_httpheader(reader, writer, raw, path, id, freedom);
+        }
+        Carrier::Grpc { path } => {
+            let Ok(mut session) =
+                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
+            else {
                 return;
             };
-            finish_reality(session, None, id, freedom);
+            if session.handshake().is_err() {
+                return;
+            }
+            let (reader, writer) = session_halves(session);
+            serve_session_grpc(reader, writer, path, id, freedom);
         }
         refused_carriers!() => {}
     }
@@ -1414,48 +1546,20 @@ fn finish_reality<S: ferrox_core::tls::TlsProvider + Send + 'static>(
     relay_vless(session, raw, id, freedom);
 }
 
-struct Grpc {
-    reader: crate::grpc::GrpcReader,
-    writer: crate::grpc::GrpcWriter,
-}
-
-impl Grpc {
-    fn new(reader: crate::grpc::GrpcReader, writer: crate::grpc::GrpcWriter) -> Self {
-        Self { reader, writer }
-    }
-}
-
-impl Read for Grpc {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.reader.read(buf)
-    }
-}
-
-impl Write for Grpc {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.writer.send(buf) {
-            Ok(buf.len())
-        } else {
-            Err(std::io::Error::other("grpc: tunnel write failed"))
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
+#[cfg(test)]
 struct CarrierStream<R, W> {
     reader: R,
     writer: W,
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> Read for CarrierStream<R, W> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.reader.read(buf)
     }
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> Write for CarrierStream<R, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.writer.write(buf)
@@ -3226,6 +3330,15 @@ fn tls_halves(
     Some((reader, writer, raw))
 }
 
+// One session, two owners: the carrier accept takes a reader and a writer.
+fn session_halves<S>(session: S) -> (TlsHalf<S>, TlsHalf<S>) {
+    let shared = Arc::new(Mutex::new(session));
+    let reader = TlsHalf {
+        session: Arc::clone(&shared),
+    };
+    (reader, TlsHalf { session: shared })
+}
+
 fn tls_ws(
     server: &SocketAddr,
     session: ferrox_core::tls::RustlsProvider<TcpStream>,
@@ -3384,6 +3497,37 @@ impl Write for TlsSink {
 }
 
 impl CarrierSink for TlsSink {
+    fn send(&self, bytes: &[u8]) -> bool {
+        let mut half = self.half.clone();
+        half.write_all(bytes).is_ok()
+    }
+
+    fn close(&self) {
+        let _ = self.raw.shutdown(Shutdown::Both);
+    }
+}
+
+// The server write end for header-only carriers: bytes through the shared session, teardown through the raw socket.
+#[derive(Debug, Clone)]
+struct SessionSink<H> {
+    half: H,
+    raw: Arc<TcpStream>,
+}
+
+impl<H: Write> Write for SessionSink<H> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.half.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.half.flush()
+    }
+}
+
+impl<H> CarrierSink for SessionSink<H>
+where
+    H: Write + Clone + Send + 'static,
+{
     fn send(&self, bytes: &[u8]) -> bool {
         let mut half = self.half.clone();
         half.write_all(bytes).is_ok()
@@ -9544,6 +9688,45 @@ mod tests {
             },
             tls_ws_accept,
         );
+    }
+
+    #[test]
+    fn production_tls_first_ws_matches_the_seam() {
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x44u8; 16];
+        let echo = TcpListener::bind("127.0.0.1:0").expect("binds echo");
+        let echo_addr: SocketAddr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut s, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).expect("reads");
+            s.write_all(&buf).expect("echoes");
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &id,
+                true,
+                &Carrier::Ws {
+                    path: "/w".to_owned(),
+                    ed: 0,
+                },
+                &server_config,
+            );
+        });
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let session = dial_tls_session(&server, &client_config).expect("dialled");
+        let header = vless_header(&id, 1, &echo_addr);
+        let (mut reader, writer) = tls_ws(&server, session, "127.0.0.1", "/w", 0, &header)
+            .expect("handshakes ws inside tls");
+        read_vless_response(&mut reader).expect("answers");
+        assert!(writer.send(b"ping"), "relays through tls-first ws");
+        let mut back = [0u8; 4];
+        reader.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
     }
 
     #[test]
