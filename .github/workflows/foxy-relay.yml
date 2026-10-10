@@ -239,9 +239,23 @@ jobs:
           PY
             rm -f ferrox-relay.pid
           }
-          trace_country() {
-            curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt
-            grep -qx "loc=$1" trace-lane.txt
+          # The first flow of a lane pays for sign-in, catalogue and edge dial,
+          # and a front that is still taking its first connection answers a
+          # reset once: the trace is retried, so a restart costs seconds rather
+          # than a red leg.
+          trace_front() {
+            FRONT="$1" WANT="$2"
+            for _ in $(seq 1 48); do
+              if [ "$FRONT" = http ]; then
+                curl -sS --max-time 25 -x "http://127.0.0.1:$PORT" \
+                  https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
+              else
+                curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
+                  https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
+              fi
+              sleep 5
+            done
+            grep -qx "loc=$WANT" trace-lane.txt
           }
           fetch_mb() {
             curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
@@ -283,15 +297,15 @@ jobs:
 
           echo "== front: socks over h2 =="
           start_lane socks "$FOXY_COUNTRY" h2
-          trace_country "$FOXY_COUNTRY"
+          trace_front socks "$FOXY_COUNTRY"
           fetch_mb file-socks.bin
           echo "socks front: 1000000 B"
           stop_lane
 
           echo "== front: http over h2 =="
           start_lane http "$FOXY_COUNTRY" h2
-          curl -sS --max-time 25 -x "http://127.0.0.1:$PORT" https://www.cloudflare.com/cdn-cgi/trace -o trace-http-front.txt
-          grep -qx "loc=$FOXY_COUNTRY" trace-http-front.txt
+          trace_front http "$FOXY_COUNTRY"
+          cp trace-lane.txt trace-http-front.txt
           curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" http://www.cloudflare.com/cdn-cgi/trace -o trace-http-plain.txt
           grep -qx "loc=$FOXY_COUNTRY" trace-http-plain.txt
           fetch_mb_http file-http.bin
@@ -300,7 +314,7 @@ jobs:
 
           echo "== front: mixed over h2 =="
           start_lane mixed "$FOXY_COUNTRY" h2
-          trace_country "$FOXY_COUNTRY"
+          trace_front mixed "$FOXY_COUNTRY"
           fetch_mb file-mixed.bin
           echo "mixed front: 1000000 B"
           stop_lane
@@ -308,7 +322,7 @@ jobs:
           echo "== chained: socks5 upstream over h2 =="
           start_freedom socks 10810
           start_lane socks "$FOXY_COUNTRY" h2 "socks5://127.0.0.1:10810"
-          trace_country "$FOXY_COUNTRY"
+          trace_front socks "$FOXY_COUNTRY"
           fetch_mb file-up.bin
           echo "socks5 upstream: 1000000 B"
           stop_lane
@@ -317,7 +331,7 @@ jobs:
           echo "== chained: http upstream over h2 =="
           start_freedom http 10811
           start_lane socks "$FOXY_COUNTRY" h2 "http://127.0.0.1:10811"
-          trace_country "$FOXY_COUNTRY"
+          trace_front socks "$FOXY_COUNTRY"
           fetch_mb file-http-up.bin
           echo "http upstream: 1000000 B"
           stop_lane
@@ -329,7 +343,7 @@ jobs:
           echo "== chained: h3 over the socks5 upstream =="
           start_freedom socks 10810
           start_lane socks "$FOXY_COUNTRY" h3 "socks5://127.0.0.1:10810"
-          trace_country "$FOXY_COUNTRY"
+          trace_front socks "$FOXY_COUNTRY"
           fetch_mb file-h3-up.bin
           echo "h3 over socks5 upstream: 1000000 B"
           stop_lane
