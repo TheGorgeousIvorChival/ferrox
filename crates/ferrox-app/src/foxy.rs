@@ -155,18 +155,36 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
     let mut tried = 0usize;
     for peer in peers {
         tried += 1;
-        let Ok(stream) = TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) else {
-            continue;
+        let stream = match TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) {
+            Ok(stream) => stream,
+            Err(error) => {
+                debug_address(peer, &format!("tcp {error}"));
+                continue;
+            }
         };
         let _ = stream.set_nodelay(true);
-        if let Ok(tls) = finish_tls(dial, stream) {
-            return Ok(tls);
+        match finish_tls(dial, stream) {
+            Ok(tls) => return Ok(tls),
+            Err(failure) => {
+                debug_address(peer, &failure.to_string());
+                continue;
+            }
         }
     }
     if tried > 1 {
         eprintln!("foxy: the edge carried the lane on none of its {tried} addresses");
     }
     Err(Failure::Io)
+}
+
+/// One address the lane tried and what it answered, behind `FOXY_DEBUG` and on
+/// stderr unconditionally when more than one address was tried: a red leg is
+/// only actionable when it names the address it lost on and why, because the
+/// same loss on a different family is a different bug.
+fn debug_address(peer: SocketAddr, why: &str) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: address {peer} lost: {why}");
+    }
 }
 
 /// One address, all the way to a session the lane can speak on, naming the

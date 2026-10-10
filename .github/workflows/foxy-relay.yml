@@ -131,49 +131,6 @@ jobs:
       # runner's reachability of the edge port, and the control is what says
       # which. The addresses come from the same catalogue the lane dials,
       # through the binary that dials them.
-      # A measurement, not a gate: a control that cannot measure must not be
-      # what turns a green lane red.
-      - name: Edge reachability control - every family of the edge authority
-        if: steps.secrets.outputs.present == 'true'
-        continue-on-error: true
-        run: |
-          BIN=target/debug/ferrox-app
-          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
-          python3 -c 'import json,os; json.dump({"inbounds":[],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"code":os.environ.get("FOXY_CODE",""),"country":os.environ["FOXY_COUNTRY"],"carrier":"h2"}}]}, open("foxy-probe.json","w"))'
-          "$BIN" edges -c foxy-probe.json | python3 -c '
-          import json, socket, sys, time
-          seen = set()
-          for line in sys.stdin:
-              try:
-                  edge = json.loads(line)
-              except ValueError:
-                  continue
-              host, port = edge["host"], int(edge["port"])
-              if (host, port) in seen:
-                  continue
-              seen.add((host, port))
-              for family, label in ((socket.AF_INET, "v4"), (socket.AF_INET6, "v6")):
-                  began, count, answered = time.time(), 0, False
-                  try:
-                      infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
-                  except socket.gaierror:
-                      print(f"edge {host}:{port} {label}: no address", flush=True)
-                      continue
-                  for info in infos:
-                      count += 1
-                      try:
-                          connection = socket.create_connection((info[4][0], port), timeout=10)
-                      except OSError:
-                          continue
-                      connection.close()
-                      answered = True
-                      break
-                  took = round((time.time() - began) * 1000)
-                  print(f"edge {host}:{port} {label}: {count} address(es), "
-                        f"{'answered' if answered else 'refused'} in {took} ms", flush=True)
-          if not seen:
-              print("edge control: the catalogue published no edge", flush=True)
-          '
       - name: Download 1 MB through every carrier
         if: steps.secrets.outputs.present == 'true'
         env:
@@ -280,6 +237,53 @@ jobs:
       # hop does. Each leg takes its own port so a lane restart can never meet
       # the listener it replaced, and each asserts the pinned exit country and
       # 1000000 bytes.
+      # What the edge authority answers on this runner, with no lane in the
+      # path: the lane's dial names the address it lost on, and this says
+      # whether the runner can reach that address at all. It runs after the
+      # carrier legs because the lane's log is where the authority it dialed is
+      # written down.
+      - name: Edge authority control - what this runner reaches
+        if: always() && steps.secrets.outputs.present == 'true'
+        continue-on-error: true
+        run: |
+          authority="$(grep -oE '[a-z0-9.-]+:[0-9]{2,5}' ferrox-relay.log 2>/dev/null | head -n 1 || true)"
+          if [ -z "$authority" ]; then
+            echo "edge control: the lane log named no authority" >&2
+          else
+            host="${authority%:*}"
+            port="${authority##*:}"
+            echo "edge control: $host:$port"
+            curl -sS --connect-timeout 15 --max-time 30 -o /dev/null -w 'tcp+tls %{http_code} in %{time_total}s\n' \
+              "https://$host:$port/cdn-cgi/trace" || echo "curl exit $?"
+            for family in 4 6; do
+              python3 - "$host" "$port" "$family" <<'PY'
+          import socket, sys, time
+          host, port, family = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          label = "v4" if family == 4 else "v6"
+          try:
+              infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+          except socket.gaierror:
+              print(f"{label}: no address", flush=True)
+              raise SystemExit(0)
+          answered, count = False, 0
+          for info in infos:
+              count += 1
+              began = time.time()
+              try:
+                  connection = socket.create_connection((info[4][0], port), timeout=10)
+              except OSError as error:
+                  print(f"{label}: {info[4][0]} refused ({error.__class__.__name__})", flush=True)
+                  continue
+              took = round((time.time() - began) * 1000)
+              connection.close()
+              answered = True
+              print(f"{label}: {info[4][0]} answered tcp in {took} ms", flush=True)
+              break
+          if not answered:
+              print(f"{label}: {count} address(es), none answered tcp", flush=True)
+          PY
+            done
+          fi
       - name: Every front and chained edge dial carries 1 MB
         if: steps.secrets.outputs.present == 'true'
         env:
