@@ -130,6 +130,30 @@ impl<S: Stream> RustlsProvider<S> {
     pub fn get_ref(&self) -> &S {
         &self.io
     }
+
+    /// Writes two slices as one TLS record: the fragmenter sees `head` and `tail`
+    /// in that order in one call, which is the record a concatenated write would
+    /// have produced, so the payload's staging copy is spent rather than the
+    /// record being split in two.
+    pub fn write_parts(&mut self, head: &[u8], mut tail: &[u8]) -> std::io::Result<()> {
+        self.drive()?;
+        let mut head = head;
+        let want = head.len() + tail.len();
+        let mut written = 0usize;
+        while written < want {
+            let slices = [std::io::IoSlice::new(head), std::io::IoSlice::new(tail)];
+            let wrote = std::io::Write::write_vectored(&mut self.conn.writer(), &slices)?;
+            if wrote == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            written += wrote;
+            let spent = wrote.min(head.len());
+            head = &head[spent..];
+            tail = &tail[wrote - spent..];
+        }
+        self.conn.complete_io(&mut self.io).map_err(recover)?;
+        Ok(())
+    }
 }
 
 impl<S: Stream> TlsProvider for RustlsProvider<S> {
