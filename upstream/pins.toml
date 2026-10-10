@@ -41,10 +41,10 @@ rev           = "f5aefca40b9f492e8095ba3c1620ae627ce331ee"
 default_branch = "main"
 path          = "crates"
 test_enabled  = true
-suite         = "git init -q Xray-core && git -C Xray-core fetch --quiet --depth 1 https://github.com/XTLS/Xray-core 5ca6f4b7d4dc20a881d4330e498892697627ec0c && git -C Xray-core checkout --quiet FETCH_HEAD && cargo test -p xray-core-rs --test local_xray_interop_tests -- --ignored --exact --test-threads=1 rust_socks_client_reaches_echo_server_through_local_xray_vless_tcp rust_round_robin_balancer_uses_each_local_xray_vless_member rust_two_hop_proxy_chain_reaches_echo_through_local_xray_vless_servers rust_socks_client_reaches_echo_server_through_local_xray_vless_ws rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade rust_socks_client_reaches_echo_server_through_local_xray_vless_ws_early_data rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade_early_data"
+suite         = "git init -q Xray-core && git -C Xray-core fetch --quiet --depth 1 https://github.com/XTLS/Xray-core 5ca6f4b7d4dc20a881d4330e498892697627ec0c && git -C Xray-core checkout --quiet FETCH_HEAD && cargo test -p xray-core-rs --test local_xray_interop_tests -- --ignored --exact --test-threads=1 rust_socks_client_reaches_echo_server_through_local_xray_vless_tcp rust_round_robin_balancer_uses_each_local_xray_vless_member rust_two_hop_proxy_chain_reaches_echo_through_local_xray_vless_servers rust_socks_client_reaches_echo_server_through_local_xray_vless_ws rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade rust_socks_client_reaches_echo_server_through_local_xray_vless_ws_early_data rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade_early_data rust_socks_client_reaches_echo_server_through_local_xray_vless_ws_tls"
 ferrox_binary = "ferrox-app"
 seam           = "XRAY_VLESS_FULL_BINARY"
-note          = "Rust VLESS core; 7 interop tests run against ferrox-app via XRAY_VLESS_FULL_BINARY, checked by conformance.yml; the other 16 stay out until their transports land. Suite fetches the Xray-core checkout the tests assert on because the harness clones only this repo"
+note          = "Rust VLESS core; 8 interop tests run against ferrox-app via XRAY_VLESS_FULL_BINARY, checked by conformance.yml; the other 15 stay out until their transports land. Suite fetches the Xray-core checkout the tests assert on because the harness clones only this repo"
 
 [sources.xray-rust-hysteria]
 repo          = "https://github.com/aimalygin/xray-rust"
