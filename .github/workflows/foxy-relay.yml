@@ -297,8 +297,10 @@ jobs:
           raise SystemExit("the hop never listened")
           PY
           }
+          # One lane per method, on its own port: a lane that is stopping still
+          # holds its listener, so a restart on the same port can meet it.
           start_lane() {
-            FRONT="$1" PORT="$2" CARRIER="$3" UPSTREAM="${4:-}" COUNTRY="$FOXY_COUNTRY" python3 -c '
+            FRONT="$1" PORT="$2" CARRIER="$3" COUNTRY="$FOXY_COUNTRY" UPSTREAM="${4:-}" python3 -c '
           import json, os
           token = json.load(open("foxy-pass.json"))["pass"]
           settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"]}
@@ -313,21 +315,24 @@ jobs:
           COUNTRY="$FOXY_COUNTRY"
 
           echo "== front: socks over h2 =="
-          start_lane socks 10808 h2
+          PORT=10808
+          start_lane socks "$PORT" h2
           trace_front socks "$COUNTRY"
           fetch_mb socks file-socks.bin
           echo "socks front: 1000000 B"
           stop_lane
 
           echo "== front: http over h2 =="
-          start_lane http 10809 h2
+          PORT=10809
+          start_lane http "$PORT" h2
           trace_front http "$COUNTRY"
           fetch_mb http file-http.bin
           echo "http front: 1000000 B"
           stop_lane
 
           echo "== front: mixed over h2 =="
-          start_lane mixed 10810 h2
+          PORT=10810
+          start_lane mixed "$PORT" h2
           trace_front socks "$COUNTRY"
           fetch_mb socks file-mixed.bin
           echo "mixed front: 1000000 B"
@@ -335,7 +340,8 @@ jobs:
 
           echo "== chained: socks5 upstream over h2 =="
           start_freedom socks 10811
-          start_lane socks 10812 h2 "socks5://127.0.0.1:10811"
+          PORT=10812
+          start_lane socks "$PORT" h2 "socks5://127.0.0.1:10811"
           trace_front socks "$COUNTRY"
           fetch_mb socks file-up.bin
           echo "socks5 upstream: 1000000 B"
@@ -345,7 +351,8 @@ jobs:
 
           echo "== chained: http upstream over h2 =="
           start_freedom http 10813
-          start_lane socks 10814 h2 "http://127.0.0.1:10813"
+          PORT=10814
+          start_lane socks "$PORT" h2 "http://127.0.0.1:10813"
           trace_front socks "$COUNTRY"
           fetch_mb socks file-http-up.bin
           echo "http upstream: 1000000 B"
@@ -358,7 +365,8 @@ jobs:
           # through one rather than around one.
           echo "== chained: h3 over the socks5 upstream =="
           start_freedom socks 10815
-          start_lane socks 10816 h3 "socks5://127.0.0.1:10815"
+          PORT=10816
+          start_lane socks "$PORT" h3 "socks5://127.0.0.1:10815"
           trace_front socks "$COUNTRY"
           fetch_mb socks file-h3-up.bin
           echo "h3 over socks5 upstream: 1000000 B"
