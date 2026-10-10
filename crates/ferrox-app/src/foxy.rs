@@ -431,6 +431,10 @@ struct H2Session {
     flows: usize,
     /// A GOAWAY ends new streams on this session and not the ones open.
     gone: bool,
+    /// A session the edge stopped answering on: no stream is opened on it and
+    /// the pool forgets it, because a flow that rides a dead session never gets
+    /// its status, and the refusal it answers with is not recoverable.
+    broken: bool,
     /// When the session last carried a frame, which is what the keepalive
     /// calls idle.
     busy: Instant,
@@ -470,6 +474,7 @@ impl H2Session {
             next: 1,
             flows: 0,
             gone: false,
+            broken: false,
             busy: Instant::now(),
         })
     }
@@ -477,7 +482,7 @@ impl H2Session {
     /// One stream id for a new flow: client ids are odd, and a session that
     /// answered GOAWAY hands out none.
     fn open(&mut self) -> Option<u32> {
-        if self.gone {
+        if self.gone || self.broken {
             return None;
         }
         let stream = self.next;
@@ -493,6 +498,11 @@ impl H2Session {
     /// means: the flows already on it keep their bytes.
     fn goaway(&mut self) {
         self.gone = true;
+    }
+
+    /// The edge stopped answering this session: no stream is opened on it again.
+    fn broke(&mut self) {
+        self.broken = true;
     }
 
     fn carried(&mut self) {
@@ -659,6 +669,15 @@ fn read_frame(
 }
 
 impl Tls2 {
+    /// Ends this session's usefulness: no stream is opened on it and the pool
+    /// forgets it. The edge stopping mid-status, resetting a stream, or a write
+    /// it will not take are all the same answer.
+    fn dead(&mut self) {
+        if let Ok(mut held) = self.session.lock() {
+            held.broke();
+        }
+    }
+
     pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
         let session = self
             .session
@@ -798,6 +817,7 @@ impl Tls2 {
                         // lane that must not pool, PROTOCOL_ERROR is ours.
                         frames::H2Event::Reset { code } => {
                             debug_lane_code(lane.stream, code);
+                            lane.dead();
                             Err(Failure::Stream)
                         }
                         // A status larger than one frame arrives in pieces: each
@@ -818,6 +838,9 @@ impl Tls2 {
                 return Ok(status);
             }
         }
+        // The edge named this session and then stopped answering it, so the
+        // next flow starts one rather than waiting out the same silence.
+        self.dead();
         Err(Failure::Stream)
     }
 
@@ -968,7 +991,11 @@ impl Write for Tls2 {
             .session
             .lock()
             .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
-        session.tls.write_all(&self.out)?;
+        if let Err(error) = session.tls.write_all(&self.out) {
+            drop(session);
+            self.dead();
+            return Err(error);
+        }
         session.carried();
         Ok(frame)
     }
@@ -978,7 +1005,12 @@ impl Write for Tls2 {
             .session
             .lock()
             .map_err(|_| std::io::Error::other("foxy: the session is poisoned"))?;
-        session.tls.flush()
+        if let Err(error) = session.tls.flush() {
+            drop(session);
+            self.dead();
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -1010,14 +1042,32 @@ impl Read for Tls2 {
                         lane.ack(frames::PING, payload).map_err(io)?;
                         Ok(())
                     }
-                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                    frames::H2Event::GoAway { .. } => {
+                        // The edge is closing the session: this stream is done
+                        // and no new one is opened on it.
+                        lane.fin = true;
+                        lane.dead();
+                        Ok(())
+                    }
+                    // The edge reset this stream, which is the edge saying it
+                    // will not carry it: it says nothing about the others.
+                    frames::H2Event::Reset { code } => {
+                        debug_lane_code(lane.stream, code);
                         lane.fin = true;
                         Ok(())
                     }
                     _ => Ok(()),
                 }
             });
-            read??;
+            if let Err(error) = read {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    self.dead();
+                    // An empty read is the edge closing the session rather than
+                    // this stream, so the session is over for everyone on it.
+                    self.fin = true;
+                }
+                return Err(error);
+            }
         }
     }
 }
