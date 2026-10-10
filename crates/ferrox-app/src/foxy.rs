@@ -142,25 +142,29 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
     }
 }
 
-fn peer(dial: &FoxyDial) -> Result<SocketAddr, Failure> {
-    if let Some(address) = dial.address {
-        return Ok(address);
-    }
-    format!("{}:{}", dial.host, dial.port)
-        .to_socket_addrs()
-        .map_err(|_| Failure::Io)?
-        .next()
-        .ok_or(Failure::Io)
-}
-
 fn tcp(dial: &FoxyDial) -> Result<TcpStream, Failure> {
     if let Some(proxy) = dial.upstream.as_ref() {
         return tcp_via(proxy, dial);
     }
-    let stream =
-        TcpStream::connect_timeout(&peer(dial)?, CONNECT_TIMEOUT).map_err(|_| Failure::Io)?;
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    // A name answers with more than one address and the first is not a
+    // promise: an edge that listens on one family and not the other is dialed
+    // on the family that answers, so every address is tried rather than the
+    // one the resolver happened to list first. An address the config names is
+    // the dial it named, and nothing else.
+    let peers = match dial.address {
+        Some(address) => vec![address],
+        None => format!("{}:{}", dial.host, dial.port)
+            .to_socket_addrs()
+            .map_err(|_| Failure::Io)?
+            .collect(),
+    };
+    for peer in peers {
+        if let Ok(stream) = TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) {
+            let _ = stream.set_nodelay(true);
+            return Ok(stream);
+        }
+    }
+    Err(Failure::Io)
 }
 
 /// TCP to the edge through one upstream hop: the TLS name stays the edge's,
@@ -231,13 +235,18 @@ pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<TcpStream>, So
 /// The one hop this tree speaks to, dialed and kept alive: a proxy that does
 /// not answer at all is a failed dial, not a lane running direct.
 fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<TcpStream> {
-    let proxy_addr = format!("{}:{}", proxy.host, proxy.port)
+    // Same reason the edge dial tries each one: a hop that answers on the
+    // family the resolver listed second is still the hop this lane uses.
+    for addr in format!("{}:{}", proxy.host, proxy.port)
         .to_socket_addrs()
         .ok()?
-        .next()?;
-    let stream = TcpStream::connect_timeout(&proxy_addr, CONNECT_TIMEOUT).ok()?;
-    let _ = stream.set_nodelay(true);
-    Some(stream)
+    {
+        if let Ok(stream) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            let _ = stream.set_nodelay(true);
+            return Some(stream);
+        }
+    }
+    None
 }
 
 /// No authentication offered, no authentication accepted: a hop that selects
@@ -1374,6 +1383,77 @@ mod loopback {
                 quota_reset: None,
             },
         }
+    }
+
+    /// A name answers with more than one address, and the first the resolver
+    /// lists is not a promise: the edge is dialed on the family that answers,
+    /// which is what a runner behind a resolver that prefers v6 needs when the
+    /// edge listens on v4 only. `localhost` answers v6 first on both runners,
+    /// so a v4 listener is exactly the case the first address cannot serve.
+    #[test]
+    fn the_edge_is_dialed_on_the_address_that_answers_not_the_first_one() {
+        let (roots, _server) = minted(b"tls");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds on v4");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            drop(stream);
+            seen_tx.send(()).expect("reports");
+        });
+        // No address named: the name is what dials, and the family it answers
+        // on is what is connected to.
+        let dial = FoxyDial {
+            host: "localhost".to_owned(),
+            port,
+            address: None,
+            carrier: Carrier::H1,
+            upstream: None,
+            roots,
+            pins: foxy::pin::Pins::default(),
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        };
+        let stream = tcp(&dial).expect("dials an address the name answers on");
+        assert_eq!(
+            stream.peer_addr().ok(),
+            Some(SocketAddr::from(([127, 0, 0, 1], port))),
+            "the dial reached the address that answers, not the first one listed"
+        );
+        seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the edge accepted");
+    }
+
+    /// An address the config names is the dial it named: a name that answers
+    /// does not get it, because that address is the poison-proof dial and the
+    /// TLS name is verified against it.
+    #[test]
+    fn an_address_the_config_names_is_the_dial_it_named() {
+        let (roots, _server) = minted(b"tls");
+        let dial = FoxyDial {
+            host: "localhost".to_owned(),
+            port: 443,
+            address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
+            carrier: Carrier::H1,
+            upstream: None,
+            roots,
+            pins: foxy::pin::Pins::default(),
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        };
+        assert!(
+            tcp(&dial).is_err(),
+            "the named address is the only one dialed"
+        );
     }
 
     fn round_trip(tunnel: &mut Tunnel) {
