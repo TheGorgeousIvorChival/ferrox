@@ -19,5 +19,9 @@
 # freedom outbound, and one more test with it. Both live behind the same
 # ferrox-app bin whose release layout `der_to_pem` is measured in, so the row
 # moves by 13 Ir without the function changing; quic.rs untouched.
+# Re-blessed 2653 by muse-ferrox: the TLS-first server accept adds five
+# serve_session_* helpers, session_halves, SessionSink and one production
+# loopback test to the same ferrox-app bin, putting back the 13 Ir that
+# 3c878f5's took out; quic.rs untouched.
 
-der_to_pem 2640
+der_to_pem 2653
