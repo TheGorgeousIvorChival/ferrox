@@ -298,7 +298,7 @@ jobs:
           PY
           }
           start_lane() {
-            FRONT="$1" PORT="$2" CARRIER="$3" UPSTREAM="${4:-}" python3 -c '
+            FRONT="$1" PORT="$2" CARRIER="$3" UPSTREAM="${4:-}" COUNTRY="$FOXY_COUNTRY" PORT="$PORT" python3 -c '
           import json, os
           token = json.load(open("foxy-pass.json"))["pass"]
           settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"]}
