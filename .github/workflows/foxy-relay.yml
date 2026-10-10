@@ -114,7 +114,12 @@ jobs:
             PORT="$1" python3 - <<'PY'
           import os, socket, time
           port = int(os.environ["PORT"])
-          for _ in range(90):
+          deadline = time.time() + 180
+          while time.time() < deadline:
+              try:
+                  int(open("ferrox-relay.pid").read().strip())
+              except (OSError, ValueError):
+                  raise SystemExit("the lane exited: see ferrox-relay.log")
               try:
                   socket.create_connection(("127.0.0.1", port), timeout=2).close()
                   raise SystemExit(0)
@@ -215,7 +220,12 @@ jobs:
             PORT="$1" python3 - <<'PY'
           import os, socket, time
           port = int(os.environ["PORT"])
-          for _ in range(90):
+          deadline = time.time() + 180
+          while time.time() < deadline:
+              try:
+                  int(open("ferrox-relay.pid").read().strip())
+              except (OSError, ValueError):
+                  raise SystemExit("the lane exited: see ferrox-relay.log")
               try:
                   socket.create_connection(("127.0.0.1", port), timeout=2).close()
                   raise SystemExit(0)
@@ -224,6 +234,11 @@ jobs:
           raise SystemExit("the lane never listened")
           PY
           }
+          # A lane that is only asked to exit holds its port until it has: on
+          # windows a listener that is still shutting down answers the new
+          # lane's bind with WSAEADDRINUSE, and a lane that died at once is
+          # indistinguishable from a lane that is merely quiet. So the stop
+          # waits for the process to be gone before either port check runs.
           stop_lane() {
             python3 - <<'PY' || true
           import os, signal, time
@@ -231,11 +246,16 @@ jobs:
               pid = int(open("ferrox-relay.pid").read().strip())
           except OSError:
               raise SystemExit(0)
-          try:
-              os.kill(pid, signal.SIGTERM)
-          except OSError:
-              pass
-          time.sleep(3)
+          for _ in range(30):
+              try:
+                  os.kill(pid, 0)
+              except OSError:
+                  raise SystemExit(0)
+              try:
+                  os.kill(pid, signal.SIGTERM)
+              except OSError:
+                  pass
+              time.sleep(1)
           PY
             rm -f ferrox-relay.pid
           }
@@ -364,7 +384,12 @@ jobs:
             PORT="$1" python3 - <<'PY'
           import os, socket, time
           port = int(os.environ["PORT"])
-          for _ in range(90):
+          deadline = time.time() + 180
+          while time.time() < deadline:
+              try:
+                  int(open("ferrox-relay.pid").read().strip())
+              except (OSError, ValueError):
+                  raise SystemExit("the lane exited: see ferrox-relay.log")
               try:
                   socket.create_connection(("127.0.0.1", port), timeout=2).close()
                   raise SystemExit(0)
