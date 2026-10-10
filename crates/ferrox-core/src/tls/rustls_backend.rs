@@ -275,14 +275,8 @@ impl<S: Stream> RustlsServerProvider<S> {
 
     fn drive(&mut self) -> Result<(), TlsError> {
         while self.conn.is_handshaking() {
-            if let Err(error) = self.conn.complete_io(&mut self.io) {
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) {
-                    continue;
-                }
-                return Err(recover(error));
+            if let Err(e) = self.conn.complete_io(&mut self.io) {
+                return Err(recover(e));
             }
         }
         Ok(())
@@ -621,6 +615,40 @@ mod tests {
             let mut buf = [0u8; 4];
             client.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
+        });
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn an_idle_peer_refuses_the_handshake_instead_of_spinning_it() {
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                    .expect("times out");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                let _ = done_tx.send(server.handshake());
+            });
+            // Silent past the old spin, which never ended: the refusal arrives first.
+            let idle = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let refused = done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the handshake refuses an idle peer");
+            assert!(
+                matches!(refused, Err(TlsError::Timeout)),
+                "idleness refuses as {refused:?}"
+            );
+            drop(idle);
         });
     }
 

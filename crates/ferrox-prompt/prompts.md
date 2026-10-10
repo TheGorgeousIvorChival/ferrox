@@ -1025,7 +1025,7 @@ The reference multiplexes, and this tree pools QUIC, so pooling HTTP/2 looked li
 ## P51 · Bound the server handshake drive that spins on an idle peer
 
 **When to use:** When a `RustlsServerProvider::drive` can spin: it `continue`s on `TimedOut`/`WouldBlock`, so a peer that connects and sends nothing burns a thread at 100% CPU with no deadline, while the client drive returns the same error to its caller.
-**Status:** todo
+**Status:** done
 **Leverage:** 3
 **Effort:** small
 **Gates:** `cargo test --workspace`; a loopback test connecting and idling past the old spin, proving the handshake refuses instead
