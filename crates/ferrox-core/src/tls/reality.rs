@@ -1416,4 +1416,55 @@ mod tests {
         server.join().expect("joins").expect("authenticates");
         assert_eq!(bytes[0], 0x16);
     }
+
+    /// A `Read` that answers `WouldBlock` once and then dribbles one byte at a
+    /// time, so the hello reader is driven through its wait path deterministically.
+    struct Dribble {
+        bytes: Vec<u8>,
+        at: usize,
+        blocked: bool,
+    }
+
+    impl Dribble {
+        fn of(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                at: 0,
+                blocked: false,
+            }
+        }
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.blocked {
+                self.blocked = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if self.at >= self.bytes.len() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_hello_in_two_records_behind_a_timeout_is_read_whole() {
+        let bytes = good_hello();
+        let body = &bytes[5..];
+        let half = body.len() / 2;
+        let mut split = vec![0x16, 0x03, 0x01];
+        split.extend_from_slice(&u16::try_from(half).unwrap().to_be_bytes());
+        split.extend_from_slice(&body[..half]);
+        let mut second = vec![0x16, 0x03, 0x01];
+        second.extend_from_slice(&u16::try_from(body.len() - half).unwrap().to_be_bytes());
+        second.extend_from_slice(&body[half..]);
+        split.extend_from_slice(&second);
+        let mut dribble = Dribble::of(&split);
+        let (raw, hello) = read_client_hello(&mut dribble).expect("reads whole");
+        assert_eq!(raw, split);
+        assert_eq!(hello.bytes, body);
+    }
 }
