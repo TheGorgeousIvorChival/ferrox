@@ -1230,20 +1230,26 @@ fn serve_session_ws<R: Read, W: FrameWrite + 'static>(
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::ws::accept_split(read, write, path) else {
+        echo_trace("session ws accept refused");
         return;
     };
     let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session ws vless decode refused");
         return;
     };
     if got != *id || cmd != 1 || !freedom {
+        echo_trace("session ws vless id or cmd refused");
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session ws uplink refused");
         return;
     };
     if !cwriter.send(&[0, 0]) {
+        echo_trace("session ws vless response refused");
         return;
     }
+    echo_trace("session ws relaying");
     relay_sink(creader, &cwriter, &uplink, |_| {});
 }
 
@@ -1255,20 +1261,26 @@ fn serve_session_xhttp<R: Read, W: FrameWrite + 'static>(
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::xhttp::accept_split(read, write, path) else {
+        echo_trace("session xhttp accept refused");
         return;
     };
     let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session xhttp vless decode refused");
         return;
     };
     if got != *id || cmd != 1 || !freedom {
+        echo_trace("session xhttp vless id or cmd refused");
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session xhttp uplink refused");
         return;
     };
     if !cwriter.send(&[0, 0]) {
+        echo_trace("session xhttp vless response refused");
         return;
     }
+    echo_trace("session xhttp relaying");
     relay_sink_drained(creader, &cwriter, &uplink);
 }
 
@@ -1281,15 +1293,19 @@ fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path) else {
+        echo_trace("session httpupgrade accept refused");
         return;
     };
     let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session httpupgrade vless decode refused");
         return;
     };
     if got != *id || cmd != 1 || !freedom {
+        echo_trace("session httpupgrade vless id or cmd refused");
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpupgrade uplink refused");
         return;
     };
     let mut sink = SessionSink {
@@ -1297,8 +1313,10 @@ fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
         raw: Arc::new(raw),
     };
     if sink.write_all(&[0, 0]).is_err() {
+        echo_trace("session httpupgrade vless response refused");
         return;
     }
+    echo_trace("session httpupgrade relaying");
     relay_sink(creader, &sink, &uplink, |_| {});
 }
 
@@ -1311,15 +1329,19 @@ fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
+        echo_trace("session httpheader accept refused");
         return;
     };
     let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session httpheader vless decode refused");
         return;
     };
     if got != *id || cmd != 1 || !freedom {
+        echo_trace("session httpheader vless id or cmd refused");
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpheader uplink refused");
         return;
     };
     let mut sink = SessionSink {
@@ -1327,8 +1349,10 @@ fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
         raw: Arc::new(raw),
     };
     if sink.write_all(&[0, 0]).is_err() {
+        echo_trace("session httpheader vless response refused");
         return;
     }
+    echo_trace("session httpheader relaying");
     relay_sink(creader, &sink, &uplink, |_| {});
 }
 
@@ -1340,21 +1364,42 @@ fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::grpc::accept_split(read, write, path) else {
+        echo_trace("session grpc accept refused");
         return;
     };
     let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session grpc vless decode refused");
         return;
     };
     if got != *id || cmd != 1 || !freedom {
+        echo_trace("session grpc vless id or cmd refused");
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session grpc uplink refused");
         return;
     };
     if !cwriter.send(&[0, 0]) {
+        echo_trace("session grpc vless response refused");
         return;
     }
+    echo_trace("session grpc relaying");
     relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+}
+
+fn accept_tls_session(
+    stream: TcpStream,
+    server: &ferrox_core::tls::TlsServerConfig,
+) -> Option<impl ferrox_core::tls::TlsProvider + Send> {
+    let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
+        echo_trace("tls-server accept refused");
+        return None;
+    };
+    if session.handshake().is_err() {
+        echo_trace("tls-server handshake refused");
+        return None;
+    }
+    Some(session)
 }
 
 fn serve_vless_tls(
@@ -1379,54 +1424,39 @@ fn serve_vless_tls(
             relay_vless(tls, Some(raw), id, freedom);
         }
         Carrier::Ws { path, .. } => {
-            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            if session.handshake().is_err() {
-                return;
-            }
             let (reader, writer) = session_halves(session);
             serve_session_ws(reader, writer, path, id, freedom);
         }
         Carrier::Xhttp { path, .. } => {
-            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            if session.handshake().is_err() {
-                return;
-            }
             let (reader, writer) = session_halves(session);
             serve_session_xhttp(reader, writer, path, id, freedom);
         }
         Carrier::HttpUpgrade { path } => {
             let Ok(raw) = stream.try_clone() else { return };
-            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            if session.handshake().is_err() {
-                return;
-            }
             let (reader, writer) = session_halves(session);
             serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
-            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            if session.handshake().is_err() {
-                return;
-            }
             let (reader, writer) = session_halves(session);
             serve_session_httpheader(reader, writer, raw, path, id, freedom);
         }
         Carrier::Grpc { path } => {
-            let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            if session.handshake().is_err() {
-                return;
-            }
             let (reader, writer) = session_halves(session);
             serve_session_grpc(reader, writer, path, id, freedom);
         }
