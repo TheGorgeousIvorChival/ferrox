@@ -133,24 +133,18 @@ pub(crate) fn upstream_proxy(text: &str) -> Option<UpstreamProxy> {
     })
 }
 
-fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
-    ferrox_core::tls::TlsConfig {
-        server_name: dial.host.clone(),
-        alpn: vec![dial.carrier.alpn().to_vec()],
-        roots: dial.roots.clone(),
-        pins: dial.pins.clone(),
-    }
-}
-
-fn tcp(dial: &FoxyDial) -> Result<TcpStream, Failure> {
+/// The TLS session to the edge, dialed address by address all the way through:
+/// an address that accepts TCP is not an address that carries the lane, and a
+/// resolver that lists one whose TLS does not answer first must not cost the
+/// lane the family that would have. The handshake and the ALPN are part of
+/// "does this address work", so they are tried per address.
+///
+/// A hop the config names is the dial instead: the association or the CONNECT
+/// carries the edge's name, and the hop answers or it does not.
+fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
     if let Some(proxy) = dial.upstream.as_ref() {
-        return tcp_via(proxy, dial);
+        return finish_tls(dial, tcp_via(proxy, dial)?);
     }
-    // A name answers with more than one address and the first is not a
-    // promise: an edge that listens on one family and not the other is dialed
-    // on the family that answers, so every address is tried rather than the
-    // one the resolver happened to list first. An address the config names is
-    // the dial it named, and nothing else.
     let peers = match dial.address {
         Some(address) => vec![address],
         None => format!("{}:{}", dial.host, dial.port)
@@ -161,16 +155,45 @@ fn tcp(dial: &FoxyDial) -> Result<TcpStream, Failure> {
     let mut tried = 0usize;
     for peer in peers {
         tried += 1;
-        if let Ok(stream) = TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) {
-            let _ = stream.set_nodelay(true);
-            return Ok(stream);
+        let Ok(stream) = TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) else {
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        if let Ok(tls) = finish_tls(dial, stream) {
+            return Ok(tls);
         }
     }
-    debug_stage("the edge accepted TCP on none of its addresses");
     if tried > 1 {
-        eprintln!("foxy: the edge answered on none of its {tried} addresses");
+        eprintln!("foxy: the edge carried the lane on none of its {tried} addresses");
     }
     Err(Failure::Io)
+}
+
+/// One address, all the way to a session the lane can speak on, naming the
+/// stage that failed because a leg that says only "io" cannot be told apart
+/// from any other leg that says the same.
+fn finish_tls(
+    dial: &FoxyDial,
+    stream: TcpStream,
+) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
+        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
+        .map_err(|_| Failure::Io)?;
+    tls.handshake()
+        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
+        .map_err(|_| Failure::Io)?;
+    negotiated(&tls, dial)
+        .inspect_err(|_| debug_stage("the edge named no protocol this lane speaks"))
+        .map(|()| tls)
+}
+
+fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
+    ferrox_core::tls::TlsConfig {
+        server_name: dial.host.clone(),
+        alpn: vec![dial.carrier.alpn().to_vec()],
+        roots: dial.roots.clone(),
+        pins: dial.pins.clone(),
+    }
 }
 
 /// TCP to the edge through one upstream hop: the TLS name stays the edge's,
@@ -326,14 +349,7 @@ fn read_exact<S: Read>(io: &mut S, buf: &mut [u8]) -> std::io::Result<()> {
 
 /// HTTP/1.1 CONNECT: the request, the status line, then the target's own bytes.
 pub(crate) fn open_h1(dial: &FoxyDial, target: &str) -> Result<Tls1, Failure> {
-    let stream = tcp(dial)?;
-    let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
-    tls.handshake()
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
-    negotiated(&tls, dial)?;
+    let mut tls = tls_to_edge(dial)?;
     tls.write_all(&foxy::connect_request(target, &dial.pass.token))
         .map_err(|_| Failure::Io)?;
     opened(foxy::connect_status(&head(&mut tls)?)?)?;
@@ -387,14 +403,7 @@ pub(crate) fn open_udp(
 }
 
 fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
-    let stream = tcp(dial)?;
-    let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
-    tls.handshake()
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
-    negotiated(&tls, dial)?;
+    let mut tls = tls_to_edge(dial)?;
 
     // The stream window arrives in the settings; the connection window only
     // moves by a frame, so without this one the tunnel is paced by a round trip
@@ -713,14 +722,7 @@ pub(crate) fn raw_h2_session(
 fn open_h2_with_raw(
     dial: &FoxyDial,
 ) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
-    let stream = tcp(dial)?;
-    let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
-    tls.handshake()
-        .inspect_err(|_| debug_stage("the TLS handshake with the edge failed"))
-        .map_err(|_| Failure::Io)?;
-    negotiated(&tls, dial)?;
+    let mut tls = tls_to_edge(dial)?;
     let mut opening = Vec::with_capacity(48);
     opening.extend_from_slice(frames::PREFACE);
     h2_frame(
@@ -1451,29 +1453,40 @@ mod loopback {
         }
     }
 
-    /// A name answers with more than one address, and the first the resolver
-    /// lists is not a promise: the edge is dialed on the family that answers,
-    /// which is what a runner behind a resolver that prefers v6 needs when the
-    /// edge listens on v4 only. `localhost` answers v6 first on both runners,
-    /// so a v4 listener is exactly the case the first address cannot serve.
+    /// An address that accepts TCP is not an address that carries the lane:
+    /// `localhost` answers v6 first on both the runners that matter, so a v6
+    /// listener that accepts and never speaks must not cost the lane the v4
+    /// edge behind it.
     #[test]
-    fn the_edge_is_dialed_on_the_address_that_answers_not_the_first_one() {
-        let (roots, _server) = minted(b"tls");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds on v4");
+    fn an_address_whose_tls_does_not_answer_costs_the_lane_the_next_one() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (roots, server) = minted(b"h2");
+        let mute = TcpListener::bind("[::1]:0").expect("binds v6");
+        let mute_port = mute.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            // Accepts the connection and then says nothing, which is the whole
+            // of an address that cannot carry TLS.
+            let (stream, _) = mute.accept().expect("accepts");
+            drop(stream);
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds v4");
         let port = listener.local_addr().expect("addr").port();
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            drop(stream);
-            seen_tx.send(()).expect("reports");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(&server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            while tls.read(&mut [0u8; 1]).map_or(true, |n| n > 0) {}
         });
-        // No address named: the name is what dials, and the family it answers
-        // on is what is connected to.
+
         let dial = FoxyDial {
+            // The port the name resolves to for both families, so the two
+            // listeners are the two addresses of one name.
             host: "localhost".to_owned(),
-            port,
+            port: mute_port.min(port) + mute_port.max(port).saturating_sub(mute_port),
             address: None,
-            carrier: Carrier::H1,
+            carrier: Carrier::H2,
             upstream: None,
             roots,
             pins: foxy::pin::Pins::default(),
@@ -1484,15 +1497,10 @@ mod loopback {
                 quota_reset: None,
             },
         };
-        let stream = tcp(&dial).expect("dials an address the name answers on");
-        assert_eq!(
-            stream.peer_addr().ok(),
-            Some(SocketAddr::from(([127, 0, 0, 1], port))),
-            "the dial reached the address that answers, not the first one listed"
-        );
-        seen_rx
-            .recv_timeout(Duration::from_secs(20))
-            .expect("the edge accepted");
+        // The v4 edge's port, which is the one that speaks.
+        let dial = FoxyDial { port, ..dial };
+        let tls = tls_to_edge(&dial).expect("dials the address whose TLS answers");
+        assert_eq!(tls.alpn(), Some(&b"h2"[..]), "the session is the live one");
     }
 
     /// An address the config names is the dial it named: a name that answers
@@ -1500,12 +1508,12 @@ mod loopback {
     /// TLS name is verified against it.
     #[test]
     fn an_address_the_config_names_is_the_dial_it_named() {
-        let (roots, _server) = minted(b"tls");
+        let (roots, _server) = minted(b"h2");
         let dial = FoxyDial {
             host: "localhost".to_owned(),
             port: 443,
             address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
-            carrier: Carrier::H1,
+            carrier: Carrier::H2,
             upstream: None,
             roots,
             pins: foxy::pin::Pins::default(),
@@ -1517,8 +1525,8 @@ mod loopback {
             },
         };
         assert!(
-            tcp(&dial).is_err(),
-            "the named address is the only one dialed"
+            tls_to_edge(&dial).is_err(),
+            "the named address is the only one"
         );
     }
 
@@ -1533,6 +1541,10 @@ mod loopback {
     /// A dial whose hop is the only way to the edge: the name the CONNECT
     /// carries is not the name anything resolves, so a dial that reaches the
     /// edge has gone through the hop.
+    fn hop_stream(proxy: &UpstreamProxy) -> std::net::TcpStream {
+        tcp_via(proxy, &upstream_dial(proxy.clone(), None)).expect("chains through the hop")
+    }
+
     fn upstream_dial(proxy: UpstreamProxy, edge: Option<SocketAddr>) -> FoxyDial {
         FoxyDial {
             host: "edge.test".to_owned(),
@@ -1580,7 +1592,7 @@ mod loopback {
             head
         });
         let proxy = upstream_proxy(&format!("http://127.0.0.1:{port}")).expect("parses");
-        let mut stream = tcp(&upstream_dial(proxy, None)).expect("chains");
+        let mut stream = hop_stream(&proxy);
         stream.write_all(PAYLOAD).expect("writes");
         let mut back = vec![0u8; PAYLOAD.len()];
         stream.read_exact(&mut back).expect("echoes");
@@ -1618,7 +1630,7 @@ mod loopback {
             greet.to_vec()
         });
         let proxy = upstream_proxy(&format!("socks5://127.0.0.1:{port}")).expect("parses");
-        let mut stream = tcp(&upstream_dial(proxy, None)).expect("chains");
+        let mut stream = hop_stream(&proxy);
         stream.write_all(PAYLOAD).expect("writes");
         let mut back = vec![0u8; PAYLOAD.len()];
         stream.read_exact(&mut back).expect("echoes");
@@ -1660,7 +1672,7 @@ mod loopback {
         let proxy = upstream_proxy(&format!("socks5://127.0.0.1:{port}")).expect("parses");
         let edge = Some(SocketAddr::from(([127, 0, 0, 1], edge_port)));
         assert!(
-            tcp(&upstream_dial(proxy, edge)).is_err(),
+            tls_to_edge(&upstream_dial(proxy.clone(), edge)).is_err(),
             "a refused hop is a failed dial"
         );
         assert!(
