@@ -3457,14 +3457,10 @@ impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
         let began = std::time::Instant::now();
         let out = self.locked_read(buf);
         if out.as_ref().is_err_and(is_timeout) {
-            // This half shares the session with the relay's write pump, and a
-            // read that waits holds it: one tick of the grain is spent waiting
-            // and the rest of it released, so a quiet edge never holds the
-            // write out for longer than the wait costs.
-            let left = RELAY_POLL.saturating_sub(began.elapsed());
-            if !left.is_zero() {
-                thread::sleep(left);
-            }
+            // The lock is shared with the relay's write pump, so every idle poll
+            // leaves a floor of it unlocked: a spinning read must not starve a writer.
+            let left = RELAY_POLL.saturating_sub(began.elapsed()).max(SESSION_POLL);
+            thread::sleep(left);
         }
         out
     }
