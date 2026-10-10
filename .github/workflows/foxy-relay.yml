@@ -8,9 +8,12 @@ name: Foxy relay (live download check)
 # against a local edge; only this job proves the relay moves bytes against the
 # real one, on every platform, through every method.
 #
+# Every OS also proves the fronts the app serves (socks, http, mixed) and the
+# edge dial chained through a local proxy the way a captive or corporate
+# network offers one: a SOCKS5 association and an HTTP CONNECT hop, with
+# HTTP/3 riding the SOCKS5 UDP association rather than around it.
 # The ubuntu job additionally proves a second exit country (a different
-# server), the `http` front (CONNECT and plain GET through the same lane), and
-# the UDP datagram path — each a separate lane start, so one leg's failure
+# server) and the UDP datagram path — each a separate lane start, so one leg's failure
 # names its own method, front, or server.
 #
 # Needs repository secrets like foxy-live.yml does: FOXY_EMAIL and FOXY_PASS
@@ -194,11 +197,148 @@ jobs:
             echo "failed legs:$FAILED" >&2
             exit 1
           fi
-      - name: Second country, http front, UDP path
+      # Every front the app serves, and every way the edge dial is chained:
+      # the lane rides a local proxy the same way a laptop behind a corporate
+      # hop does. Each leg restarts the lane, so a failure names its own
+      # method, front or chain, and each asserts the pinned exit country and
+      # 1000000 bytes.
+      - name: Every front and chained edge dial carries 1 MB
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+          FOXY_DEBUG: 1
+        run: |
+          BIN=target/debug/ferrox-app
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          PORT="$SOCKS_PORT"
+          wait_port() {
+            PORT="$1" python3 - <<'PY'
+          import os, socket, time
+          port = int(os.environ["PORT"])
+          for _ in range(90):
+              try:
+                  socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                  raise SystemExit(0)
+              except OSError:
+                  time.sleep(2)
+          raise SystemExit("the lane never listened")
+          PY
+          }
+          stop_lane() {
+            python3 - <<'PY' || true
+          import os, signal, time
+          try:
+              pid = int(open("ferrox-relay.pid").read().strip())
+          except OSError:
+              raise SystemExit(0)
+          try:
+              os.kill(pid, signal.SIGTERM)
+          except OSError:
+              pass
+          time.sleep(3)
+          PY
+            rm -f ferrox-relay.pid
+          }
+          trace_country() {
+            curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt
+            grep -qx "loc=$1" trace-lane.txt
+          }
+          fetch_mb() {
+            curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$1"
+            test "$(wc -c < "$1" | tr -d ' ')" = 1000000
+          }
+          fetch_mb_http() {
+            curl -sS --max-time 300 -x "http://127.0.0.1:$PORT" \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$1"
+            test "$(wc -c < "$1" | tr -d ' ')" = 1000000
+          }
+          # A front the app serves with a freedom outbound is a plain local
+          # proxy: it is the hop a captive or corporate network offers, and the
+          # edge dial is chained through it below.
+          start_freedom() {
+            FRONT="$1" PORT="$2" python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"freedom"}]}, open("foxy-hop.json","w"))'
+            chmod 600 foxy-hop.json
+            "$BIN" run -c foxy-hop.json >> ferrox-relay.log 2>&1 &
+            echo "$!" > foxy-hop.pid
+            wait_port "$2"
+          }
+          start_lane() {
+            FRONT="$1" COUNTRY="$2" CARRIER="$3" PORT="$PORT" UPSTREAM="${4:-}" python3 -c '
+          import json, os
+          token = json.load(open("foxy-pass.json"))["pass"]
+          settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"]}
+          if os.environ["UPSTREAM"]:
+              settings["upstreamProxy"] = os.environ["UPSTREAM"]
+          json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":settings}]}, open("foxy-relay.json","w"))'
+            chmod 600 foxy-relay.json
+            "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
+            echo "$!" > ferrox-relay.pid
+            wait_port "$PORT"
+          }
+          drop_hop() {
+            kill "$(cat foxy-hop.pid)" 2>/dev/null || true
+            rm -f foxy-hop.pid
+          }
+
+          echo "== front: socks over h2 =="
+          start_lane socks "$FOXY_COUNTRY" h2
+          trace_country "$FOXY_COUNTRY"
+          fetch_mb file-socks.bin
+          echo "socks front: 1000000 B"
+          stop_lane
+
+          echo "== front: http over h2 =="
+          start_lane http "$FOXY_COUNTRY" h2
+          curl -sS --max-time 25 -x "http://127.0.0.1:$PORT" https://www.cloudflare.com/cdn-cgi/trace -o trace-http-front.txt
+          grep -qx "loc=$FOXY_COUNTRY" trace-http-front.txt
+          curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" http://www.cloudflare.com/cdn-cgi/trace -o trace-http-plain.txt
+          grep -qx "loc=$FOXY_COUNTRY" trace-http-plain.txt
+          fetch_mb_http file-http.bin
+          echo "http front: 1000000 B"
+          stop_lane
+
+          echo "== front: mixed over h2 =="
+          start_lane mixed "$FOXY_COUNTRY" h2
+          trace_country "$FOXY_COUNTRY"
+          fetch_mb file-mixed.bin
+          echo "mixed front: 1000000 B"
+          stop_lane
+
+          echo "== chained: socks5 upstream over h2 =="
+          start_freedom socks 10810
+          start_lane socks "$FOXY_COUNTRY" h2 "socks5://127.0.0.1:10810"
+          trace_country "$FOXY_COUNTRY"
+          fetch_mb file-up.bin
+          echo "socks5 upstream: 1000000 B"
+          stop_lane
+          drop_hop
+
+          echo "== chained: http upstream over h2 =="
+          start_freedom http 10811
+          start_lane socks "$FOXY_COUNTRY" h2 "http://127.0.0.1:10811"
+          trace_country "$FOXY_COUNTRY"
+          fetch_mb file-http-up.bin
+          echo "http upstream: 1000000 B"
+          stop_lane
+          drop_hop
+
+          # HTTP/3 rides a SOCKS5 UDP association: the association is the only
+          # way a QUIC carrier gets through a hop, so the h3 leg is proven
+          # through one rather than around one.
+          echo "== chained: h3 over the socks5 upstream =="
+          start_freedom socks 10810
+          start_lane socks "$FOXY_COUNTRY" h3 "socks5://127.0.0.1:10810"
+          trace_country "$FOXY_COUNTRY"
+          fetch_mb file-h3-up.bin
+          echo "h3 over socks5 upstream: 1000000 B"
+          stop_lane
+          drop_hop
+
+      - name: Second country and UDP path
         # One runner proves the legs that are about the lane rather than the
-        # platform: a different exit server, the http front the app now serves
-        # itself, and the datagram path. Each restarts the lane, so a failure
-        # names its leg.
+        # platform: a different exit server, and the datagram path. Each
+        # restarts the lane, so a failure names its leg.
         if: steps.secrets.outputs.present == 'true' && matrix.os == 'ubuntu-latest'
         env:
           FOXY_COUNTRY: ${{ inputs.country || 'US' }}
@@ -259,27 +399,8 @@ jobs:
           test "$(wc -c < file-de.bin | tr -d ' ')" = 1000000
           echo "second country DE: 1000000 B"
           stop_lane
-          # The http front the app serves itself: CONNECT carries TLS and
-          # plain GET carries the trace, then 1 MB arrives through it.
-          echo "== http front over h2 =="
-          start_lane http "$FOXY_COUNTRY" h2
-          for i in $(seq 1 24); do
-            if curl -sS --max-time 30 -x "http://127.0.0.1:$PORT" \
-              https://www.cloudflare.com/cdn-cgi/trace -o trace-http-front.txt; then
-              break
-            fi
-            sleep 20
-          done
-          grep -E '^(loc|ip)=' trace-http-front.txt
-          grep -qx "loc=$FOXY_COUNTRY" trace-http-front.txt
-          curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
-            http://www.cloudflare.com/cdn-cgi/trace -o trace-http-plain.txt
-          grep -qx "loc=$FOXY_COUNTRY" trace-http-plain.txt
-          curl -sS --max-time 300 -x "http://127.0.0.1:$PORT" \
-            'https://speed.cloudflare.com/__down?bytes=1000000' -o file-http.bin
-          test "$(wc -c < file-http.bin | tr -d ' ')" = 1000000
-          echo "http front: 1000000 B"
-          stop_lane
+          # The http front the app serves itself is proven on every OS in the
+          # step above; this leg stays with the lane-shaped methods.
           # DNS through the tunnel over UDP. UDP rides H2 CONNECT-UDP whatever
           # the TCP carrier is, so one leg proves it — through a fresh socks
           # lane, because the UDP associate below speaks SOCKS5.
@@ -433,8 +554,11 @@ jobs:
             echo
             echo "Exit country off the tunnel's Cloudflare trace, plus a real"
             echo "1 MB download through the tunnel per carrier (h1, h2, h3,"
-            echo "auto) with its exact byte count and SHA-256 above. Ubuntu"
-            echo "additionally proves a second exit country, the http front,"
-            echo "and the UDP datagram path. The log names the edge, the"
-            echo "carrier that answered, and per-flow relay totals."
+            echo "auto) with its exact byte count and SHA-256 above. Every OS"
+            echo "also proves the socks, http and mixed fronts, and the edge"
+            echo "dial chained through a local socks5 and a local http proxy,"
+            echo "including HTTP/3 over the SOCKS5 UDP association. Ubuntu"
+            echo "additionally proves a second exit country and the UDP"
+            echo "datagram path. The log names the edge, the carrier that"
+            echo "answered, and per-flow relay totals."
           } >> "$GITHUB_STEP_SUMMARY"

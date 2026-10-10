@@ -14,6 +14,12 @@ upstream/*
 # this machine. One contributor's history is not the project's, and committing it
 # would make every other contributor's suppression window wrong.
 .ferrox/
+
+# A lane's account and pass, written by `foxy-connect.sh` under $FOXY_CONF_DIR
+# default ~/.ferrox. A copy checked into the tree would be a checked-in secret,
+# so the script refuses to read one that is tracked and never writes it here.
+/foxy-credentials
+/credentials
 /.freebuff
 .DS_Store
 
