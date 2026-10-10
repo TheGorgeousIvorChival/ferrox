@@ -459,19 +459,40 @@ pub(crate) fn stream_recv_exact(
 /// (Windows schannel, macOS keychain, iOS) covers the platforms where trust
 /// is not a file. `caCertFile` remains where a user names anchors outright,
 /// and `SSL_CERT_FILE` is honoured everywhere.
+/// The unix and Git bundle layouts, read only when the platform store has
+/// nothing to say.
+const BUNDLES: [&str; 10] = [
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/opt/homebrew/etc/ca-certificates/cert.pem",
+    "/usr/local/etc/ca-certificates/cert.pem",
+    "C:/Program Files/Git/mingw64/ssl/certs/ca-bundle.crt",
+    "C:/Program Files/Git/usr/ssl/certs/ca-bundle.crt",
+    "C:/msys64/mingw64/ssl/certs/ca-bundle.crt",
+    "C:/msys64/usr/ssl/certs/ca-bundle.crt",
+];
+
 pub(crate) fn system_roots() -> Vec<Vec<u8>> {
-    const BUNDLES: [&str; 10] = [
-        "/etc/ssl/cert.pem",
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/etc/ssl/ca-bundle.pem",
-        "/opt/homebrew/etc/ca-certificates/cert.pem",
-        "/usr/local/etc/ca-certificates/cert.pem",
-        "C:/Program Files/Git/mingw64/ssl/certs/ca-bundle.crt",
-        "C:/Program Files/Git/usr/ssl/certs/ca-bundle.crt",
-        "C:/msys64/mingw64/ssl/certs/ca-bundle.crt",
-        "C:/msys64/usr/ssl/certs/ca-bundle.crt",
-    ];
+    // The platform store comes first on purpose, and the file bundles second.
+    // On macOS the compatibility files exist with a handful of roots in them,
+    // so a bundle-first order answers with that stub and every edge certificate
+    // that roots anywhere else is an unknown issuer — which is how the macOS
+    // lane lost every handshake while a browser on the same runner reached the
+    // same edge through the keychain. The platform store is the complete set on
+    // every platform this tree serves, and the bundles are what it falls back
+    // to when it has nothing.
+    let native = rustls_native_certs::load_native_certs();
+    let roots: Vec<Vec<u8>> = native
+        .certs
+        .into_iter()
+        .map(|cert| cert.to_vec())
+        .filter(|der| !der.is_empty())
+        .collect();
+    if !roots.is_empty() {
+        return roots;
+    }
     if let Ok(path) = std::env::var("SSL_CERT_FILE") {
         if let Ok(pem) = std::fs::read(&path) {
             let roots = parse_ca_pem(&pem);
@@ -505,18 +526,6 @@ pub(crate) fn system_roots() -> Vec<Vec<u8>> {
         if !roots.is_empty() {
             return roots;
         }
-    }
-    // The platform store itself (Windows schannel, macOS keychain, iOS): file
-    // bundles cover the unix and Git layouts above, this covers the rest.
-    let native = rustls_native_certs::load_native_certs();
-    let roots: Vec<Vec<u8>> = native
-        .certs
-        .into_iter()
-        .map(|cert| cert.to_vec())
-        .filter(|der| !der.is_empty())
-        .collect();
-    if !roots.is_empty() {
-        return roots;
     }
     Vec::new()
 }
