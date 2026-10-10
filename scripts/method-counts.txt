@@ -128,8 +128,11 @@ carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbou
 reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends
 reality-tls client-outbound-rows-dialled 0 ferrox-app-proxy::tests::vless_outbound_with_reality_security_is_skipped
-reality-tls x25519-group-operations-per-authenticated-hello 1 ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one
+reality-tls x25519-shares-recognised 3 ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one
 reality-tls short-id-bytes 8 ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes
+reality-tls cover-origin-dials-per-authenticated-hello 0 ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing
+reality-tls cover-origin-bytes-per-spliced-hello 1 ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte
+reality-tls proxy-protocol-header-bytes 28 ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes
 
 kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these
