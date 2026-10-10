@@ -23,6 +23,23 @@ pub(crate) fn print_x25519() {
     println!("Password (PublicKey): {public}");
 }
 
+/// The published edges, as JSON rows on stdout, so a runner can be measured
+/// against the same addresses the lane dials: host, port, city, country and
+/// nothing else. Reading the catalogue needs the network, which is why this is
+/// a command and not a function the lane calls.
+pub(crate) fn print_foxy_edges(path: &str) {
+    // The config is read to name itself in errors; the catalogue is what this
+    // prints, and it needs no config at all.
+    let _ = std::fs::metadata(path).map_err(|error| exit(&format!("cannot read {path}: {error}")));
+    let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
+    for edge in edges {
+        println!(
+            "{{\"host\":\"{}\",\"port\":{},\"city\":\"{}\",\"country\":\"{}\"}}",
+            edge.host, edge.port, edge.city, edge.country
+        );
+    }
+}
+
 pub(crate) fn serve_file(path: &str) -> ! {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|error| exit(&format!("cannot read {path}: {error}")));
@@ -4983,13 +5000,16 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
 }
 
 /// UDP over the Foxy lane: one CONNECT-UDP stream per destination, opened
-/// lazily on the first datagram. UDP rides H2 only — the H1 upgrade form is
-/// unimplemented and no published edge answers QUIC — so the configured
-/// carrier does not apply here.
+/// lazily on the first datagram. The carrier is HTTP/2 and then HTTP/3, in that
+/// order: the published MASQUE edge answers QUIC on UDP 2499 not at all, so an
+/// edge that does not answer it is a slower flow rather than a refused one, and
+/// HTTP/1.1 has no extended CONNECT to carry it. The configured carrier does
+/// not apply to UDP, because the form the datagram rides is what the edge has
+/// to answer.
 fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
     const POLL: Duration = Duration::from_millis(10);
     let _ = relay.set_read_timeout(Some(POLL));
-    let mut streams: HashMap<SocketAddr, crate::foxy::Tls2> = HashMap::new();
+    let mut streams: HashMap<SocketAddr, crate::foxy::Datagram> = HashMap::new();
     let mut buf = vec![0u8; UDP_BUF];
     let mut datagram = vec![0u8; UDP_BUF];
     let mut reply = Vec::with_capacity(UDP_BUF);
@@ -5010,7 +5030,7 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
                     }
                 }
                 if let Some(lane) = streams.get_mut(&dest) {
-                    if lane.write_datagram(payload).is_err() {
+                    if lane.write(payload).is_err() {
                         streams.remove(&dest);
                     }
                 }
@@ -5020,7 +5040,7 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
         }
         let mut dead = Vec::new();
         for (dest, lane) in &mut streams {
-            match lane.read_datagram(&mut datagram) {
+            match lane.read(&mut datagram) {
                 Ok(0) => {}
                 Ok(n) => {
                     if let Some(src) = client {
@@ -5042,9 +5062,9 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
 }
 
 /// Opens a CONNECT-UDP stream to one destination on the first edge that
-/// answers, H2 only. The pass is read fresh per dial so a renewal between
-/// datagrams is picked up without reopening anything else.
-fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Tls2> {
+/// answers, HTTP/3 first and HTTP/2 next. The pass is read fresh per dial so a
+/// renewal between datagrams is picked up without reopening anything else.
+fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datagram> {
     if edge_limited(&foxy.limited_until, now_secs()) {
         return None;
     }
@@ -5064,33 +5084,60 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Tls2>
             .account
             .as_ref()
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
-        let dial = crate::foxy::FoxyDial {
-            host: edge.host.clone(),
-            port: edge.port,
-            address: foxy.edge_address,
-            carrier: crate::foxy::Carrier::H2,
-            upstream: foxy.upstream.clone(),
-            roots: foxy.roots.clone(),
-            pins: foxy.pins.clone(),
-            pass,
-        };
-        match crate::foxy::open_udp(&dial, &dest.ip().to_string(), dest.port()) {
-            Ok(lane) => {
-                debug_lane(
-                    &edge,
-                    crate::foxy::Carrier::H2,
-                    &format!("udp opened for {dest}"),
-                );
-                clear_limited(&foxy.limited_strikes, &foxy.limited_until);
-                let _ = lane.set_read_quantum(RELAY_QUANTUM);
-                return Some(lane);
+        for carrier in crate::foxy::Carrier::udp_order() {
+            if carrier == crate::foxy::Carrier::H3
+                && foxy
+                    .upstream
+                    .as_ref()
+                    .is_some_and(super::foxy::UpstreamProxy::http)
+            {
+                continue;
             }
-            Err(failure) => {
-                debug_lane(&edge, crate::foxy::Carrier::H2, &failure.to_string());
-                if matches!(failure, ferrox_core::foxy::Failure::Rejected(429)) {
-                    note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
-                    break;
+            let dial = crate::foxy::FoxyDial {
+                host: edge.host.clone(),
+                port: edge.port,
+                address: foxy.edge_address,
+                carrier,
+                upstream: foxy.upstream.clone(),
+                roots: foxy.roots.clone(),
+                pins: foxy.pins.clone(),
+                pass: pass.clone(),
+            };
+            let host = dest.ip().to_string();
+            let failure = match carrier {
+                crate::foxy::Carrier::H3 => {
+                    let quic_dial = foxy_quic_dial(foxy, &edge);
+                    let Some((conn, sock, local, id)) = crate::quic::pooled_stream(&quic_dial)
+                    else {
+                        continue;
+                    };
+                    let quic = (conn, sock, local, id);
+                    match crate::foxy::H3::open_udp(&dial, &host, dest.port(), quic) {
+                        Ok(mut lane) => {
+                            lane.set_read_quantum(RELAY_QUANTUM);
+                            debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
+                            clear_limited(&foxy.limited_strikes, &foxy.limited_until);
+                            return Some(crate::foxy::Datagram::H3(Box::new(
+                                crate::foxy::PooledDatagram::pool(lane, quic_dial, id),
+                            )));
+                        }
+                        Err(failure) => failure,
+                    }
                 }
+                _ => match crate::foxy::open_udp(&dial, &host, dest.port()) {
+                    Ok(lane) => {
+                        let _ = lane.set_read_quantum(RELAY_QUANTUM);
+                        debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
+                        clear_limited(&foxy.limited_strikes, &foxy.limited_until);
+                        return Some(crate::foxy::Datagram::H2(Box::new(lane)));
+                    }
+                    Err(failure) => failure,
+                },
+            };
+            debug_lane(&edge, carrier, &failure.to_string());
+            if matches!(failure, ferrox_core::foxy::Failure::Rejected(429)) {
+                note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
+                break;
             }
         }
     }

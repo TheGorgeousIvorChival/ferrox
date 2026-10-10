@@ -126,43 +126,11 @@ jobs:
           else
             echo "::warning::this runner cannot itself download 1 MB (curl exit $code, ${got:-0} bytes)"
           fi
-      # Which families the edge's authority answers on, with no lane in the
-      # path, and how fast: the lane's dial tries every address the name
-      # spells, so a leg that fails is a statement about this runner's
-      # reachability and not about the lane, and the control is what says
-      # which. The catalogue is read the way the lane reads it, unauthenticated.
-      - name: Edge reachability control - every family of the edge authority
-        if: steps.secrets.outputs.present == 'true'
-        run: |
-          python3 - <<'PY' || true
-          import json, re, socket, time, urllib.request
-          bucket = ("https://firefox.settings.services.mozilla.com/v1/buckets/main"
-                    "/collections/vpn-serverlist/records")
-          body = urllib.request.urlopen(bucket, timeout=25).read().decode()
-          authorities = set(re.findall(r'"host"\s*:\s*"([^"]+)"', body))
-          for authority in sorted(authorities)[:6]:
-              host, _, port = authority.partition(":")
-              for family, label in ((socket.AF_INET, "v4"), (socket.AF_INET6, "v6")):
-                  began = time.time()
-                  answered, number = False, 0
-                  try:
-                      infos = socket.getaddrinfo(host, int(port), family, socket.SOCK_STREAM)
-                  except socket.gaierror:
-                      print(f"edge {authority} {label}: no address", flush=True)
-                      continue
-                  for info in infos:
-                      number += 1
-                      try:
-                          connection = socket.create_connection((info[4][0], int(port)), timeout=10)
-                      except OSError:
-                          continue
-                      connection.close()
-                      answered = True
-                      break
-                  took = round((time.time() - began) * 1000)
-                  print(f"edge {authority} {label}: {number} address(es), "
-                        f"{'answered' if answered else 'refused'} in {took} ms", flush=True)
-          PY
+      # Which families of the edge's own authority answer on this runner, with
+      # no lane in the path: a lane whose dial fails is a statement about this
+      # runner's reachability of the edge port, and the control is what says
+      # which. The addresses come from the same catalogue the lane dials,
+      # through the binary that dials them.
       - name: Download 1 MB through every carrier
         if: steps.secrets.outputs.present == 'true'
         env:
@@ -269,6 +237,53 @@ jobs:
       # hop does. Each leg takes its own port so a lane restart can never meet
       # the listener it replaced, and each asserts the pinned exit country and
       # 1000000 bytes.
+      # What the edge authority answers on this runner, with no lane in the
+      # path: the lane's dial names the address it lost on, and this says
+      # whether the runner reaches that address at all. It runs after the
+      # carrier legs because the lane's log is where the authority it dialed is
+      # written down, and the hostname is what it dialed, so the request here
+      # carries the same name the lane verifies.
+      - name: Edge authority control - what this runner reaches
+        if: always() && steps.secrets.outputs.present == 'true'
+        continue-on-error: true
+        run: |
+          authority="$(grep -oE '[a-z0-9-]+(\.[a-z0-9-]+)+\.[a-z]{2,}:[0-9]{2,5}' ferrox-relay.log 2>/dev/null | head -n 1 || true)"
+          if [ -z "$authority" ]; then
+            echo "edge control: the lane log named no authority" >&2
+            exit 0
+          fi
+          host="${authority%:*}"
+          port="${authority##*:}"
+          echo "edge control: $host:$port"
+          curl -sS --connect-timeout 15 --max-time 40 -o /dev/null \
+            -w 'tls to the edge: %{http_code} in %{time_total}s\n' \
+            "https://$host:$port/cdn-cgi/trace" || echo "curl exit $?"
+          HOST="$host" PORT="$port" python3 - <<'PY'
+          import os, socket, time
+          host, port = os.environ["HOST"], int(os.environ["PORT"])
+          for family, label in ((socket.AF_INET, "v4"), (socket.AF_INET6, "v6")):
+              try:
+                  infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+              except socket.gaierror:
+                  print(f"{label}: no address", flush=True)
+                  continue
+              answered, count = False, 0
+              for info in infos:
+                  count += 1
+                  began = time.time()
+                  try:
+                      connection = socket.create_connection((info[4][0], port), timeout=10)
+                  except OSError as error:
+                      print(f"{label}: {info[4][0]} refused ({error.__class__.__name__})", flush=True)
+                      continue
+                  took = round((time.time() - began) * 1000)
+                  connection.close()
+                  answered = True
+                  print(f"{label}: {info[4][0]} took tcp in {took} ms", flush=True)
+                  break
+              if not answered:
+                  print(f"{label}: {count} address(es), none took tcp", flush=True)
+          PY
       - name: Every front and chained edge dial carries 1 MB
         if: steps.secrets.outputs.present == 'true'
         env:
@@ -520,18 +535,146 @@ jobs:
           echo "second country DE: 1000000 B"
           stop_lane
 
-          # DNS through the tunnel over UDP. UDP rides H2 CONNECT-UDP whatever
-          # the TCP carrier is, so one leg proves it — through a fresh socks
-          # lane, because the UDP associate below speaks SOCKS5.
-          echo "== udp path over h2 =="
+          # DNS through the tunnel over UDP. UDP rides CONNECT-UDP and the lane
+          # prefers the HTTP/3 edge, so the probe below is run over the auto
+          # order — HTTP/3 first, then the HTTP/2 form — each through a fresh
+          # socks lane, because the UDP associate speaks SOCKS5.
+          # The probe is written once and run per carrier: a datagram to the
+          # edge's relay and whatever comes back, NTP and DNS (both refused at
+          # this edge, kept as the policy record) plus a QUIC
+          # Version-Negotiation bait to a :443 target the edge already carries
+          # over TCP. Any answer bytes is the datagram path proven.
+          cat > udp-probe.py <<'PROBE'
+          import os, random, socket, struct
+          port = int(os.environ['SOCKS_PORT'])
+          tcp = socket.create_connection(('127.0.0.1', port), timeout=30)
+          tcp.settimeout(30)
+
+          def recv_exact(sock, n):
+              out = b''
+              while len(out) < n:
+                  chunk = sock.recv(n - len(out))
+                  if not chunk:
+                      raise RuntimeError('eof in handshake')
+                  out += chunk
+              return out
+
+          def udp_addr(packet):
+              atyp = packet[0]
+              if atyp == 1:
+                  return 4 + 2, socket.inet_ntoa(packet[1:5])
+              if atyp == 4:
+                  return 16 + 2, socket.inet_ntop(socket.AF_INET6, packet[1:17])
+              ln = packet[1]
+              return 1 + 1 + ln + 2, packet[2:2 + ln].decode()
+
+          def dns_query(name):
+              qid = random.randint(1, 65534)
+              head = struct.pack('>HHHHHH', qid, 0x0100, 1, 0, 0, 0)
+              body = b''.join(bytes([len(p)]) + p.encode() for p in name.split('.')) + b'\x00'
+              return qid, head + body + struct.pack('>HH', 1, 1)
+
+          def dns_answers(reply, qid):
+              (rid, flags, qd, an, _, _) = struct.unpack('>HHHHHH', reply[:12])
+              assert rid == qid, 'query id came back different'
+              assert flags & 0x000F == 0, 'dns rcode is not zero'
+              assert an > 0, 'no answer records'
+              at = 12
+              for _ in range(qd):
+                  while reply[at] != 0:
+                      at += 1 + reply[at]
+                  at += 5
+              out = []
+              for _ in range(an):
+                  if reply[at] & 0xC0 == 0xC0:
+                      at += 2
+                  else:
+                      while reply[at] != 0:
+                          at += 1 + reply[at]
+                      at += 1
+                  rtype, _, _, rdlen = struct.unpack('>HHIH', reply[at:at + 8])
+                  at += 8
+                  if rtype == 1 and rdlen == 4:
+                      out.append(socket.inet_ntoa(reply[at:at + 4]))
+                  at += rdlen
+              return out
+
+          tcp.sendall(bytes([5, 1, 0]))
+          assert recv_exact(tcp, 2) == b'\x05\x00', 'no method'
+          tcp.sendall(bytes([5, 3, 0, 1, 0, 0, 0, 0, 0, 0]))
+          head = recv_exact(tcp, 4)
+          assert head[:3] == b'\x05\x00\x00', 'associate refused'
+          atyp = head[3]
+          if atyp == 1:
+              relay = ('127.0.0.1', struct.unpack('>H', recv_exact(tcp, 6)[4:6])[0])
+          elif atyp == 4:
+              relay = ('127.0.0.1', struct.unpack('>H', recv_exact(tcp, 18)[16:18])[0])
+          else:
+              ln = recv_exact(tcp, 1)[0]
+              recv_exact(tcp, ln)
+              relay = ('127.0.0.1', struct.unpack('>H', recv_exact(tcp, 2))[0])
+          udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          udp.settimeout(10)
+          bait = b'\xc0\xde\xad\xbe\xef\x08' + os.urandom(8) + b'\x08' + os.urandom(8)
+          bait += b'\x00\x44\x00'
+          bait += bytes(1200 - len(bait))
+          targets = [
+              (b'\x00\x00\x00\x03\x13time.cloudflare.com', 123, 'ntp-name', b'\x1b' + b'\x00' * 47, 48),
+              (b'\x00\x00\x00\x03\x14speed.cloudflare.com', 443, 'quic-vn', bait, 0),
+          ]
+          answers = []
+          for hdr, target_port, name, probe, want in targets:
+              for _ in range(3):
+                  frame = hdr + struct.pack('>H', target_port) + probe
+                  udp.sendto(frame, relay)
+                  try:
+                      packet, _ = udp.recvfrom(65535)
+                  except socket.timeout:
+                      continue
+                  assert packet[:3] == b'\x00\x00\x00', 'bad socks udp header'
+                  hlen, _ = udp_addr(packet[3:])
+                  body = packet[3 + hlen:]
+                  print(name, 'answered', len(body), 'B', flush=True)
+                  if probe is not None and (want == 0 or len(body) == want):
+                      answers.append((name, len(body)))
+                      break
+          qid, query = dns_query('one.one.one.one')
+          name = b'one.one.one.one'
+          udp.sendto(b'\x00\x00\x00\x03' + bytes([len(name)]) + name + struct.pack('>H', 53) + query, relay)
+          try:
+              packet, _ = udp.recvfrom(65535)
+          except socket.timeout:
+              packet = None
+          if packet:
+              assert packet[:3] == b'\x00\x00\x00', 'bad socks udp header'
+              hlen, _ = udp_addr(packet[3:])
+              body = packet[3 + hlen:]
+              if len(body) >= 12 and body[:2] == struct.pack('>H', qid):
+                  answers.append(('dns', dns_answers(body, qid)))
+          assert answers, 'no udp answer through the tunnel'
+          print('udp through the tunnel:', answers)
+          PROBE
+          echo "== udp path over the auto carrier: h3, then h2 =="
           PORT=10818
-          start_lane socks "$PORT" h2 "$COUNTRY"
+          start_lane socks "$PORT" auto "$COUNTRY"
           trace_socks "$PORT" "$COUNTRY"
           # Control first: plain TCP to the DNS port through the same tunnel.
           # A fast connect proves egress; a refusal proves the target, and any
           # UDP verdict below must be read against this line. Names only, no
           # literals: the fixture gate forbids routable addresses in the tree.
           curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
+          SOCKS_PORT="$PORT" python3 udp-probe.py
+          stop_lane
+          # The other form the lane speaks: the same datagram over the HTTP/2
+          # edge the US MASQUE authority publishes, so a runner that never
+          # reaches UDP 2499 still carries UDP rather than refusing it.
+          echo "== udp path over h2 =="
+          PORT=10819
+          start_lane socks "$PORT" h2 "$COUNTRY"
+          trace_socks "$PORT" "$COUNTRY"
+          curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
+          SOCKS_PORT="$PORT" python3 udp-probe.py
+          stop_lane
           SOCKS_PORT="$PORT" python3 - <<'PY'
       - name: Stop the lane and show its log
         if: always() && steps.secrets.outputs.present == 'true'
