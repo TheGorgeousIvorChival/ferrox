@@ -76,7 +76,8 @@ branch has been read, so no duration is quoted.
   so a stream that lands mid-frame reallocates and memcpys once per read.
   `reserve` amortises that. In the good case, where a read lands on a frame
   boundary, the branch was already false and this changes nothing.
-- **NOT attempted: widening the mask loop's stride.** `apply_mask` XORs 16 bytes
+- **Widening the mask loop's stride the naive way is a regression; unrolling the
+  loop over four 16-byte lanes ships.** `apply_mask` XORs 16 bytes
   per iteration, so about a quarter of its work on a long masked frame is loop
   counter and bounds check rather than XOR. Striding 64 bytes was tried — same
   vector op count, same bytes at the same offsets, since 64 is a multiple of the
@@ -86,12 +87,12 @@ branch has been read, so no duration is quoted.
   bytes it is 63 scalar XORs against 3 vector ops plus 15. Every length that is
   not a multiple of 64 is worse, and the lengths that are multiples of 64 are
   unchanged, so the change only ever helped frames that were already
-  vector-aligned. Reverted. Fixing it properly means an inner loop over four
-  16-byte lanes, which is more code than the win is worth without a
-  measurement. `mask_chunks_match_the_byte_loop` is what pins the stride: it
-  compares against the byte loop at 0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64,
-  65, 127, 128, 129, 191, 192, 255, 1 024 and 8 192 — every boundary where a
-  wrong stride shows up.
+  vector-aligned. Reverted. What ships instead keeps the 16-byte op and strides
+  the *loop* 64: four `xor_block` lanes per iteration, the sub-64 remainder
+  through the old 16-loop, scalar tail still under 16 — same vector ops, a
+  quarter of the loop overhead, identical tail by construction since 64, 16 and
+  the tail start are all multiples of the 4-byte mask. `mask_chunks_match_the_byte_loop`
+  pins it against the byte loop at every 16- and 64-boundary ±1.
 - **Two read syscalls per message, unconditionally, forever.** The old
   `frame_head` called `read_exact` for 2 bytes, then `read_exact` again for the
   extended length and the mask, then `read_exact` for the payload. Comparing the
