@@ -176,7 +176,6 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
             Ok(tls) => return Ok(tls),
             Err(failure) => {
                 debug_address(peer, &failure.to_string());
-                continue;
             }
         }
     }
