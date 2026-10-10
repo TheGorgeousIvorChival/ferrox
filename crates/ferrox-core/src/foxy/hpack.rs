@@ -171,7 +171,7 @@ pub(crate) fn integer(out: &mut Vec<u8>, prefix: u8, mask: u8, value: usize) {
 /// The same integer as `integer`, continued into the byte the pattern already
 /// occupies rather than a new one — the one form QPACK uses for a field name,
 /// where the low bits of the pattern byte are the length prefix.
-fn integer_into(out: &mut Vec<u8>, prefix: u8, value: usize) {
+pub(crate) fn integer_into(out: &mut Vec<u8>, prefix: u8, value: usize) {
     let max = (1usize << prefix) - 1;
     let slot = out.len() - 1;
     if value < max {

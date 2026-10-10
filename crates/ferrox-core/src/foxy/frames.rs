@@ -207,6 +207,43 @@ pub fn quic_varint(out: &mut Vec<u8>, value: u64) {
     }
 }
 
+/// The bytes a QUIC varint takes, so a length can be named before the bytes it
+/// counts are written.
+pub fn quic_varint_len(value: u64) -> usize {
+    match value {
+        0..=63 => 1,
+        64..=16_383 => 2,
+        16_384..=1_073_741_823 => 4,
+        _ => 8,
+    }
+}
+
+/// The same varint written into a fixed buffer, which is how a frame header
+/// travels beside a payload that already has a home: the lane would otherwise
+/// stage the payload in a buffer to have somewhere to put the header first.
+///
+/// The first byte carries the length tag and the value's top six bits, and
+/// every byte after it is a whole eight — the split `quic_varint` writes.
+pub fn quic_varint_into(out: &mut [u8; 9], value: u64) -> usize {
+    let len = quic_varint_len(value);
+    if len == 1 {
+        out[0] = value as u8;
+        return len;
+    }
+    let tag = match len {
+        2 => 0x40_u8,
+        4 => 0x80,
+        _ => 0xc0,
+    };
+    let mut rest = value;
+    for byte in out[1..len].iter_mut().rev() {
+        *byte = rest as u8;
+        rest >>= 8;
+    }
+    out[0] = tag | rest as u8;
+    len
+}
+
 #[must_use]
 pub fn quic_read(bytes: &[u8], at: &mut usize) -> Option<u64> {
     let first = *bytes.get(*at)?;
@@ -272,6 +309,31 @@ pub fn h3_event(frame: H3Frame, payload: &[u8]) -> H3Event<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixed-buffer varint and the `Vec` one are the same bytes at every
+    /// width: a header sent in two pieces has to be the frame a single write
+    /// would have been.
+    #[test]
+    fn the_fixed_buffer_varint_is_the_vec_one() {
+        for value in [
+            0u64,
+            1,
+            63,
+            64,
+            16_383,
+            16_384,
+            1_073_741_823,
+            1_073_741_824,
+            65_535,
+            1_234_567,
+        ] {
+            let mut vec = Vec::new();
+            quic_varint(&mut vec, value);
+            let mut fixed = [0u8; 9];
+            let len = quic_varint_into(&mut fixed, value);
+            assert_eq!(vec, fixed[..len], "{value}");
+        }
+    }
 
     const END_HEADERS: u8 = 0x4;
 

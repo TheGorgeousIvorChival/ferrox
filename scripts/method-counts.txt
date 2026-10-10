@@ -108,6 +108,18 @@ carrier-xhttp read-syscalls-per-16KiB-chunk 2 ferrox-app-xhttp::tests::a_chunk_c
 carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback
 
+carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
+carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
+carrier-foxy read-buffer-bytes-per-staged-remainder 1 ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for
+carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
+carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
+carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
+carrier-foxy capsules-reassembled-across-frames 1 ferrox-app-foxy::loopback::a_capsule_split_over_frames_reassembles_as_one_datagram
+carrier-foxy stream-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes
+carrier-foxy server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
+carrier-foxy dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
+
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
 carrier-quic server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake

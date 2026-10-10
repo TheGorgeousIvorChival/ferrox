@@ -8,6 +8,10 @@
 # appear in a callgrind profile; that row is reported as not found and the next
 # name up is the one to try.
 #
+# A symbol reported as `not found` inlined into its caller under release: the
+# row is then noise, and the name up is the one to try. `ferrox_app::foxy::read_frame`
+# and `masque::datagram_encode` are the two that survive for this method.
+#
 # `doc  test filter  symbol`
 record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::record::fill_exact
 record-layer  record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted  ferrox_core::record::fill_exact_with_head
@@ -21,6 +25,8 @@ vmess  vmess::tests::frames_seal_to_stable_bytes  vmess::read_frame
 trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode_trojan_request
 vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
 xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
+carrier-foxy  foxy::loopback::the_http2_carrier_writes_one_literal_header_block_and_relays  foxy::read_frame
+carrier-foxy  foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram  masque::datagram_encode
 carrier-websocket  ws::tests::a_read_covers_a_window_not_one_frame_header  ws::WsReader::pull
 carrier-websocket  ws::tests::frames_round_trip_masked_and_plain  ws::write_frame
 carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::apply_mask
