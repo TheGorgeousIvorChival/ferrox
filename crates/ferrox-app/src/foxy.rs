@@ -174,10 +174,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
         let _ = stream.set_nodelay(true);
         match finish_tls(dial, stream) {
             Ok(tls) => return Ok(tls),
-            Err(failure) => {
-                debug_address(peer, &failure.to_string());
-                continue;
-            }
+            Err(failure) => debug_address(peer, &failure.to_string()),
         }
     }
     if tried > 1 {
