@@ -233,3 +233,140 @@ fn the_quic_lane_reaches_the_edge_over_udp_or_says_why_not() {
         None => println!("no h3 handshake with {} over udp/{}", edge.host, edge.port),
     }
 }
+
+/// What the edge does with a second CONNECT on one connection, which is the
+/// question the lane's HTTP/2 pool stands on: one handshake for every flow is
+/// only worth building if the edge takes the streams.
+///
+/// No loopback edge can answer it, and the account's own behaviour is the only
+/// evidence. This dials one session, sends two CONNECTs on it (stream 1 and
+/// stream 3, the two odd ids a client owns) and prints what each one got, so
+/// the verdict is a recorded answer rather than a reading of a reference.
+#[test]
+#[ignore = "needs a Firefox account and the network; run by foxy-live.yml"]
+fn a_second_connect_stream_on_one_session_names_what_the_edge_does() {
+    let email = std::env::var("FOXY_EMAIL").unwrap_or_default();
+    let password = std::env::var("FOXY_PASS").unwrap_or_default();
+    let country = std::env::var("FOXY_COUNTRY").unwrap_or_else(|_| "US".to_owned());
+    assert!(
+        !email.is_empty(),
+        "FOXY_EMAIL is the account to sign in with"
+    );
+    assert!(!password.is_empty(), "FOXY_PASS is its password");
+
+    let Some(account) = account() else {
+        panic!("the account plane URLs are not the ones this tree knows");
+    };
+    account.sign_in(&email, &password).expect("signs in");
+    if account.needs_code() {
+        let code = std::env::var("FOXY_CODE").expect("FOXY_CODE is the emailed code");
+        account.verify_code(&code).expect("verifies");
+    }
+    account.renew().expect("mints a pass");
+    let pass = account.current();
+
+    let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
+    let picked = ferrox_core::foxy::catalog::tier(&edges, &country, "", 3);
+    let edge = picked
+        .first()
+        .unwrap_or_else(|| panic!("the catalogue publishes no edge for {country}"));
+    let dial = FoxyDial {
+        host: edge.host.clone(),
+        port: edge.port,
+        address: None,
+        carrier: Carrier::H2,
+        upstream: None,
+        roots: crate::quic::system_roots(),
+        pins: ferrox_core::foxy::pin::Pins::default(),
+        pass: pass.clone(),
+    };
+
+    // Both CONNECTs ask for the same target, so the only difference between
+    // them is the stream the edge answers on.
+    let target = format!("{PROBE_HOST}:80");
+    let mut session = crate::foxy::raw_h2_session(&dial).expect("one H2 session to the edge");
+    let first = ask_stream(&mut session, 1, &target, &dial.pass.token);
+    let second = ask_stream(&mut session, 3, &target, &dial.pass.token);
+    println!("stream 1 answered {first:?}, stream 3 answered {second:?}");
+    assert!(
+        first.is_some(),
+        "the first stream on a session the edge accepted carries a status"
+    );
+    assert!(
+        second.is_some(),
+        "the edge takes one CONNECT per H2 session: a pool would carry flows on streams it \
+         never answers, so P48 stays reverted and P50 keeps recording this"
+    );
+    println!("the edge answers a second CONNECT on the same session, so the session can be pooled");
+}
+
+/// One CONNECT on one stream of an open session, and the status it answers
+/// with: `None` when the edge resets it or never answers at all, which are the
+/// two ways this probe can say no.
+fn ask_stream(
+    session: &mut (impl Read + Write),
+    stream: u32,
+    target: &str,
+    token: &str,
+) -> Option<u16> {
+    let mut block = Vec::with_capacity(96 + token.len());
+    ferrox_core::foxy::hpack::hpack_connect(target, token, &mut block);
+    let mut head = Vec::with_capacity(frames::H2_HEADER + block.len());
+    let frame = ferrox_core::foxy::frames::H2Frame {
+        kind: ferrox_core::foxy::frames::HEADERS,
+        flags: 0x4,
+        stream,
+        length: block.len() as u32,
+    };
+    head.extend_from_slice(&frame.header());
+    head.extend_from_slice(&block);
+    session.write_all(&head).ok()?;
+    session.flush().ok()?;
+    let deadline = Instant::now() + READ;
+    while Instant::now() < deadline {
+        let mut header = [0u8; frames::H2_HEADER];
+        read_frames_exact(session, &mut header).ok()?;
+        let frame = ferrox_core::foxy::frames::H2Frame::parse(&header)?;
+        let mut payload = vec![0u8; frame.length as usize];
+        read_frames_exact(session, &mut payload).ok()?;
+        match ferrox_core::foxy::frames::h2_event(frame, &payload, stream) {
+            ferrox_core::foxy::frames::H2Event::Headers { block, .. } => {
+                return ferrox_core::foxy::hpack::hpack_status(block);
+            }
+            ferrox_core::foxy::frames::H2Event::Reset { .. } => {
+                println!("stream {stream}: the edge reset it");
+                return None;
+            }
+            ferrox_core::foxy::frames::H2Event::Settings { ack: false, .. } => {
+                let mut ack = Vec::new();
+                let frame = ferrox_core::foxy::frames::H2Frame {
+                    kind: ferrox_core::foxy::frames::SETTINGS,
+                    flags: 0x1,
+                    stream: 0,
+                    length: 0,
+                };
+                ack.extend_from_slice(&frame.header());
+                session.write_all(&ack).ok()?;
+            }
+            _ => {}
+        }
+    }
+    println!("stream {stream}: no answer within {READ:?}");
+    None
+}
+
+use ferrox_core::foxy::frames;
+
+fn read_frames_exact(
+    stream: &mut (impl Read + ?Sized),
+    mut into: &mut [u8],
+) -> std::io::Result<()> {
+    while !into.is_empty() {
+        match stream.read(into) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(n) => into = &mut into[n..],
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}

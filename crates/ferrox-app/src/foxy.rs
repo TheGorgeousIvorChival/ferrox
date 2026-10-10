@@ -676,6 +676,41 @@ impl Tls2 {
     }
 }
 
+/// One HTTP/2 session to the edge with the opening already written and no
+/// stream on it yet, for the check that asks the edge what it does with a
+/// second CONNECT: the answer decides whether the lane can pool the session
+/// (`P48`) or must dial per flow (`P50`), and no loopback edge can stand in
+/// for the real one.
+#[cfg(test)]
+pub(crate) fn raw_h2_session(
+    dial: &FoxyDial,
+) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    let stream = tcp(dial)?;
+    let mut tls = ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream)
+        .map_err(|_| Failure::Io)?;
+    tls.handshake().map_err(|_| Failure::Io)?;
+    negotiated(&tls, dial)?;
+    let mut opening = Vec::with_capacity(48);
+    opening.extend_from_slice(frames::PREFACE);
+    h2_frame(
+        frames::SETTINGS,
+        0,
+        0,
+        &frames::client_settings(),
+        &mut opening,
+    );
+    h2_frame(
+        frames::WINDOW_UPDATE,
+        0,
+        0,
+        &(frames::WINDOW - frames::DEFAULT_WINDOW).to_be_bytes(),
+        &mut opening,
+    );
+    tls.write_all(&opening).map_err(|_| Failure::Io)?;
+    tls.flush().map_err(|_| Failure::Io)?;
+    Ok(tls)
+}
+
 impl Write for Tls2 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.fin {

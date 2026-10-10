@@ -96,6 +96,19 @@ jobs:
       # What the account host actually presents, and how much of the runner's
       # bundle the lane read. A refusal with no issuer in it is a refusal nobody
       # can act on.
+      # What the edge does with a second CONNECT on one HTTP/2 session: the
+      # lane's session pool stands on the answer, so it is asked of the real
+      # edge rather than read out of a reference.
+      - name: Two CONNECT streams on one session
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_CODE: ${{ secrets.FOXY_CODE }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
+        run: |
+          cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
+            foxy_live::a_second_connect_stream_on_one_session_names_what_the_edge_does
       - name: What the account host presents
         if: always() && steps.secrets.outputs.present == 'true'
         continue-on-error: true
