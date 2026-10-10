@@ -585,6 +585,27 @@ fn h2_keepalive(session: &Weak<Mutex<H2Session>>) {
     }
 }
 
+/// Which stream the edge reset, and with what error code, behind FOXY_DEBUG:
+/// REFUSED_STREAM (0x7) says the edge will not carry this stream now,
+/// PROTOCOL_ERROR (0x1) says this lane wrote something wrong, FLOW_CONTROL_ERROR
+/// (0x3) says the windows disagree, and nothing else diagnoses the refusal.
+fn debug_lane_code(stream: u32, code: u32) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        let named = if code == 0x7 {
+            "REFUSED_STREAM"
+        } else if code == 0x1 {
+            "PROTOCOL_ERROR"
+        } else if code == 0x5 {
+            "STREAM_CLOSED"
+        } else if code == 0x3 {
+            "FLOW_CONTROL_ERROR"
+        } else {
+            "unnamed"
+        };
+        eprintln!("foxy-debug: stream {stream} reset by the edge with {code:#x} ({named})");
+    }
+}
+
 fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8], out: &mut Vec<u8>) {
     let frame = frames::H2Frame {
         kind,
@@ -772,7 +793,13 @@ impl Tls2 {
                             }
                             Err(Failure::Stream)
                         }
-                        frames::H2Event::Reset { .. } => Err(Failure::Stream),
+                        // The edge names why it refused the stream, and the
+                        // code is the whole diagnosis: REFUSED_STREAM is a
+                        // lane that must not pool, PROTOCOL_ERROR is ours.
+                        frames::H2Event::Reset { code } => {
+                            debug_lane_code(lane.stream, code);
+                            Err(Failure::Stream)
+                        }
                         // A status larger than one frame arrives in pieces: each
                         // fragment is appended and the block is read once the
                         // peer's `END_HEADERS` says it is whole.
