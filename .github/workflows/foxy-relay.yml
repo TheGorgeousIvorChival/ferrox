@@ -131,8 +131,11 @@ jobs:
       # runner's reachability of the edge port, and the control is what says
       # which. The addresses come from the same catalogue the lane dials,
       # through the binary that dials them.
+      # A measurement, not a gate: a control that cannot measure must not be
+      # what turns a green lane red.
       - name: Edge reachability control - every family of the edge authority
         if: steps.secrets.outputs.present == 'true'
+        continue-on-error: true
         run: |
           BIN=target/debug/ferrox-app
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
