@@ -23,6 +23,23 @@ pub(crate) fn print_x25519() {
     println!("Password (PublicKey): {public}");
 }
 
+/// The published edges, as JSON rows on stdout, so a runner can be measured
+/// against the same addresses the lane dials: host, port, city, country and
+/// nothing else. Reading the catalogue needs the network, which is why this is
+/// a command and not a function the lane calls.
+pub(crate) fn print_foxy_edges(path: &str) {
+    // The config is read to name itself in errors; the catalogue is what this
+    // prints, and it needs no config at all.
+    let _ = std::fs::metadata(path).map_err(|error| exit(&format!("cannot read {path}: {error}")));
+    let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
+    for edge in edges {
+        println!(
+            "{{\"host\":\"{}\",\"port\":{},\"city\":\"{}\",\"country\":\"{}\"}}",
+            edge.host, edge.port, edge.city, edge.country
+        );
+    }
+}
+
 pub(crate) fn serve_file(path: &str) -> ! {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|error| exit(&format!("cannot read {path}: {error}")));

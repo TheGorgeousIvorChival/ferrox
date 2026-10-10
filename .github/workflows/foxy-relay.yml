@@ -129,35 +129,28 @@ jobs:
       # Which families of the edge's own authority answer on this runner, with
       # no lane in the path: a lane whose dial fails is a statement about this
       # runner's reachability of the edge port, and the control is what says
-      # which. Read from the same catalogue the lane reads, so the test is of
-      # the address the lane would dial.
+      # which. The addresses come from the same catalogue the lane dials,
+      # through the binary that dials them.
       - name: Edge reachability control - every family of the edge authority
         if: steps.secrets.outputs.present == 'true'
         run: |
-          python3 - <<'PY' || true
-          import json, socket, time, urllib.request
-          bucket = ("https://firefox.settings.services.mozilla.com/v1/buckets/main"
-                    "/collections/vpn-serverlist/records")
-          body = urllib.request.urlopen(bucket, timeout=25).read().decode()
-          rows = json.loads(body).get("data", [])
-          pairs = set()
-          for row in rows:
-              stack = [row]
-              while stack:
-                  node = stack.pop()
-                  if isinstance(node, dict):
-                      if "host" in node and "port" in node:
-                          pairs.add((str(node["host"]), int(node["port"])))
-                      stack.extend(node.values())
-                  elif isinstance(node, list):
-                      stack.extend(node)
-          if not pairs:
-              print("edge reachability control: the catalogue named no host/port pair")
-          for host, port in sorted(pairs)[:4]:
+          BIN=target/debug/ferrox-app
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          python3 -c 'import json,os; json.dump({"inbounds":[],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"code":os.environ.get("FOXY_CODE",""),"country":os.environ["FOXY_COUNTRY"],"carrier":"h2"}}]}, open("foxy-probe.json","w"))'
+          "$BIN" edges -c foxy-probe.json | python3 -c '
+          import json, socket, sys, time
+          seen = set()
+          for line in sys.stdin:
+              try:
+                  edge = json.loads(line)
+              except ValueError:
+                  continue
+              host, port = edge["host"], int(edge["port"])
+              if (host, port) in seen:
+                  continue
+              seen.add((host, port))
               for family, label in ((socket.AF_INET, "v4"), (socket.AF_INET6, "v6")):
-                  began = time.time()
-                  count = 0
-                  answered = False
+                  began, count, answered = time.time(), 0, False
                   try:
                       infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
                   except socket.gaierror:
@@ -175,7 +168,9 @@ jobs:
                   took = round((time.time() - began) * 1000)
                   print(f"edge {host}:{port} {label}: {count} address(es), "
                         f"{'answered' if answered else 'refused'} in {took} ms", flush=True)
-          PY
+          if not seen:
+              print("edge control: the catalogue published no edge", flush=True)
+          '
       - name: Download 1 MB through every carrier
         if: steps.secrets.outputs.present == 'true'
         env:

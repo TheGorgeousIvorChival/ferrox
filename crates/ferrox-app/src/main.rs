@@ -159,6 +159,17 @@ fn main() {
             }
             proxy::mint_foxy_pass(&config, &out);
         }
+        "edges" => {
+            let next = args.next().unwrap_or_else(|| usage());
+            if next != "-c" && next != "-config" {
+                usage();
+            }
+            let config = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            proxy::print_foxy_edges(&config);
+        }
         "x25519" => {
             if args.next().is_some() {
                 usage();
