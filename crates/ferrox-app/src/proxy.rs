@@ -1245,6 +1245,7 @@ fn serve_session_ws<R: Read, W: FrameWrite + 'static>(
         echo_trace("session ws uplink refused");
         return;
     };
+    echo_trace(&format!("session ws uplink {target}"));
     if !cwriter.send(&[0, 0]) {
         echo_trace("session ws vless response refused");
         return;
@@ -6188,6 +6189,9 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
         loop {
             match peer_read.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    if echo_trace_on() && first {
+                        echo_trace("relay fwd first read");
+                    }
                     let sent = uplink.send(&buf[..n]);
                     if echo_trace_on() && first {
                         echo_trace(if sent {
