@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use super::{Stream, TlsError, TlsProvider};
@@ -24,12 +25,85 @@ const ED25519_SEED: [u8; 32] = [
     0x2d, 0x65, 0x64, 0x32, 0x35, 0x31, 0x39, 0x2d, 0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x63,
 ];
 
-#[derive(Debug, Clone)]
+/// How fast the cover origin may be fed once a splice has passed `after_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub after_bytes: u64,
+    pub bytes_per_sec: u64,
+    pub burst_bytes_per_sec: u64,
+}
+
+/// The cover origin an unauthenticated peer is spliced into, dialled lazily so
+/// that an authenticated client costs the real site nothing.
+#[derive(Debug, Clone, Default)]
 pub struct RealityServerConfig {
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
     pub server_names: Vec<String>,
     pub max_time_skew: Option<Duration>,
+    pub min_client_ver: Option<[u8; 3]>,
+    pub max_client_ver: Option<[u8; 3]>,
+    pub limit_fallback_upload: Option<RateLimit>,
+    pub limit_fallback_download: Option<RateLimit>,
+    pub dest: Option<String>,
+    pub xver: u8,
+    pub show: bool,
+}
+
+/// The two ends of a socket, for the PROXY-protocol header a cover origin is
+/// sent before anything else: `local` is the source the cover origin sees and
+/// `peer` the destination it was dialled on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Edges {
+    pub peer: Option<SocketAddr>,
+    pub local: Option<SocketAddr>,
+}
+
+impl Edges {
+    pub fn of(io: &TcpStream) -> Self {
+        Self {
+            peer: io.peer_addr().ok(),
+            local: io.local_addr().ok(),
+        }
+    }
+}
+
+/// What the server answers with once the `ClientHello` has been read: either an
+/// authenticated session, or the splice that carries an unauthenticated peer to
+/// the cover origin it asked for.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the session holds the TLS stack and the splice holds two sockets; boxing either would add a pointer chase to every handshake"
+)]
+pub enum RealityAccept<S: Stream> {
+    Session(RealityServer<S>),
+    Proxied(Proxied<S>),
+}
+
+impl<S: Stream> std::fmt::Debug for RealityAccept<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Session(_) => f.write_str("RealityAccept::Session"),
+            Self::Proxied(_) => f.write_str("RealityAccept::Proxied"),
+        }
+    }
+}
+
+/// An unauthenticated peer and the cover origin it is now being spliced into.
+pub struct Proxied<S: Stream> {
+    pub client: S,
+    pub target: TcpStream,
+    pub upload: Option<RateLimit>,
+    pub download: Option<RateLimit>,
+}
+
+impl<S: Stream> std::fmt::Debug for Proxied<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Proxied")
+            .field("upload", &self.upload)
+            .field("download", &self.download)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -38,10 +112,20 @@ pub struct RealityServer<S: Stream> {
 }
 
 impl<S: Stream> RealityServer<S> {
-    pub fn accept(cfg: &RealityServerConfig, now: u64, io: S) -> Result<Self, TlsError> {
+    /// Reads the `ClientHello`, authenticates it, and answers with the session or
+    /// with the splice. A hello that does not authenticate and has no cover
+    /// origin configured is an error, which is the whole of a refusal.
+    pub fn accept(
+        cfg: &RealityServerConfig,
+        now_ms: u64,
+        io: S,
+        edges: Edges,
+    ) -> Result<RealityAccept<S>, TlsError> {
         let mut replay = Replay::new(io);
         let (raw, hello) = read_client_hello(&mut replay)?;
-        let auth_key = authenticate(cfg, &hello, now)?;
+        let Ok(auth_key) = authenticate(cfg, &hello, now_ms) else {
+            return splice(cfg, replay.into_inner(), &raw, edges);
+        };
         let identity = super::TlsServerConfig {
             alpn: Vec::new(),
             cert_chain: vec![bound_certificate(&auth_key, first_name(cfg))],
@@ -49,9 +133,9 @@ impl<S: Stream> RealityServer<S> {
             key_kind: super::ServerKeyKind::Pkcs8,
         };
         replay.set_prefix(&raw);
-        Ok(Self {
+        Ok(RealityAccept::Session(Self {
             inner: RustlsServerProvider::accept(&identity, replay)?,
-        })
+        }))
     }
 
     pub fn get_ref(&self) -> &S {
@@ -93,6 +177,114 @@ impl<S: Stream> Write for RealityServer<S> {
     }
 }
 
+/// Dials the cover origin, hands it the hello the server read, and answers with
+/// the splice. The dial is lazy on purpose: an authenticated client never costs
+/// the real site a connection, and neither does a port scanner.
+fn splice<S: Stream>(
+    cfg: &RealityServerConfig,
+    io: S,
+    hello: &[u8],
+    edges: Edges,
+) -> Result<RealityAccept<S>, TlsError> {
+    let Some(dest) = cfg.dest.as_deref() else {
+        return Err(TlsError::Other(format!(
+            "{}: refused, no cover origin configured",
+            cfg.server_names.first().map_or("reality", String::as_str)
+        )));
+    };
+    let refused = |why: &str| TlsError::Other(format!("reality: cover origin, {why}"));
+    let mut target = TcpStream::connect(dest).map_err(|_| refused("unreachable"))?;
+    if cfg.xver > 0 {
+        proxy_protocol(&mut target, cfg.xver, edges).map_err(|_| refused("proxy protocol"))?;
+    }
+    target.write_all(hello).map_err(|_| refused("hello"))?;
+    target.flush().map_err(|_| refused("hello"))?;
+    Ok(RealityAccept::Proxied(Proxied {
+        client: io,
+        target,
+        upload: cfg.limit_fallback_upload,
+        download: cfg.limit_fallback_download,
+    }))
+}
+
+fn narrow(edge: &SocketAddr) -> [u8; 4] {
+    match edge.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || v6.octets()[12..].try_into().unwrap_or([0; 4]),
+            |v4| v4.octets(),
+        ),
+    }
+}
+
+fn wide(edge: &SocketAddr) -> [u8; 16] {
+    match edge.ip() {
+        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        std::net::IpAddr::V6(v6) => v6.octets(),
+    }
+}
+
+/// The PROXY-protocol header, either the text form or the binary one, written
+/// before the hello so the cover origin sees who really connected.
+fn proxy_protocol(target: &mut TcpStream, version: u8, edges: Edges) -> Result<(), std::io::Error> {
+    match version {
+        1 => {
+            let line = match (edges.local, edges.peer) {
+                (Some(local), Some(peer)) => {
+                    let family = if local.is_ipv4() && peer.is_ipv4() {
+                        "TCP4"
+                    } else {
+                        "TCP6"
+                    };
+                    format!(
+                        "PROXY {family} {} {} {} {}\r\n",
+                        local.ip(),
+                        peer.ip(),
+                        local.port(),
+                        peer.port()
+                    )
+                }
+                _ => "PROXY UNKNOWN\r\n".to_owned(),
+            };
+            target.write_all(line.as_bytes())
+        }
+        2 => {
+            const MAGIC: [u8; 12] = [
+                0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
+            ];
+            let mut body = Vec::with_capacity(36);
+            if let (Some(local), Some(peer)) = (edges.local, edges.peer) {
+                let four = local.is_ipv4() && peer.is_ipv4();
+                let (near, far) = if four {
+                    (narrow(&local).to_vec(), narrow(&peer).to_vec())
+                } else {
+                    (Vec::from(wide(&local)), Vec::from(wide(&peer)))
+                };
+                body.extend_from_slice(&near);
+                body.extend_from_slice(&far);
+                body.extend_from_slice(&local.port().to_be_bytes());
+                body.extend_from_slice(&peer.port().to_be_bytes());
+                let fam = if four { 0x11 } else { 0x21 };
+                target.write_all(&MAGIC)?;
+                target.write_all(&[0x21, fam])?;
+            } else {
+                body.extend_from_slice(&[0; 12]);
+                target.write_all(&MAGIC)?;
+                target.write_all(&[0x20, 0x30])?;
+            }
+            let rest = u16::try_from(body.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "oversized proxy header")
+            })?;
+            target.write_all(&rest.to_be_bytes())?;
+            target.write_all(&body)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported proxy protocol version",
+        )),
+    }
+}
+
 struct Replay<S> {
     prefix: Vec<u8>,
     at: usize,
@@ -112,6 +304,10 @@ impl<S> Replay<S> {
         self.prefix.clear();
         self.prefix.extend_from_slice(bytes);
         self.at = 0;
+    }
+
+    fn into_inner(self) -> S {
+        self.io
     }
 
     fn transport(&self) -> &S {
@@ -157,7 +353,7 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, ClientHello), TlsE
     let mut bytes: Vec<u8> = Vec::new();
     let mut header = [0u8; 5];
     loop {
-        if io.read_exact(&mut header).is_err() {
+        if !read_fully(io, &mut header) {
             return Err(TlsError::Closed);
         }
         if header[0] != 0x16 {
@@ -173,7 +369,7 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, ClientHello), TlsE
         }
         let at = bytes.len();
         bytes.resize(at + len, 0);
-        if io.read_exact(&mut bytes[at..]).is_err() {
+        if !read_fully(io, &mut bytes[at..]) {
             return Err(TlsError::Closed);
         }
         raw.extend_from_slice(&header);
@@ -187,6 +383,26 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, ClientHello), TlsE
     }
 }
 
+pub(crate) fn read_fully<R: Read>(io: &mut R, buf: &mut [u8]) -> bool {
+    let mut at = 0;
+    while at < buf.len() {
+        match io.read(&mut buf[at..]) {
+            Ok(0) => return false,
+            Ok(n) => at += n,
+            Err(error) if waiting(&error) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn waiting(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 fn hello_is_whole(bytes: &[u8]) -> Option<usize> {
     if bytes.first()? != &0x01 || bytes.len() < 4 {
         return None;
@@ -198,7 +414,7 @@ fn hello_is_whole(bytes: &[u8]) -> Option<usize> {
 fn authenticate(
     cfg: &RealityServerConfig,
     hello: &ClientHello,
-    now: u64,
+    now_ms: u64,
 ) -> Result<[u8; 32], TlsError> {
     let refused = |why: &str| -> TlsError { TlsError::Other(format!("reality: refused, {why}")) };
     if hello.session_id.1 != 32 {
@@ -234,13 +450,19 @@ fn authenticate(
         .map_err(|_| refused("tag"))?;
     plain.copy_from_slice(&opened);
 
+    let client_ver = [plain[0], plain[1], plain[2]];
+    if cfg.min_client_ver.is_some_and(|lo| client_ver < lo)
+        || cfg.max_client_ver.is_some_and(|hi| client_ver > hi)
+    {
+        return Err(refused("client version"));
+    }
     let short_id = std::array::from_fn(|i| plain[8 + i]);
     if !cfg.short_ids.contains(&short_id) {
         return Err(refused("short id"));
     }
     if let Some(skew) = cfg.max_time_skew {
-        let sent = u64::from(u32::from_be_bytes([plain[4], plain[5], plain[6], plain[7]]));
-        if now.abs_diff(sent) > skew.as_secs() {
+        let sent = u64::from(u32::from_be_bytes([plain[4], plain[5], plain[6], plain[7]])) * 1000;
+        if now_ms.abs_diff(sent) > u64::try_from(skew.as_millis()).unwrap_or(u64::MAX) {
             return Err(refused("clock"));
         }
     }
@@ -523,6 +745,7 @@ mod tests {
             short_ids: vec![SHORT_ID],
             server_names: vec![SNI.to_owned()],
             max_time_skew: None,
+            ..RealityServerConfig::default()
         }
     }
 
@@ -615,19 +838,66 @@ mod tests {
         out
     }
 
-    fn offer(cfg: &RealityServerConfig, now: u64, bytes: &[u8]) -> bool {
+    /// How long the cover origin is given to hand back what it was sent, which
+    /// is the only boundary on reading a splice whose peer has nothing more to
+    /// say.
+    const COVER_WAIT: Duration = Duration::from_millis(400);
+
+    struct Verdict {
+        authenticated: bool,
+        dialled: usize,
+        cover: Vec<u8>,
+    }
+
+    fn offer(cfg: &RealityServerConfig, now_ms: u64, hello: &[u8]) -> Verdict {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
+        let cover = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let mut cfg = cfg.clone();
+        cfg.dest = Some(cover.local_addr().expect("addr").to_string());
         let settings = cfg.clone();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            RealityServer::accept(&settings, now, stream)
+            RealityServer::accept(&settings, now_ms, stream, Edges::default()).ok()
         });
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        client.write_all(bytes).expect("writes");
+        client.write_all(hello).expect("writes");
         client.flush().expect("flushes");
         let _ = client.shutdown(std::net::Shutdown::Write);
-        server.join().expect("joins").is_ok()
+        let answer = server.join().expect("joins");
+        let authenticated = matches!(answer, Some(RealityAccept::Session(_)));
+        let mut dialled = 0;
+        let mut seen = Vec::new();
+        cover.set_nonblocking(true).expect("nonblocking");
+        if let Ok((mut site, _)) = cover.accept() {
+            dialled += 1;
+            site.set_nonblocking(false).expect("blocking");
+            site.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
+            let mut once = [0u8; 4096];
+            loop {
+                match site.read(&mut once) {
+                    Ok(0) | Err(_) => break,
+                    Ok(took) => seen.extend_from_slice(&once[..took]),
+                }
+            }
+        }
+        Verdict {
+            authenticated,
+            dialled,
+            cover: seen,
+        }
+    }
+
+    fn accepted(now_ms: u64, bytes: &[u8]) -> bool {
+        offer(&settings(), now_ms, bytes).authenticated
+    }
+
+    fn offer_with(cfg: &RealityServerConfig, now_ms: u64, bytes: &[u8]) -> Verdict {
+        offer(cfg, now_ms, bytes)
+    }
+
+    fn refused_with(cfg: &RealityServerConfig, now_ms: u64, bytes: &[u8]) -> bool {
+        !offer(cfg, now_ms, bytes).authenticated
     }
 
     fn good_hello() -> Vec<u8> {
@@ -647,7 +917,7 @@ mod tests {
     )]
     #[test]
     fn an_authenticated_hello_is_accepted() {
-        assert!(offer(&settings(), 0, &good_hello()));
+        assert!(accepted(0, &good_hello()));
     }
 
     #[cfg_attr(
@@ -669,23 +939,179 @@ mod tests {
             record(&body)
         };
 
-        assert!(!offer(&settings(), 0, &build("evil.example", &SHORT_ID)));
-        assert!(!offer(&settings(), 0, &build(SNI, &wrong_short)));
+        assert!(!offer(&settings(), 0, &build("evil.example", &SHORT_ID)).authenticated);
+        assert!(!offer(&settings(), 0, &build(SNI, &wrong_short)).authenticated);
 
         for at in [39usize, 50, 71, 100, 160] {
             let mut bytes = build(SNI, &SHORT_ID);
-            let target = at.min(bytes.len() - 1);
-            bytes[target] ^= 0x40;
+            let spot = at.min(bytes.len() - 1);
+            bytes[spot] ^= 0x40;
             assert!(
-                !offer(&settings(), 0, &bytes),
-                "byte {target} was not covered"
+                !offer(&settings(), 0, &bytes).authenticated,
+                "byte {spot} was not covered"
             );
         }
         other[0] = 0;
         assert_ne!(other, wrong_short);
 
-        assert!(!offer(&settings(), 0, b"not a tls record at all"));
-        assert!(!offer(&settings(), 0, &[]));
+        assert!(!offer(&settings(), 0, b"not a tls record at all").authenticated);
+        assert!(!offer(&settings(), 0, &[]).authenticated);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn an_authenticated_hello_costs_the_cover_origin_nothing() {
+        let verdict = offer(&settings(), 0, &good_hello());
+        assert!(verdict.authenticated);
+        assert_eq!(verdict.dialled, 0, "the cover origin must not be dialled");
+        assert_eq!(verdict.cover.len(), 0);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte() {
+        let mut bytes = good_hello();
+        let spot = 71.min(bytes.len() - 1);
+        bytes[spot] ^= 0x40;
+        let verdict = offer(&settings(), 0, &bytes);
+        assert!(!verdict.authenticated);
+        assert_eq!(verdict.dialled, 1);
+        assert_eq!(
+            verdict.cover, bytes,
+            "the cover origin must see the hello the server read"
+        );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_refused_hello_with_no_cover_origin_is_dropped_not_dialled() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            RealityServer::accept(&settings(), 0, stream, Edges::default()).is_ok()
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut hello = good_hello();
+        let spot = 71.min(hello.len() - 1);
+        hello[spot] ^= 0x40;
+        client.write_all(&hello).expect("writes");
+        client.flush().expect("flushes");
+        assert!(!server.join().expect("joins"));
+        client
+            .set_read_timeout(Some(COVER_WAIT))
+            .expect("sets a read timeout");
+        let mut silence = [0u8; 8];
+        assert!(matches!(client.read(&mut silence), Ok(0) | Err(_)));
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn the_proxy_protocol_header_precedes_the_hello_on_the_cover_origin() {
+        let mut bytes = good_hello();
+        let spot = 71.min(bytes.len() - 1);
+        bytes[spot] ^= 0x40;
+        for (xver, head) in [(1u8, b"PROXY " as &[u8]), (2u8, &[0x0d, 0x0a])] {
+            let mut cfg = settings();
+            cfg.xver = xver;
+            let verdict = offer(&cfg, 0, &bytes);
+            assert_eq!(verdict.dialled, 1, "version {xver} never dialled");
+            assert!(
+                verdict.cover.starts_with(head),
+                "version {xver} wrote no recognizable header"
+            );
+            let after = verdict.cover.len() - bytes.len();
+            assert_eq!(&verdict.cover[after..], &bytes[..]);
+        }
+    }
+
+    #[test]
+    fn the_text_proxy_header_names_both_ends_of_the_client_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let edges = Edges::of(&stream);
+        assert!(edges.peer.is_some() && edges.local.is_some());
+        assert_ne!(edges.peer, edges.local);
+        let (mut site, _) = listener.accept().expect("accepts");
+        proxy_protocol(&mut site, 1, edges).expect("writes a header");
+        drop(site);
+        let mut sink = stream;
+        sink.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
+        let mut head = [0u8; 64];
+        let mut got = Vec::new();
+        while let Ok(took) = sink.read(&mut head) {
+            if took == 0 {
+                break;
+            }
+            got.extend_from_slice(&head[..took]);
+            if got.contains(&b'\n') {
+                break;
+            }
+        }
+        let line = String::from_utf8_lossy(&got);
+        assert!(
+            line.starts_with("PROXY TCP4 127.0.0.1 127.0.0.1 "),
+            "{line}"
+        );
+        assert!(line.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listening = listener.local_addr().expect("addr").port();
+        let stream = TcpStream::connect(("127.0.0.1", listening)).expect("connects");
+        let client = stream.local_addr().expect("addr").port();
+        let (mut site, _) = listener.accept().expect("accepts");
+        proxy_protocol(&mut site, 2, Edges::of(&stream)).expect("writes a header");
+        drop(site);
+        let mut sink = stream;
+        sink.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
+        let mut head = [0u8; 28];
+        let mut got = 0;
+        while got < head.len() {
+            match sink.read(&mut head[got..]) {
+                Ok(0) | Err(_) => break,
+                Ok(took) => got += took,
+            }
+        }
+        assert_eq!(got, 28, "the header is a fixed twenty-eight bytes");
+        assert_eq!(
+            &head[..12],
+            &[0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]
+        );
+        assert_eq!(head[12], 0x21, "the version-and-command byte is 1.3");
+        assert_eq!(head[13], 0x11, "the family is TCP over IPv4");
+        assert_eq!(
+            u16::from_be_bytes([head[14], head[15]]),
+            12,
+            "the length counts the two addresses and the two ports"
+        );
+        assert_eq!(&head[16..20], &[127, 0, 0, 1], "the source address");
+        assert_eq!(&head[20..24], &[127, 0, 0, 1], "the destination address");
+        assert_eq!(
+            u16::from_be_bytes([head[24], head[25]]),
+            client,
+            "the source port"
+        );
+        assert_eq!(
+            u16::from_be_bytes([head[26], head[27]]),
+            listening,
+            "the destination port"
+        );
     }
 
     #[cfg_attr(
@@ -711,8 +1137,69 @@ mod tests {
             [1, 35, 69, 103, 0, 0, 0, 0],
             1_700_000_000,
         );
-        assert!(offer(&cfg, 0, &record(&body)));
-        assert!(!offer(&settings(), 0, &record(&body)));
+        assert!(offer_with(&cfg, 0, &record(&body)).authenticated);
+        assert!(!offer_with(&settings(), 0, &record(&body)).authenticated);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_sub_second_clock_gate_does_not_refuse_every_hello() {
+        let cfg = RealityServerConfig {
+            max_time_skew: Some(Duration::from_millis(250)),
+            ..settings()
+        };
+        let client_private = [0x44u8; 32];
+        let random: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(9));
+        let mut base = [0u8; 32];
+        base[0] = 9;
+        let share = x25519_dalek::x25519(client_private, base);
+        let now = 1_788_000_000u64;
+        let mut body = hello_body(&random, &share, SNI);
+        seal(
+            &mut body,
+            &random,
+            &client_private,
+            SHORT_ID,
+            u32::try_from(now).unwrap(),
+        );
+        assert!(offer_with(&cfg, now * 1000 + 100, &record(&body)).authenticated);
+        assert!(!offer_with(&cfg, now * 1000 + 900, &record(&body)).authenticated);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn the_client_version_gate_bites_only_when_it_is_set() {
+        let client_private = [0x55u8; 32];
+        let random: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
+        let mut base = [0u8; 32];
+        base[0] = 9;
+        let share = x25519_dalek::x25519(client_private, base);
+        let mut body = hello_body(&random, &share, SNI);
+        seal(&mut body, &random, &client_private, SHORT_ID, 1_700_000_000);
+        let hello = record(&body);
+        assert!(accepted(0, &hello), "no version gate must refuse nothing");
+        let low = RealityServerConfig {
+            min_client_ver: Some([27, 0, 0]),
+            ..settings()
+        };
+        assert!(refused_with(&low, 0, &hello));
+        let high = RealityServerConfig {
+            max_client_ver: Some([1, 8, 1]),
+            ..settings()
+        };
+        assert!(refused_with(&high, 0, &hello));
+        let wide = RealityServerConfig {
+            min_client_ver: Some([1, 0, 0]),
+            max_client_ver: Some([30, 0, 0]),
+            ..settings()
+        };
+        assert!(offer_with(&wide, 0, &hello).authenticated);
     }
 
     #[cfg_attr(
@@ -722,7 +1209,7 @@ mod tests {
     #[test]
     fn the_clock_gate_is_off_by_default_and_bites_when_set() {
         let cfg = RealityServerConfig {
-            max_time_skew: Some(Duration::from_secs(60)),
+            max_time_skew: Some(Duration::from_millis(1_500)),
             ..settings()
         };
         let client_private = [0x33u8; 32];
@@ -730,11 +1217,11 @@ mod tests {
         let mut base = [0u8; 32];
         base[0] = 9;
         let share = x25519_dalek::x25519(client_private, base);
-        let now = 1_788_000_000;
+        let now = 1_788_000_000u64;
         let stale = u32::try_from(now - 3600).unwrap();
         let mut body = hello_body(&random, &share, SNI);
         seal(&mut body, &random, &client_private, SHORT_ID, stale);
-        assert!(!offer(&cfg, now, &record(&body)));
+        assert!(refused_with(&cfg, now * 1000, &record(&body)));
         let mut body = hello_body(&random, &share, SNI);
         seal(
             &mut body,
@@ -743,7 +1230,7 @@ mod tests {
             SHORT_ID,
             u32::try_from(now).unwrap(),
         );
-        assert!(offer(&cfg, now, &record(&body)));
+        assert!(offer_with(&cfg, now * 1000, &record(&body)).authenticated);
     }
 
     #[test]
@@ -921,12 +1408,63 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            RealityServer::accept(&cfg, 0, stream).map(|_| ())
+            RealityServer::accept(&cfg, 0, stream, Edges::default()).map(|_| ())
         });
         let bytes = good_hello();
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         client.write_all(&bytes).expect("writes");
         server.join().expect("joins").expect("authenticates");
         assert_eq!(bytes[0], 0x16);
+    }
+
+    /// A `Read` that answers `WouldBlock` once and then dribbles one byte at a
+    /// time, so the hello reader is driven through its wait path deterministically.
+    struct Dribble {
+        bytes: Vec<u8>,
+        at: usize,
+        blocked: bool,
+    }
+
+    impl Dribble {
+        fn of(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                at: 0,
+                blocked: false,
+            }
+        }
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.blocked {
+                self.blocked = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if self.at >= self.bytes.len() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_hello_in_two_records_behind_a_timeout_is_read_whole() {
+        let bytes = good_hello();
+        let body = &bytes[5..];
+        let half = body.len() / 2;
+        let mut split = vec![0x16, 0x03, 0x01];
+        split.extend_from_slice(&u16::try_from(half).unwrap().to_be_bytes());
+        split.extend_from_slice(&body[..half]);
+        let mut second = vec![0x16, 0x03, 0x01];
+        second.extend_from_slice(&u16::try_from(body.len() - half).unwrap().to_be_bytes());
+        second.extend_from_slice(&body[half..]);
+        split.extend_from_slice(&second);
+        let mut dribble = Dribble::of(&split);
+        let (raw, hello) = read_client_hello(&mut dribble).expect("reads whole");
+        assert_eq!(raw, split);
+        assert_eq!(hello.bytes, body);
     }
 }

@@ -159,7 +159,7 @@ mod rustls_backend;
 pub use rustls_backend::{RustlsProvider, RustlsServerProvider};
 
 pub mod reality;
-pub use reality::{RealityServer, RealityServerConfig};
+pub use reality::{Edges, Proxied, RateLimit, RealityAccept, RealityServer, RealityServerConfig};
 
 pub fn connect<S: Stream>(cfg: &TlsConfig, io: S) -> Result<impl TlsProvider + use<S>, TlsError> {
     RustlsProvider::connect(cfg, io)

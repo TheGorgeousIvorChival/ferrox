@@ -6,11 +6,11 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
-use ferrox_core::tls::TlsProvider as _;
+use ferrox_core::tls::{Edges, Stream, TlsProvider as _};
 use ferrox_core::transport::EarlyData;
 
 pub(crate) fn print_version() {
@@ -1510,75 +1510,189 @@ fn serve_vless_reality(
     match carrier {
         Carrier::Raw => {
             let Ok(raw) = stream.try_clone() else { return };
-            let Ok(session) = ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
-            else {
-                return;
-            };
-            finish_reality(session, Some(raw), id, freedom);
+            let edges = Edges::of(&stream);
+            let accepted =
+                ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
+            answer_reality(accepted, Some(raw), id, freedom, server);
         }
         Carrier::Ws { path, .. } => {
-            let Ok(mut session) =
-                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
-            else {
-                return;
-            };
-            if session.handshake().is_err() {
-                return;
-            }
-            let (reader, writer) = session_halves(session);
-            serve_session_ws(reader, writer, path, id, freedom);
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_ws(reader, writer, path, id, freedom);
+            });
         }
         Carrier::Xhttp { path, .. } => {
-            let Ok(mut session) =
-                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
-            else {
-                return;
-            };
-            if session.handshake().is_err() {
-                return;
-            }
-            let (reader, writer) = session_halves(session);
-            serve_session_xhttp(reader, writer, path, id, freedom);
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_xhttp(reader, writer, path, id, freedom);
+            });
         }
         Carrier::HttpUpgrade { path } => {
             let Ok(raw) = stream.try_clone() else { return };
-            let Ok(mut session) =
-                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
-            else {
-                return;
-            };
-            if session.handshake().is_err() {
-                return;
-            }
-            let (reader, writer) = session_halves(session);
-            serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
+            });
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
-            let Ok(mut session) =
-                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
-            else {
-                return;
-            };
-            if session.handshake().is_err() {
-                return;
-            }
-            let (reader, writer) = session_halves(session);
-            serve_session_httpheader(reader, writer, raw, path, id, freedom);
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_httpheader(reader, writer, raw, path, id, freedom);
+            });
         }
         Carrier::Grpc { path } => {
-            let Ok(mut session) =
-                ferrox_core::tls::RealityServer::accept(server, unix_now(), stream)
-            else {
-                return;
-            };
-            if session.handshake().is_err() {
-                return;
-            }
-            let (reader, writer) = session_halves(session);
-            serve_session_grpc(reader, writer, path, id, freedom);
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_grpc(reader, writer, path, id, freedom);
+            });
         }
         refused_carriers!() => {}
+    }
+}
+
+// REALITY first on the raw stream, the carrier second over the halves — the
+// references read the ClientHello off TCP, not out of an upgraded stream.
+fn serve_carrier_reality(
+    stream: TcpStream,
+    server: &ferrox_core::tls::RealityServerConfig,
+    serve: impl FnOnce(ferrox_core::tls::RealityServer<TcpStream>),
+) {
+    let edges = Edges::of(&stream);
+    match ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges) {
+        Ok(ferrox_core::tls::RealityAccept::Session(session)) => serve(session),
+        Ok(ferrox_core::tls::RealityAccept::Proxied(proxied)) => relay_fallback(proxied),
+        Err(why) => {
+            if server.show {
+                eprintln!("REALITY: {why}");
+            }
+        }
+    }
+}
+/// The token bucket one splice direction paces itself with: `burst` bytes for
+/// free the moment the count clears `after_bytes`, then `bytes_per_sec` of them.
+#[derive(Debug)]
+struct Gauge {
+    limit: ferrox_core::tls::RateLimit,
+    sent: u64,
+    began: Option<Instant>,
+}
+
+impl Gauge {
+    fn start(limit: ferrox_core::tls::RateLimit) -> Self {
+        let burst = if limit.burst_bytes_per_sec < limit.bytes_per_sec {
+            limit.bytes_per_sec
+        } else {
+            limit.burst_bytes_per_sec
+        };
+        Self {
+            limit: ferrox_core::tls::RateLimit {
+                burst_bytes_per_sec: burst,
+                ..limit
+            },
+            sent: 0,
+            began: None,
+        }
+    }
+
+    /// Waits until the byte that closes this write may go out, then counts it.
+    fn admit(&mut self, len: usize) {
+        let end = self.sent + u64::try_from(len).unwrap_or(u64::MAX);
+        self.sent = end;
+        if end <= self.limit.after_bytes || self.limit.bytes_per_sec == 0 {
+            return;
+        }
+        let began = *self.began.get_or_insert_with(Instant::now);
+        let owed = end - self.limit.after_bytes;
+        if owed <= self.limit.burst_bytes_per_sec {
+            return;
+        }
+        let wait = Duration::from_nanos(
+            (owed - self.limit.burst_bytes_per_sec) * 1_000_000_000 / self.limit.bytes_per_sec,
+        );
+        let deadline = began + wait;
+        if let Some(rest) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(rest);
+        }
+    }
+}
+
+/// Either the authenticated session carries the record, or the unauthenticated
+/// peer is spliced to the cover origin and the REALITY row never sees it.
+fn answer_reality<S: Stream + Send + 'static>(
+    accepted: Result<ferrox_core::tls::RealityAccept<S>, ferrox_core::tls::TlsError>,
+    raw: Option<TcpStream>,
+    id: &[u8; 16],
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+) {
+    let accepted = match accepted {
+        Ok(accepted) => accepted,
+        Err(why) => {
+            if server.show {
+                eprintln!("REALITY: {why}");
+            }
+            return;
+        }
+    };
+    match accepted {
+        ferrox_core::tls::RealityAccept::Session(session) => {
+            finish_reality(session, raw, id, freedom);
+        }
+        ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
+    }
+}
+
+/// The splice to the cover origin, driven by the same relay the rest of the
+/// proxy uses: an unauthenticated peer is a plain bidirectional copy, so it is
+/// not a second implementation of a pump.
+fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied<S>) {
+    let ferrox_core::tls::Proxied {
+        client,
+        target,
+        upload,
+        download,
+    } = proxied;
+    let one = Arc::new(Half::new(client));
+    let two = Arc::new(Half::new(target));
+    let mut up = upload.map(Gauge::start);
+    let mut down = download.map(Gauge::start);
+    let (send, recv) = (Arc::clone(&one), Arc::clone(&two));
+    let uplink = thread::spawn(move || copy_paced(&send, &two, up.as_mut()));
+    copy_paced(&one, &recv, down.as_mut());
+    let _ = uplink.join();
+}
+
+fn copy_paced<R: Read, W: Write>(from: &Half<R>, to: &Half<W>, mut gauge: Option<&mut Gauge>) {
+    let mut buffer = RelayBuf::new();
+    loop {
+        let n = match from.read_once(buffer.as_mut()) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(error) if is_timeout(&error) => continue,
+            Err(_) => return,
+        };
+        if let Some(gauge) = gauge.as_mut() {
+            gauge.admit(n);
+        }
+        if to.write_once(buffer.filled(n)).is_err() {
+            return;
+        }
     }
 }
 
@@ -1680,23 +1794,75 @@ fn inbound_reality_config(inbound: &Json) -> Option<ferrox_core::tls::RealitySer
             .get("maxTimeDiff")
             .and_then(as_millis)
             .map(Duration::from_millis),
+        min_client_ver: reality
+            .get("minClientVer")
+            .and_then(Json::as_str)
+            .and_then(client_ver),
+        max_client_ver: reality
+            .get("maxClientVer")
+            .and_then(Json::as_str)
+            .and_then(client_ver),
+        limit_fallback_upload: reality.get("limitFallbackUpload").and_then(rate_limit),
+        limit_fallback_download: reality.get("limitFallbackDownload").and_then(rate_limit),
+        dest: reality
+            .get("dest")
+            .and_then(Json::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned),
+        xver: reality
+            .get("xver")
+            .and_then(as_uint)
+            .and_then(|n| u8::try_from(n).ok())
+            .unwrap_or(0),
+        show: reality.get("show").and_then(Json::as_bool).unwrap_or(false),
     })
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
+fn client_ver(text: &str) -> Option<[u8; 3]> {
+    let mut out = [0u8; 3];
+    let mut at = 0;
+    for part in text.split('.') {
+        let value = part.parse::<u8>().ok()?;
+        *out.get_mut(at)? = value;
+        at += 1;
+    }
+    (at > 0).then_some(out)
 }
 
+fn rate_limit(node: &Json) -> Option<ferrox_core::tls::RateLimit> {
+    Some(ferrox_core::tls::RateLimit {
+        after_bytes: node.get("afterBytes").and_then(as_uint)?,
+        bytes_per_sec: node.get("bytesPerSec").and_then(as_uint)?,
+        burst_bytes_per_sec: node.get("burstBytesPerSec").and_then(as_uint)?,
+    })
+}
+
+fn as_uint(node: &Json) -> Option<u64> {
+    if let Json::Num(n) = node {
+        if *n >= 0.0 && n.fract() == 0.0 {
+            return u64::try_from(*n as i64).ok();
+        }
+    }
+    None
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Xray fills the eight bytes from the front and zero-pads the tail, so `a8` is
+/// `a8 00 ...`, never `00 ... a8`.
 fn short_id(hex: &str) -> Option<[u8; 8]> {
     let mut out = [0u8; 8];
     if hex.is_empty() || hex.len() > 16 || !hex.len().is_multiple_of(2) {
         return None;
     }
-    let at = 8 - hex.len() / 2;
     for (i, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        out[at + i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(out)
 }
@@ -2368,16 +2534,26 @@ fn serve_vless_kcp_reality(
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
 ) {
-    let Ok(session) = ferrox_core::tls::RealityServer::accept(
+    let accepted = ferrox_core::tls::RealityServer::accept(
         server,
-        unix_now(),
+        unix_millis(),
         KcpIo {
             conn: Arc::clone(conn),
         },
-    ) else {
+        Edges::default(),
+    );
+    let Ok(accepted) = accepted else {
+        if server.show {
+            eprintln!("REALITY: the cover origin refused the splice");
+        }
         return;
     };
-    finish_reality(session, None, id, freedom);
+    match accepted {
+        ferrox_core::tls::RealityAccept::Session(session) => {
+            finish_reality(session, None, id, freedom);
+        }
+        ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
+    }
 }
 
 fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[u8; 56], freedom: bool) {
@@ -8673,6 +8849,48 @@ mod tests {
         )
         .expect("parses");
         assert!(find_vless_outbound(&root).is_some());
+    }
+
+    #[test]
+    fn the_gauge_paces_only_past_the_burst_it_was_given() {
+        let mut flat = Gauge::start(ferrox_core::tls::RateLimit {
+            after_bytes: 4,
+            bytes_per_sec: 0,
+            burst_bytes_per_sec: 0,
+        });
+        let start = Instant::now();
+        for _ in 0..8 {
+            flat.admit(1);
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(20),
+            "no rate, no wait"
+        );
+
+        let mut capped = Gauge::start(ferrox_core::tls::RateLimit {
+            after_bytes: 0,
+            bytes_per_sec: 500,
+            burst_bytes_per_sec: 4_096,
+        });
+        let start = Instant::now();
+        capped.admit(4_096);
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "the burst is free"
+        );
+        capped.admit(1);
+        assert!(
+            start.elapsed() >= Duration::from_millis(1),
+            "the byte past the burst waits out its token"
+        );
+    }
+
+    #[test]
+    fn a_short_id_hex_fills_from_the_front() {
+        assert_eq!(short_id("a8"), Some([0xa8, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(short_id("01020304"), Some([1, 2, 3, 4, 0, 0, 0, 0]));
+        assert_eq!(short_id(""), None);
+        assert_eq!(short_id("abc"), None);
     }
 
     #[test]
