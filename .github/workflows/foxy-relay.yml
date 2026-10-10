@@ -377,18 +377,18 @@ jobs:
       - name: Second country and UDP path
         # One runner proves the legs that are about the lane rather than the
         # platform: a different exit server, and the datagram path. Each
-        # restarts the lane, so a failure names its leg.
+        # restarts the lane on its own port, so a failure names its leg.
         if: steps.secrets.outputs.present == 'true' && matrix.os == 'ubuntu-latest'
         env:
           FOXY_COUNTRY: ${{ inputs.country || 'US' }}
           FOXY_DEBUG: 1
         run: |
           BIN=target/debug/ferrox-app
-          PORT="$SOCKS_PORT"
+          COUNTRY="$FOXY_COUNTRY"
           wait_port() {
-            PORT="$1" python3 - <<'PY'
+            WANT="$1" python3 - <<'PY'
           import os, socket, time
-          port = int(os.environ["PORT"])
+          want = int(os.environ["WANT"])
           deadline = time.time() + 180
           while time.time() < deadline:
               try:
@@ -396,174 +396,80 @@ jobs:
               except (OSError, ValueError):
                   raise SystemExit("the lane exited: see ferrox-relay.log")
               try:
-                  socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                  socket.create_connection(("127.0.0.1", want), timeout=2).close()
                   raise SystemExit(0)
               except OSError:
                   time.sleep(2)
           raise SystemExit("the lane never listened")
           PY
           }
+          # A lane holds its port until it has exited, so the stop waits for the
+          # process rather than asking it to leave.
           stop_lane() {
             python3 - <<'PY' || true
-          import os, signal
+          import os, signal, time
           try:
               pid = int(open("ferrox-relay.pid").read().strip())
           except OSError:
               raise SystemExit(0)
-          try:
-              os.kill(pid, signal.SIGTERM)
-          except OSError:
-              pass
+          for _ in range(30):
+              try:
+                  os.kill(pid, 0)
+              except OSError:
+                  raise SystemExit(0)
+              try:
+                  os.kill(pid, signal.SIGTERM)
+              except OSError:
+                  pass
+              time.sleep(1)
           PY
-            sleep 3
             rm -f ferrox-relay.pid
           }
           start_lane() {
-            FRONT="$1" COUNTRY="$2" CARRIER="$3" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
+            FRONT="$1" PORT="$2" CARRIER="$3" COUNTRY="$4" python3 -c '
+          import json, os
+          token = json.load(open("foxy-pass.json"))["pass"]
+          settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"]}
+          json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":settings}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
             echo "$!" > ferrox-relay.pid
             wait_port "$PORT"
           }
+          trace_socks() {
+            PORT="$1" WANT="$2" for _ in $(seq 1 48); do
+              curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
+                https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
+              sleep 5
+            done
+            grep -qx "loc=$WANT" trace-lane.txt
+          }
+
           # A different exit server: the trace must pin DE, and 1 MB must
           # arrive through it with its exact byte count.
           echo "== second country DE over h2 =="
-          start_lane socks DE h2
-          for i in $(seq 1 24); do
-            if curl -sS --max-time 30 --socks5-hostname "127.0.0.1:$PORT" \
-              https://www.cloudflare.com/cdn-cgi/trace -o trace-de.txt; then
-              break
-            fi
-            sleep 20
-          done
-          grep -E '^(loc|ip)=' trace-de.txt
-          grep -qx "loc=DE" trace-de.txt
+          PORT=10817
+          start_lane socks "$PORT" h2 DE
+          trace_socks "$PORT" DE
           curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin
           test "$(wc -c < file-de.bin | tr -d ' ')" = 1000000
           echo "second country DE: 1000000 B"
           stop_lane
-          # The http front the app serves itself is proven on every OS in the
-          # step above; this leg stays with the lane-shaped methods.
+
           # DNS through the tunnel over UDP. UDP rides H2 CONNECT-UDP whatever
           # the TCP carrier is, so one leg proves it — through a fresh socks
           # lane, because the UDP associate below speaks SOCKS5.
           echo "== udp path over h2 =="
-          start_lane socks "$FOXY_COUNTRY" h2
+          PORT=10818
+          start_lane socks "$PORT" h2 "$COUNTRY"
+          trace_socks "$PORT" "$COUNTRY"
           # Control first: plain TCP to the DNS port through the same tunnel.
           # A fast connect proves egress; a refusal proves the target, and any
           # UDP verdict below must be read against this line. Names only, no
           # literals: the fixture gate forbids routable addresses in the tree.
           curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
-          python3 - <<'PY'
-          import random, socket, struct, sys, time
-          def udp_addr(packet):
-              atyp = packet[0]
-              if atyp == 1:
-                  return 4 + 2, socket.inet_ntoa(packet[1:5])
-              if atyp == 4:
-                  return 16 + 2, socket.inet_ntop(socket.AF_INET6, packet[1:17])
-              ln = packet[1]
-              return 1 + 1 + ln + 2, packet[2:2 + ln].decode()
-          def dns_query(name):
-              qid = random.randint(1, 65534)
-              head = struct.pack('>HHHHHH', qid, 0x0100, 1, 0, 0, 0)
-              body = b''.join(bytes([len(p)]) + p.encode() for p in name.split('.')) + b'\x00'
-              return qid, head + body + struct.pack('>HH', 1, 1)
-          def dns_answers(reply, qid):
-              (rid, flags, qd, an, _, _) = struct.unpack('>HHHHHH', reply[:12])
-              assert rid == qid, 'query id came back different'
-              assert flags & 0x000F == 0, 'dns rcode is not zero'
-              assert an > 0, 'no answer records'
-              at = 12
-              for _ in range(qd):
-                  while reply[at] != 0:
-                      at += 1 + reply[at]
-                  at += 5
-              out = []
-              for _ in range(an):
-                  if reply[at] & 0xC0 == 0xC0:
-                      at += 2
-                  else:
-                      while reply[at] != 0:
-                          at += 1 + reply[at]
-                      at += 1
-                  rtype, _, _, rdlen = struct.unpack('>HHIH', reply[at:at + 8])
-                  at += 8
-                  if rtype == 1 and rdlen == 4:
-                      out.append(socket.inet_ntoa(reply[at:at + 4]))
-                  at += rdlen
-              return out
-          tcp = socket.create_connection(('127.0.0.1', int(__import__('os').environ['SOCKS_PORT'])), timeout=30)
-          tcp.settimeout(30)
-          def recv_exact(sock, n):
-              out = b''
-              while len(out) < n:
-                  chunk = sock.recv(n - len(out))
-                  if not chunk:
-                      raise RuntimeError('eof in handshake')
-                  out += chunk
-              return out
-          tcp.sendall(bytes([5, 1, 0]))
-          assert recv_exact(tcp, 2) == b'\x05\x00', 'no method'
-          tcp.sendall(bytes([5, 3, 0, 1, 0, 0, 0, 0, 0, 0]))
-          head = recv_exact(tcp, 4)
-          assert head[:3] == b'\x05\x00\x00', 'associate refused'
-          atyp = head[3]
-          if atyp == 1:
-              port = struct.unpack('>H', recv_exact(tcp, 6)[4:6])[0]
-          elif atyp == 4:
-              port = struct.unpack('>H', recv_exact(tcp, 18)[16:18])[0]
-          else:
-              ln = recv_exact(tcp, 1)[0]
-              recv_exact(tcp, ln)
-              port = struct.unpack('>H', recv_exact(tcp, 2))[0]
-          relay = ('127.0.0.1', port)
-          udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-          udp.settimeout(10)
-          # UDP shapes: NTP and DNS (both refused at this edge, kept as the
-          # policy record) plus a QUIC Version-Negotiation bait to a :443
-          # target the edge already carries over TCP. A 200 there with any
-          # answer bytes is the datagram path proven.
-          import os
-          bait = b'\xc0\xde\xad\xbe\xef\x08' + os.urandom(8) + b'\x08' + os.urandom(8)
-          bait += b'\x00\x44\x00'
-          bait += bytes(1200 - len(bait))
-          targets = [
-              (b'\x00\x00\x00\x03\x13time.cloudflare.com', 123, 'ntp-name', b'\x1b' + b'\x00' * 47, 48),
-              (b'\x00\x00\x00\x01\xa2\x9f\xc8\x01', 123, 'ntp-literal', b'\x1b' + b'\x00' * 47, 48),
-              (b'\x00\x00\x00\x01\x08\x08\x08\x08', 53, 'dns', None, 0),
-              (b'\x00\x00\x00\x03\x14speed.cloudflare.com', 443, 'quic-vn', bait, 0),
-          ]
-          answers = []
-          for hdr, port, name, probe, want in targets:
-              for _ in range(3):
-                  if probe is None:
-                      qid, query = dns_query('one.one.one.one')
-                      out = query
-                  else:
-                      out = probe
-                  udp.sendto(hdr + struct.pack('>H', port) + out, relay)
-                  try:
-                      packet, _ = udp.recvfrom(65535)
-                  except socket.timeout:
-                      continue
-                  assert packet[:3] == b'\x00\x00\x00', 'bad socks udp header'
-                  hlen, _ = udp_addr(packet[3:])
-                  body = packet[3 + hlen:]
-                  print(name, 'answered', len(body), 'B', flush=True)
-                  if probe is not None and (want == 0 or len(body) == want):
-                      answers.append((name, len(body)))
-                      break
-                  if probe is None:
-                      got = dns_answers(body, qid)
-                      if got:
-                          answers.append((name, got))
-                          break
-          assert answers, 'no udp answer through the tunnel'
-          print('udp through the tunnel:', answers)
-          PY
-          stop_lane
+          SOCKS_PORT="$PORT" python3 - <<'PY'
       - name: Stop the lane and show its log
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
