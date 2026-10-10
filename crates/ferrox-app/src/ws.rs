@@ -35,7 +35,15 @@ fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3], mask[0], mask[1],
         mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
     ];
-    let (chunks, tail) = buf.as_chunks_mut::<16>();
+    let (blocks, rest) = buf.as_chunks_mut::<64>();
+    for block in blocks {
+        let lanes = block.as_chunks_mut::<16>().0;
+        xor_block(&mut lanes[0], &wide);
+        xor_block(&mut lanes[1], &wide);
+        xor_block(&mut lanes[2], &wide);
+        xor_block(&mut lanes[3], &wide);
+    }
+    let (chunks, tail) = rest.as_chunks_mut::<16>();
     for chunk in chunks {
         xor_block(chunk, &wide);
     }
@@ -437,7 +445,6 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<(&'a str, Vec<u8>)> {
 }
 
 // The same accept over halves that cannot peek: pipelined bytes arrive as a prefix, after the early data.
-#[cfg(test)]
 pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
@@ -591,7 +598,8 @@ mod tests {
     #[test]
     fn mask_chunks_match_the_byte_loop() {
         for len in [
-            0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 255, 1024, 8192,
+            0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 48, 49, 63, 64, 65, 80, 81, 127, 128, 129, 191,
+            192, 255, 256, 1024, 4096, 8192,
         ] {
             for mask in [[0u8, 0, 0, 0], [1, 2, 3, 4], [0xFF, 0x00, 0xA5, 0x5A]] {
                 let plain: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();

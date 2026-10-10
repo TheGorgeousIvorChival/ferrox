@@ -1239,6 +1239,187 @@ fn serve_vless_reality_inbound(
     true
 }
 
+fn serve_session_ws<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::ws::accept_split(read, write, path) else {
+        echo_trace("session ws accept refused");
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session ws vless decode refused");
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        echo_trace("session ws vless id or cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session ws uplink refused");
+        return;
+    };
+    echo_trace(&format!("session ws uplink {target}"));
+    if !cwriter.send(&[0, 0]) {
+        echo_trace("session ws vless response refused");
+        return;
+    }
+    echo_trace("session ws relaying");
+    relay_sink(creader, &cwriter, &uplink, |_| {});
+}
+
+fn serve_session_xhttp<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::xhttp::accept_split(read, write, path) else {
+        echo_trace("session xhttp accept refused");
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session xhttp vless decode refused");
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        echo_trace("session xhttp vless id or cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session xhttp uplink refused");
+        return;
+    };
+    if !cwriter.send(&[0, 0]) {
+        echo_trace("session xhttp vless response refused");
+        return;
+    }
+    echo_trace("session xhttp relaying");
+    relay_sink_drained(creader, &cwriter, &uplink);
+}
+
+fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: TcpStream,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path) else {
+        echo_trace("session httpupgrade accept refused");
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session httpupgrade vless decode refused");
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        echo_trace("session httpupgrade vless id or cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpupgrade uplink refused");
+        return;
+    };
+    let mut sink = SessionSink {
+        half: cwriter,
+        raw: Arc::new(raw),
+    };
+    if sink.write_all(&[0, 0]).is_err() {
+        echo_trace("session httpupgrade vless response refused");
+        return;
+    }
+    echo_trace("session httpupgrade relaying");
+    relay_sink(creader, &sink, &uplink, |_| {});
+}
+
+fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: TcpStream,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
+        echo_trace("session httpheader accept refused");
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session httpheader vless decode refused");
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        echo_trace("session httpheader vless id or cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpheader uplink refused");
+        return;
+    };
+    let mut sink = SessionSink {
+        half: cwriter,
+        raw: Arc::new(raw),
+    };
+    if sink.write_all(&[0, 0]).is_err() {
+        echo_trace("session httpheader vless response refused");
+        return;
+    }
+    echo_trace("session httpheader relaying");
+    relay_sink(creader, &sink, &uplink, |_| {});
+}
+
+fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::grpc::accept_split(read, write, path) else {
+        echo_trace("session grpc accept refused");
+        return;
+    };
+    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+        echo_trace("session grpc vless decode refused");
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        echo_trace("session grpc vless id or cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session grpc uplink refused");
+        return;
+    };
+    if !cwriter.send(&[0, 0]) {
+        echo_trace("session grpc vless response refused");
+        return;
+    }
+    echo_trace("session grpc relaying");
+    relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+}
+
+fn accept_tls_session(
+    stream: TcpStream,
+    server: &ferrox_core::tls::TlsServerConfig,
+) -> Option<impl ferrox_core::tls::TlsProvider + Send> {
+    let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
+        echo_trace("tls-server accept refused");
+        return None;
+    };
+    if session.handshake().is_err() {
+        echo_trace("tls-server handshake refused");
+        return None;
+    }
+    Some(session)
+}
+
 fn serve_vless_tls(
     stream: TcpStream,
     id: &[u8; 16],
@@ -1261,51 +1442,41 @@ fn serve_vless_tls(
             relay_vless(tls, Some(raw), id, freedom);
         }
         Carrier::Ws { path, .. } => {
-            let Some((reader, writer)) = crate::ws::accept(stream, path) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            serve_carried_tls(CarrierStream { reader, writer }, id, freedom, server);
+            let (reader, writer) = session_halves(session);
+            serve_session_ws(reader, writer, path, id, freedom);
         }
         Carrier::Xhttp { path, .. } => {
-            let Some((reader, writer)) = crate::xhttp::accept(stream, path) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
-            serve_carried_tls(CarrierStream { reader, writer }, id, freedom, server);
+            let (reader, writer) = session_halves(session);
+            serve_session_xhttp(reader, writer, path, id, freedom);
         }
         Carrier::HttpUpgrade { path } => {
-            let Some((reader, write)) = crate::httpupgrade::accept(stream, path) else {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            serve_carried_tls(
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-                id,
-                freedom,
-                server,
-            );
+            let (reader, writer) = session_halves(session);
+            serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
         }
         Carrier::HttpHeader { path } => {
-            let Some((reader, write)) = crate::httpheader::accept(stream, path) else {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            serve_carried_tls(
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-                id,
-                freedom,
-                server,
-            );
+            let (reader, writer) = session_halves(session);
+            serve_session_httpheader(reader, writer, raw, path, id, freedom);
         }
         Carrier::Grpc { path } => {
-            let Some((reader, writer)) = crate::grpc::accept(stream, path) else {
+            let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            serve_carried_tls(Grpc::new(reader, writer), id, freedom, server);
+            let (reader, writer) = session_halves(session);
+            serve_session_grpc(reader, writer, path, id, freedom);
         }
         refused_carriers!() => {}
     }
@@ -1333,82 +1504,84 @@ fn serve_vless_reality(
     carrier: &Carrier,
     server: &ferrox_core::tls::RealityServerConfig,
 ) {
-    let Ok(raw) = stream.try_clone() else { return };
     if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    let edges = Edges::of(&stream);
     match carrier {
         Carrier::Raw => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let edges = Edges::of(&stream);
             let accepted =
                 ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
             answer_reality(accepted, Some(raw), id, freedom, server);
         }
-        Carrier::Grpc { path } => {
-            let Some((reader, writer)) = crate::grpc::accept(stream, path) else {
-                return;
-            };
-            let tunnel = Grpc::new(reader, writer);
-            let accepted =
-                ferrox_core::tls::RealityServer::accept(server, unix_millis(), tunnel, edges);
-            answer_reality(accepted, Some(raw), id, freedom, server);
-        }
         Carrier::Ws { path, .. } => {
-            let Some((reader, writer)) = crate::ws::accept(stream, path) else {
-                return;
-            };
-            let accepted = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_millis(),
-                CarrierStream { reader, writer },
-                edges,
-            );
-            answer_reality(accepted, None, id, freedom, server);
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_ws(reader, writer, path, id, freedom);
+            });
         }
         Carrier::Xhttp { path, .. } => {
-            let Some((reader, writer)) = crate::xhttp::accept(stream, path) else {
-                return;
-            };
-            let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
-            let accepted = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_millis(),
-                CarrierStream { reader, writer },
-                edges,
-            );
-            answer_reality(accepted, None, id, freedom, server);
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_xhttp(reader, writer, path, id, freedom);
+            });
         }
         Carrier::HttpUpgrade { path } => {
-            let Some((reader, write)) = crate::httpupgrade::accept(stream, path) else {
-                return;
-            };
-            let accepted = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_millis(),
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-                edges,
-            );
-            answer_reality(accepted, None, id, freedom, server);
+            let Ok(raw) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
+            });
         }
         Carrier::HttpHeader { path } => {
-            let Some((reader, write)) = crate::httpheader::accept(stream, path) else {
-                return;
-            };
-            let accepted = ferrox_core::tls::RealityServer::accept(
-                server,
-                unix_millis(),
-                CarrierStream {
-                    reader,
-                    writer: write,
-                },
-                edges,
-            );
-            answer_reality(accepted, None, id, freedom, server);
+            let Ok(raw) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_httpheader(reader, writer, raw, path, id, freedom);
+            });
+        }
+        Carrier::Grpc { path } => {
+            serve_carrier_reality(stream, server, |mut session| {
+                if session.handshake().is_err() {
+                    return;
+                }
+                let (reader, writer) = session_halves(session);
+                serve_session_grpc(reader, writer, path, id, freedom);
+            });
         }
         refused_carriers!() => {}
+    }
+}
+
+// REALITY first on the raw stream, the carrier second over the halves — the
+// references read the ClientHello off TCP, not out of an upgraded stream.
+fn serve_carrier_reality(
+    stream: TcpStream,
+    server: &ferrox_core::tls::RealityServerConfig,
+    serve: impl FnOnce(ferrox_core::tls::RealityServer<TcpStream>),
+) {
+    let edges = Edges::of(&stream);
+    match ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges) {
+        Ok(ferrox_core::tls::RealityAccept::Session(session)) => serve(session),
+        Ok(ferrox_core::tls::RealityAccept::Proxied(proxied)) => relay_fallback(proxied),
+        Err(why) => {
+            if server.show {
+                eprintln!("REALITY: {why}");
+            }
+        }
     }
 }
 /// The token bucket one splice direction paces itself with: `burst` bytes for
@@ -1535,48 +1708,20 @@ fn finish_reality<S: ferrox_core::tls::TlsProvider + Send + 'static>(
     relay_vless(session, raw, id, freedom);
 }
 
-struct Grpc {
-    reader: crate::grpc::GrpcReader,
-    writer: crate::grpc::GrpcWriter,
-}
-
-impl Grpc {
-    fn new(reader: crate::grpc::GrpcReader, writer: crate::grpc::GrpcWriter) -> Self {
-        Self { reader, writer }
-    }
-}
-
-impl Read for Grpc {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.reader.read(buf)
-    }
-}
-
-impl Write for Grpc {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.writer.send(buf) {
-            Ok(buf.len())
-        } else {
-            Err(std::io::Error::other("grpc: tunnel write failed"))
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
+#[cfg(test)]
 struct CarrierStream<R, W> {
     reader: R,
     writer: W,
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> Read for CarrierStream<R, W> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.reader.read(buf)
     }
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> Write for CarrierStream<R, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.writer.write(buf)
@@ -3409,6 +3554,15 @@ fn tls_halves(
     Some((reader, writer, raw))
 }
 
+// One session, two owners: the carrier accept takes a reader and a writer.
+fn session_halves<S>(session: S) -> (TlsHalf<S>, TlsHalf<S>) {
+    let shared = Arc::new(Mutex::new(session));
+    let reader = TlsHalf {
+        session: Arc::clone(&shared),
+    };
+    (reader, TlsHalf { session: shared })
+}
+
 fn tls_ws(
     server: &SocketAddr,
     session: ferrox_core::tls::RustlsProvider<TcpStream>,
@@ -3567,6 +3721,37 @@ impl Write for TlsSink {
 }
 
 impl CarrierSink for TlsSink {
+    fn send(&self, bytes: &[u8]) -> bool {
+        let mut half = self.half.clone();
+        half.write_all(bytes).is_ok()
+    }
+
+    fn close(&self) {
+        let _ = self.raw.shutdown(Shutdown::Both);
+    }
+}
+
+// The server write end for header-only carriers: bytes through the shared session, teardown through the raw socket.
+#[derive(Debug, Clone)]
+struct SessionSink<H> {
+    half: H,
+    raw: Arc<TcpStream>,
+}
+
+impl<H: Write> Write for SessionSink<H> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.half.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.half.flush()
+    }
+}
+
+impl<H> CarrierSink for SessionSink<H>
+where
+    H: Write + Clone + Send + 'static,
+{
     fn send(&self, bytes: &[u8]) -> bool {
         let mut half = self.half.clone();
         half.write_all(bytes).is_ok()
@@ -6206,13 +6391,9 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     F: FnOnce(&mut R),
 {
     const CHUNK: usize = 16 * 1024;
-    if echo_trace_on() {
-        echo_trace("relay start");
-    }
+    echo_trace("relay start");
     let Ok(peer_read) = peer.try_clone() else {
-        if echo_trace_on() {
-            echo_trace("relay no peer");
-        }
+        echo_trace("relay no peer");
         return;
     };
     let Ok(peer_write) = peer.try_clone() else {
@@ -6227,8 +6408,17 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
         loop {
             match peer_read.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    if first {
+                        echo_trace("relay fwd first read");
+                    }
+                    if first {
+                        echo_trace("relay fwd sending");
+                    }
                     let sent = uplink.send(&buf[..n]);
-                    if echo_trace_on() && first {
+                    if first {
+                        echo_trace("relay fwd sent");
+                    }
+                    if first {
                         echo_trace(if sent {
                             "relay fwd first send ok"
                         } else {
@@ -6237,23 +6427,17 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                         first = false;
                     }
                     if !sent {
-                        if echo_trace_on() {
-                            echo_trace("relay fwd send failed");
-                        }
+                        echo_trace("relay fwd send failed");
                         break;
                     }
                 }
                 Err(error) if is_timeout(&error) => {}
                 Err(error) => {
-                    if echo_trace_on() {
-                        echo_trace(&format!("relay fwd read err {error:?}"));
-                    }
+                    echo_trace(&format!("relay fwd read err {error:?}"));
                     break;
                 }
                 Ok(_) => {
-                    if echo_trace_on() {
-                        echo_trace("relay fwd eof");
-                    }
+                    echo_trace("relay fwd eof");
                     break;
                 }
             }
@@ -6268,28 +6452,28 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     loop {
         match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
-                if echo_trace_on() && first {
+                if first {
                     echo_trace("relay bwd first read");
-                    first = false;
+                }
+                if first {
+                    echo_trace("relay bwd forwarding");
                 }
                 if peer_write.write_all(&buf[..n]).is_err() {
-                    if echo_trace_on() {
-                        echo_trace("relay bwd peer write failed");
-                    }
+                    echo_trace("relay bwd peer write failed");
                     break;
+                }
+                if first {
+                    echo_trace("relay bwd forwarded");
+                    first = false;
                 }
             }
             Err(error) if is_timeout(&error) => {}
             Err(error) => {
-                if echo_trace_on() {
-                    echo_trace(&format!("relay bwd read err {error:?}"));
-                }
+                echo_trace(&format!("relay bwd read err {error:?}"));
                 break;
             }
             Ok(_) => {
-                if echo_trace_on() {
-                    echo_trace("relay bwd eof");
-                }
+                echo_trace("relay bwd eof");
                 break;
             }
         }
@@ -9799,6 +9983,45 @@ mod tests {
             },
             tls_ws_accept,
         );
+    }
+
+    #[test]
+    fn production_tls_first_ws_matches_the_seam() {
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x44u8; 16];
+        let echo = TcpListener::bind("127.0.0.1:0").expect("binds echo");
+        let echo_addr: SocketAddr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut s, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).expect("reads");
+            s.write_all(&buf).expect("echoes");
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &id,
+                true,
+                &Carrier::Ws {
+                    path: "/w".to_owned(),
+                    ed: 0,
+                },
+                &server_config,
+            );
+        });
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let session = dial_tls_session(&server, &client_config).expect("dialled");
+        let header = vless_header(&id, 1, &echo_addr);
+        let (mut reader, writer) = tls_ws(&server, session, "127.0.0.1", "/w", 0, &header)
+            .expect("handshakes ws inside tls");
+        read_vless_response(&mut reader).expect("answers");
+        assert!(writer.send(b"ping"), "relays through tls-first ws");
+        let mut back = [0u8; 4];
+        reader.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
     }
 
     #[test]

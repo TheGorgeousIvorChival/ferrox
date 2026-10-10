@@ -569,7 +569,7 @@ Put the measured number in `scripts/expected-ops.txt` only after reading the dif
 ## P26 · Refuse a conformance run where no suite ran at all
 
 **When to use:** When `conformance.yml` is green and the log says no upstream suite reached a Ferrox binary. `run-upstream-suite.sh` now refuses a per-suite `PASS` that ran zero tests or a different number than its pin names, and then prints its tally and exits 0 whatever that tally says — so a `pins.toml` edit that disables every pin leaves a green job whose entire upstream-conformance content is a line of skips.
-**Status:** todo
+**Status:** doing
 **Leverage:** 4
 **Effort:** small
 **Gates:** `./scripts/check-upstream-pins.sh`; CI: `pins.yml` green, and `conformance.yml` refusing a tally of zero
@@ -665,7 +665,7 @@ Then earn the gate the hard way: three consecutive green `ci.yml` runs with no c
 ## P31 · Put the security layer outside the carrier, where both references put it
 
 **When to use:** When a `security: tls` or `security: reality` row over a stream carrier is next to carry, and a real Xray peer cannot complete the handshake: this tree serves the carrier first and runs the TLS session inside it, where both references run TLS first and build the carrier on top.
-**Status:** todo
+**Status:** doing
 **Leverage:** 5
 **Effort:** large
 **Gates:** `cargo test --workspace`; CI: `conformance.yml` green with the `ws_tls`, `httpupgrade_tls` and `grpc_tls` rows executed against `ferrox-app`
@@ -937,7 +937,7 @@ Each of those is its own proof: a loopback pair in each direction per row, the w
 ## P45 · Take the unreachable two-lane Poly1305 rung out of the aarch64 ladder
 
 **When to use:** When a rung of `Poly1305::absorb` cannot be entered: `TWO_LANE_THRESHOLD_BYTES` and `NEON4_THRESHOLD_BYTES` are both 1 024 and the four-block rung is tested first, so `absorb_two_lane` runs only where a test calls it by name.
-**Status:** todo
+**Status:** doing
 **Leverage:** 2
 **Effort:** small
 **Gates:** `cargo test --workspace`; CI: `ci.yml` green on all three runners, and `bench.yml` gate 7b's and 7c's `aarch64` rows unmoved
@@ -1020,4 +1020,18 @@ Read the edge hostname, port and pass exactly as today; only the transport chang
 
 ```text
 The reference multiplexes, and this tree pools QUIC, so pooling HTTP/2 looked like the same job. The edge this tree dials answered the first CONNECT on one connection and closed the stream on the second, so the premise is unproven and the pool was reverted rather than landed: a lane that works by dialling per flow is worth more than a pool the edge refuses. Before pooling, ask the edge: a live leg that opens two streams on one connection, or a loopback edge that mirrors what the real one did with the second one, and only pool when the answer is that it takes them both. The stop where it was reverted is the pre-slice state: `open_h2_with` dials, handshakes, writes the preface and one HEADERS frame per flow.
+```
+
+## P51 · Bound the server handshake drive that spins on an idle peer
+
+**When to use:** When a `RustlsServerProvider::drive` can spin: it `continue`s on `TimedOut`/`WouldBlock`, so a peer that connects and sends nothing burns a thread at 100% CPU with no deadline, while the client drive returns the same error to its caller.
+**Status:** todo
+**Leverage:** 3
+**Effort:** small
+**Gates:** `cargo test --workspace`; a loopback test connecting and idling past the old spin, proving the handshake refuses instead
+**Touches:** crates/ferrox-core/src/tls/rustls_backend.rs
+**Random weight:** 1
+
+```text
+The server handshake drive `continue`s on `TimedOut`/`WouldBlock`, so a peer that connects and sends nothing burns a thread with no deadline — only peer-close bounds it today — while the client drive returns the same error to its caller. (A bound in the same shape was tried on the session read path and reverted: blocking callers like `read_exact` need the pump-until-progress loop, so the bound belongs here, not there.) Return the idle error to the caller, whose poll grain already exists, and prove it with a peer that connects and then does nothing.
 ```

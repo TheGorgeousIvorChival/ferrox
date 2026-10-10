@@ -81,7 +81,7 @@ handshake duration is quoted from a machine without a named runner.
   (`:284-306`). One provider that *is* the stream means Vision never needs to
   reach into anything, which is why
   [the Vision page](xtls-vision.md) can end the framing by handing the socket
-  over instead of by copying bytes out of someone else's buffer.
+   over instead of by copying bytes out of someone else's buffer.
 - **Reflection and `unsafe` in the handshake.** The gates are
   `an_authenticated_hello_is_accepted`, `every_unauthenticated_hello_is_refused`
   and `the_certificate_differs_per_auth_key`.

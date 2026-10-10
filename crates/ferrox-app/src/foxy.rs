@@ -2419,7 +2419,13 @@ mod loopback {
                         std::io::ErrorKind::WouldBlock
                             | std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::Interrupted
-                    ) => {}
+                    ) =>
+                {
+                    // The lane is shared with the writer, so an idle poll
+                    // sleeps instead of re-locking: a tight poll loop starves
+                    // the writer behind the same mutex under load.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 Err(error) => panic!("the echo failed: {error}"),
             }
         }

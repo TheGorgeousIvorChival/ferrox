@@ -20,5 +20,9 @@
 # ferrox-app bin whose release layout `der_to_pem` is measured in, so the row
 # moves by the 13 Ir a test count moves it by, without `der_to_pem` changing:
 # quic.rs is untouched, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2653 by muse-ferrox: the TLS-first server accept adds five
+# serve_session_* helpers, session_halves, SessionSink and one production
+# loopback test to the same ferrox-app bin, putting back the 13 Ir that
+# 3c878f5's took out; quic.rs untouched.
 
 der_to_pem 2653
