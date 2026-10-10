@@ -126,41 +126,54 @@ jobs:
           else
             echo "::warning::this runner cannot itself download 1 MB (curl exit $code, ${got:-0} bytes)"
           fi
-      # Which families the edge's authority answers on, with no lane in the
-      # path, and how fast: the lane's dial tries every address the name
-      # spells, so a leg that fails is a statement about this runner's
-      # reachability and not about the lane, and the control is what says
-      # which. The catalogue is read the way the lane reads it, unauthenticated.
+      # Which families of the edge's own authority answer on this runner, with
+      # no lane in the path: a lane whose dial fails is a statement about this
+      # runner's reachability of the edge port, and the control is what says
+      # which. Read from the same catalogue the lane reads, so the test is of
+      # the address the lane would dial.
       - name: Edge reachability control - every family of the edge authority
         if: steps.secrets.outputs.present == 'true'
         run: |
           python3 - <<'PY' || true
-          import json, re, socket, time, urllib.request
+          import json, socket, time, urllib.request
           bucket = ("https://firefox.settings.services.mozilla.com/v1/buckets/main"
                     "/collections/vpn-serverlist/records")
           body = urllib.request.urlopen(bucket, timeout=25).read().decode()
-          authorities = set(re.findall(r'"host"\s*:\s*"([^"]+)"', body))
-          for authority in sorted(authorities)[:6]:
-              host, _, port = authority.partition(":")
+          rows = json.loads(body).get("data", [])
+          pairs = set()
+          for row in rows:
+              stack = [row]
+              while stack:
+                  node = stack.pop()
+                  if isinstance(node, dict):
+                      if "host" in node and "port" in node:
+                          pairs.add((str(node["host"]), int(node["port"])))
+                      stack.extend(node.values())
+                  elif isinstance(node, list):
+                      stack.extend(node)
+          if not pairs:
+              print("edge reachability control: the catalogue named no host/port pair")
+          for host, port in sorted(pairs)[:4]:
               for family, label in ((socket.AF_INET, "v4"), (socket.AF_INET6, "v6")):
                   began = time.time()
-                  answered, number = False, 0
+                  count = 0
+                  answered = False
                   try:
-                      infos = socket.getaddrinfo(host, int(port), family, socket.SOCK_STREAM)
+                      infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
                   except socket.gaierror:
-                      print(f"edge {authority} {label}: no address", flush=True)
+                      print(f"edge {host}:{port} {label}: no address", flush=True)
                       continue
                   for info in infos:
-                      number += 1
+                      count += 1
                       try:
-                          connection = socket.create_connection((info[4][0], int(port)), timeout=10)
+                          connection = socket.create_connection((info[4][0], port), timeout=10)
                       except OSError:
                           continue
                       connection.close()
                       answered = True
                       break
                   took = round((time.time() - began) * 1000)
-                  print(f"edge {authority} {label}: {number} address(es), "
+                  print(f"edge {host}:{port} {label}: {count} address(es), "
                         f"{'answered' if answered else 'refused'} in {took} ms", flush=True)
           PY
       - name: Download 1 MB through every carrier
