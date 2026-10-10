@@ -15,5 +15,9 @@
 # information, not a gate.
 # Re-blessed 2653 by 37eeb71: its loopback ladder test is one more test in the
 # same ferrox-app bin, putting back the 13 Ir that 08949a2's took out; quic.rs untouched.
+# Re-blessed 2640 by 3c878f5: the SOCKS UDP associate path grows an arm for a
+# freedom outbound, and one more test with it. Both live behind the same
+# ferrox-app bin whose release layout `der_to_pem` is measured in, so the row
+# moves by 13 Ir without the function changing; quic.rs untouched.
 
-der_to_pem 2653
+der_to_pem 2640

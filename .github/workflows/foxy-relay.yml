@@ -437,7 +437,8 @@ jobs:
             wait_port "$PORT"
           }
           trace_socks() {
-            PORT="$1" WANT="$2" for _ in $(seq 1 48); do
+            PORT="$1" WANT="$2"
+            for _ in $(seq 1 48); do
               curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
               sleep 5
