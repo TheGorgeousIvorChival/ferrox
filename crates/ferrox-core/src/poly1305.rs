@@ -16,9 +16,6 @@ const NEON_THRESHOLD_BYTES: usize = 512;
 const STRIDE2_THRESHOLD_BYTES: usize = 128;
 
 #[cfg(target_arch = "aarch64")]
-const TWO_LANE_THRESHOLD_BYTES: usize = 1024;
-
-#[cfg(target_arch = "aarch64")]
 const NEON4_THRESHOLD_BYTES: usize = 1024;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -474,11 +471,6 @@ impl Poly1305 {
             unsafe { self.absorb_avx2(data) };
             return;
         }
-        #[cfg(target_arch = "aarch64")]
-        if hibit == HIBIT && data.len() >= TWO_LANE_THRESHOLD_BYTES {
-            self.absorb_two_lane(data);
-            return;
-        }
         if hibit == HIBIT && data.len() >= STRIDE2_THRESHOLD_BYTES {
             self.absorb_stride2(data);
             return;
@@ -597,116 +589,6 @@ impl Poly1305 {
         }
 
         self.h = [h0, h1, h2];
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one two-lane loop body; factoring the per-pair body into a helper would put a call per thirty-two bytes, the same cost the stride-two loop keeps inline"
-    )]
-    fn absorb_two_lane(&mut self, data: &[u8]) {
-        let blocks = data.len() / 16;
-        let pairs = blocks / 4;
-        debug_assert!(
-            pairs > 0,
-            "the dispatch only sends four blocks or more here"
-        );
-
-        let r = (self.r0, self.r1, self.r2);
-        let rs = (self.s1, self.s2);
-        let q = Self::fold_unfolded(Self::mul_unfolded([r.0, r.1, r.2], r, rs));
-        let qs = (q[1].wrapping_mul(20), q[2].wrapping_mul(20));
-
-        let cut = pairs * 32;
-        let (left, right) = data.split_at(cut);
-        let [mut a0, mut a1, mut a2] = self.h;
-        let [mut b0, mut b1, mut b2] = [0u64; 3];
-
-        let l_pairs = (left.len() / 32).min(pairs);
-        let r_pairs = (right.len() / 32).min(pairs);
-        let (left_head, left_rest) = left.split_at(l_pairs * 32);
-        let (right_head, right_rest) = right.split_at(r_pairs * 32);
-
-        for (x, y) in left_head
-            .as_chunks::<32>()
-            .0
-            .iter()
-            .zip(right_head.as_chunks::<32>().0.iter())
-        {
-            let (x0, x1, x2) = Self::block_limbs3(&x[0..16]);
-            let (x3, x4, x5) = Self::block_limbs3(&x[16..32]);
-            let d_a = Self::mul_unfolded([a0 + x0, a1 + x1, a2 + x2], (q[0], q[1], q[2]), qs);
-            let d_b = Self::mul_unfolded([x3, x4, x5], r, rs);
-            [a0, a1, a2] = Self::fold_unfolded([d_a[0] + d_b[0], d_a[1] + d_b[1], d_a[2] + d_b[2]]);
-
-            let (y0, y1, y2) = Self::block_limbs3(&y[0..16]);
-            let (y3, y4, y5) = Self::block_limbs3(&y[16..32]);
-            let d_a = Self::mul_unfolded([b0 + y0, b1 + y1, b2 + y2], (q[0], q[1], q[2]), qs);
-            let d_b = Self::mul_unfolded([y3, y4, y5], r, rs);
-            [b0, b1, b2] = Self::fold_unfolded([d_a[0] + d_b[0], d_a[1] + d_b[1], d_a[2] + d_b[2]]);
-        }
-
-        let tail = |d: &[u8], [mut h0, mut h1, mut h2]: [u64; 3]| -> [u64; 3] {
-            let mut rest = d;
-            while let Some(p) = rest.first_chunk::<32>() {
-                let (p0, p1, p2) = Self::block_limbs3(&p[0..16]);
-                let (p3, p4, p5) = Self::block_limbs3(&p[16..32]);
-                let d_a = Self::mul_unfolded([h0 + p0, h1 + p1, h2 + p2], (q[0], q[1], q[2]), qs);
-                let d_b = Self::mul_unfolded([p3, p4, p5], r, rs);
-                [h0, h1, h2] =
-                    Self::fold_unfolded([d_a[0] + d_b[0], d_a[1] + d_b[1], d_a[2] + d_b[2]]);
-                rest = &rest[32..];
-            }
-            if let Some(m) = rest.first_chunk::<16>() {
-                let (b0, b1, b2) = Self::block_limbs3(m);
-                let d = Self::mul_unfolded([h0 + b0, h1 + b1, h2 + b2], r, rs);
-                [h0, h1, h2] = Self::fold_unfolded(d);
-            }
-            [h0, h1, h2]
-        };
-        debug_assert_eq!(left_rest.len() % 16, 0);
-        debug_assert_eq!(right_rest.len() % 16, 0);
-        [a0, a1, a2] = tail(left_rest, [a0, a1, a2]);
-        [b0, b1, b2] = tail(right_rest, [b0, b1, b2]);
-
-        let rp = Self::field_pow3([r.0, r.1, r.2], (blocks - 2 * pairs) as u64);
-        let rps = (rp[1].wrapping_mul(20), rp[2].wrapping_mul(20));
-        let d = Self::mul_unfolded([a0, a1, a2], (rp[0], rp[1], rp[2]), rps);
-        self.h = Self::fold_unfolded([
-            d[0] + u128::from(b0),
-            d[1] + u128::from(b1),
-            d[2] + u128::from(b2),
-        ]);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline]
-    fn block_limbs3(m: &[u8]) -> (u64, u64, u64) {
-        let t0 = u64::from_le_bytes(m[0..8].try_into().expect("a whole 16-byte block"));
-        let t1 = u64::from_le_bytes(m[8..16].try_into().expect("a whole 16-byte block"));
-        (
-            t0 & LIMB_MASK,
-            ((t0 >> 44) | (t1 << 20)) & LIMB_MASK,
-            ((t1 >> 24) & LIMB2_MASK) + HIBIT,
-        )
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn field_pow3(base: [u64; 3], mut exp: u64) -> [u64; 3] {
-        let mul = |x: [u64; 3], y: [u64; 3]| {
-            let ys = (y[1].wrapping_mul(20), y[2].wrapping_mul(20));
-            Self::fold_unfolded(Self::mul_unfolded(x, (y[0], y[1], y[2]), ys))
-        };
-        let mut acc = [1u64, 0, 0];
-        let mut b = base;
-        while exp > 0 {
-            if exp & 1 == 1 {
-                acc = mul(acc, b);
-            }
-            b = mul(b, b);
-            exp >>= 1;
-        }
-        acc
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1547,16 +1429,6 @@ mod tests {
                     two_way.finish(),
                     "{blocks} blocks: the two-way NEON path must match the one-block chain"
                 );
-
-                if blocks >= 4 {
-                    let mut two_lane = Poly1305::new(&key);
-                    two_lane.absorb_two_lane(&data);
-                    assert_eq!(
-                        expected,
-                        two_lane.finish(),
-                        "{blocks} blocks: the two-lane path must match the one-block chain"
-                    );
-                }
 
                 if blocks >= 4 {
                     let mut four_way = Poly1305::new(&key);

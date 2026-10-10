@@ -937,7 +937,7 @@ Each of those is its own proof: a loopback pair in each direction per row, the w
 ## P45 · Take the unreachable two-lane Poly1305 rung out of the aarch64 ladder
 
 **When to use:** When a rung of `Poly1305::absorb` cannot be entered: `TWO_LANE_THRESHOLD_BYTES` and `NEON4_THRESHOLD_BYTES` are both 1 024 and the four-block rung is tested first, so `absorb_two_lane` runs only where a test calls it by name.
-**Status:** todo
+**Status:** doing
 **Leverage:** 2
 **Effort:** small
 **Gates:** `cargo test --workspace`; CI: `ci.yml` green on all three runners, and `bench.yml` gate 7b's and 7c's `aarch64` rows unmoved

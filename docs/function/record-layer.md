@@ -473,15 +473,16 @@ What is **not** removed, and is named rather than claimed:
   one in `89f9714` on the same measurement, taken again after the four blocks'
   limbs came out of one `TBL4` a group.
 
-  **The two-lane rung below the four-lane one is unreachable, and this page
-  said otherwise until the line above was corrected.** `89f9714` moved
-  `NEON4_THRESHOLD_BYTES` down to `TWO_LANE_THRESHOLD_BYTES` at 1 024 and
-  `absorb` tests the four-lane rung first, so on `aarch64` every slice of 1 024
-  bytes or more reaches `absorb_neon4` and `absorb_two_lane` is entered by the
-  test at `poly1305.rs:1553` and by nothing else. The `4096` this page quoted
-  for NEON-4 was the reading that made the ladder look like three rungs on
-  `aarch64`; the code has two, and the dead one is a slice in the roadmap
-  rather than a threshold to tune here.
+  **The two-lane rung below the four-lane one was unreachable, and it is gone.**
+  `89f9714` moved `NEON4_THRESHOLD_BYTES` down to 1 024 where the two-lane
+  threshold sat, and `absorb` tested the four-lane rung first, so every slice
+  of 1 024 bytes or more reached `absorb_neon4` and `absorb_two_lane` ran only
+  where a test called it by name. P45 deleted the rung, its threshold, its
+  dispatch arm, its two helpers and that test: a second Horner step, its own
+  pair of `q`/`qs` powers and its own tail walk, none of them reachable from
+  any input. The shipping ladders were already `{128 stride-2, 1024 NEON-4}`
+  on aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64; now the code says so
+  with no leftover arm to misread as a third.
 
   This also bounds what the ladder-head guards on the four-lane rungs can
   assume: the head is `e = blocks % 4` blocks, so at most 48 bytes, and the
